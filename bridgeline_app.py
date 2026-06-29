@@ -157,13 +157,14 @@ def load_data_from_sheet(sh):
     acc_vals = sh.worksheet(SHEET_NAME).get_all_values()
     raw_rows = list(acc_vals[2:])  # min_row=3 in generate_mis.load_data: skip 2 header rows
 
-    # Follow-up tab (Apr/May cases relocated out of Accounts but still need
+    # Monthly archive tabs (cases relocated out of Accounts but still need
     # follow-up until Closed). No header row — same column order as Accounts,
     # so it merges in the same way read_accounts_from_gsheet() already does.
-    try:
-        raw_rows += list(sh.worksheet(FOLLOWUP_SHEET_NAME).get_all_values())
-    except gspread.exceptions.WorksheetNotFound:
-        pass
+    for archive_name in get_archive_tab_names():
+        try:
+            raw_rows += list(sh.worksheet(archive_name).get_all_values())
+        except gspread.exceptions.WorksheetNotFound:
+            continue
 
     rows = []
     for raw in raw_rows:
@@ -414,7 +415,21 @@ def calc_total(amount, charges=None, gst=None):
     g   = round(float(gst or ch * 0.18), 2)
     return round(amt + ch + g, 2)
 
-FOLLOWUP_SHEET_NAME = 'Apr/May26'  # cases moved out of Accounts but still need follow-up until Closed
+FOLLOWUP_SHEET_NAME = 'Apr/May26'  # legacy follow-up tab, grandfathered into active_archive_tabs
+
+def get_archive_tab_names():
+    """Names of monthly archive tabs (e.g. 'June 26') still being merged into
+    every Accounts read, sourced from the Config sheet's 'active_archive_tabs'
+    list (JSON array) instead of a hardcoded name — so a brand-new tab the
+    monthly rollover creates is picked up automatically, with no code change.
+    Falls back to just the legacy FOLLOWUP_SHEET_NAME if the Config key is
+    missing (e.g. first run before it's been seeded).
+    """
+    cfg = load_config()
+    tabs = cfg.get('active_archive_tabs')
+    if not tabs:
+        return [FOLLOWUP_SHEET_NAME]
+    return tabs
 
 def read_accounts_from_gsheet():
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
@@ -429,20 +444,21 @@ def read_accounts_from_gsheet():
                 record[h] = row[j] if j < len(row) else ''
             rows.append(record)
 
-    # Follow-up tab (Apr/May cases relocated out of Accounts). No header row —
+    # Monthly archive tabs (e.g. 'Apr/May26', 'June 26', ...). No header row —
     # columns are in the same order as Accounts, so reuse its header list.
-    # Keep reading this tab until every case in it shows Overdue Status = Closed.
-    try:
-        ws2 = sh.worksheet(FOLLOWUP_SHEET_NAME)
-        vals2 = ws2.get_all_values()
-        for i, row in enumerate(vals2, start=1):
-            if row and row[0].startswith('BLP-'):
-                record = {'_row': i, '_sheet': FOLLOWUP_SHEET_NAME}
-                for j, h in enumerate(headers):
-                    record[h] = row[j] if j < len(row) else ''
-                rows.append(record)
-    except gspread.exceptions.WorksheetNotFound:
-        pass
+    # Keep reading a tab until every case in it shows Overdue Status = Closed.
+    for archive_name in get_archive_tab_names():
+        try:
+            ws2 = sh.worksheet(archive_name)
+            vals2 = ws2.get_all_values()
+            for i, row in enumerate(vals2, start=1):
+                if row and row[0].startswith('BLP-'):
+                    record = {'_row': i, '_sheet': archive_name}
+                    for j, h in enumerate(headers):
+                        record[h] = row[j] if j < len(row) else ''
+                    rows.append(record)
+        except gspread.exceptions.WorksheetNotFound:
+            continue
 
     return rows
 
