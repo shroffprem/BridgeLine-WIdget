@@ -280,6 +280,11 @@ def extract_utr(text):
     m = re.search(r'IMPS\s*Ref\s*(?:no|number|#)?\s*[:\-]?\s*(\d{10,15})', t, re.IGNORECASE)
     if m:
         return m.group(1)
+    # IMPS with a name/company in between (e.g. "IMPS -TRIGOLDWYSE LLP- 617415701480
+    # Avl bal INR") — find any standalone long digit run anywhere after IMPS
+    m = re.search(r'IMPS\b.*?\b(\d{10,15})\b', t, re.IGNORECASE)
+    if m:
+        return m.group(1)
 
     # UPI: ref number is the 12-digit segment before the last -UPI or -PAYMENT suffix,
     # or before @VPA section. Pattern: UPI-...-DIGITS-WORD or UPI-...-DIGITS end-of-string
@@ -291,6 +296,10 @@ def extract_utr(text):
         m = re.search(r'\b(\d{12})\b', t)
         if m:
             return m.group(1)
+    # "Credit Alert!" style: "... from VPA name@bank (UPI 615689900342)"
+    m = re.search(r'\(UPI\s+(\d{10,15})\)', t, re.IGNORECASE)
+    if m:
+        return m.group(1)
 
     # Ref label
     m = re.search(r'\bref\b\s*[:\-#]?\s*([A-Z0-9]{8,22})', t, re.IGNORECASE)
