@@ -708,7 +708,7 @@ def save_repayment(data):
             next_mc_row = len(mc_vals) + 1
             mc.insert_row([
                 disb_id, coll_date, amount,
-                raw_msg or utr, info.get('customer', ''),
+                utr or raw_msg, info.get('customer', ''),
             ], next_mc_row)
         except Exception:
             pass
