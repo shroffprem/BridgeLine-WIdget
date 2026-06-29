@@ -372,7 +372,11 @@ def parse_cases(rows, mcoll=None):
         # entries from resurrecting already-closed cases as phantom outstanding.
         if mcoll and disb_id in mcoll and balance_raw != 0 and status != 'Closed':
             mc          = mcoll[disb_id]
-            coll_amt    = mc['total_collected']
+            # M Coll's own running total can be incomplete (e.g. early instalments
+            # entered straight into Accounts before per-instalment M Coll logging
+            # existed for that case) — never let it understate what Accounts'
+            # own cumulative "Collected Amount" column already shows.
+            coll_amt    = max(mc['total_collected'], coll_amt)
             if mc['latest_date']:
                 coll_date = mc['latest_date']
             balance_display = total - coll_amt   # exact; can be negative if over-collected

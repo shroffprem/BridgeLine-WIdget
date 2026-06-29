@@ -155,8 +155,18 @@ def load_data_from_sheet(sh):
     same spreadsheet the widget already reads/writes, instead of a manually
     downloaded Excel snapshot."""
     acc_vals = sh.worksheet(SHEET_NAME).get_all_values()
+    raw_rows = list(acc_vals[2:])  # min_row=3 in generate_mis.load_data: skip 2 header rows
+
+    # Follow-up tab (Apr/May cases relocated out of Accounts but still need
+    # follow-up until Closed). No header row — same column order as Accounts,
+    # so it merges in the same way read_accounts_from_gsheet() already does.
+    try:
+        raw_rows += list(sh.worksheet(FOLLOWUP_SHEET_NAME).get_all_values())
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
     rows = []
-    for raw in acc_vals[2:]:  # min_row=3 in generate_mis.load_data: skip 2 header rows
+    for raw in raw_rows:
         row = list(raw[:22])
         row += [None] * (22 - len(row))
         row = [None if c == '' else c for c in row]  # match openpyxl's blank-cell None
@@ -658,7 +668,10 @@ def save_repayment(data):
     total    = _cell_num(ws, row, COL['total']) or calc_total(_cell_num(ws, row, COL['amount']))
     new_coll = existing + amount
     new_bal  = max(0, total - new_coll - discount)
-    new_status = 'Closed' if new_bal == 0 else info['status']
+    # Sub-rupee residue (rounding leftovers from discount/instalment math)
+    # counts as fully settled, matching the >= 1.0 "open" threshold
+    # generate_mis.py already uses for its own reports.
+    new_status = 'Closed' if new_bal < 1 else info['status']
 
     updates = [
         (row, COL['coll_date'],   coll_date),
@@ -687,7 +700,7 @@ def save_repayment(data):
     # Record in M Coll for every repayment that is part of a multi-instalment
     # history, i.e. anything except a single one-shot payment that fully
     # closes a previously-untouched balance.
-    is_single_full_payment = (existing == 0 and new_bal == 0)
+    is_single_full_payment = (existing == 0 and new_bal < 1)
     if not is_single_full_payment:
         try:
             mc = sh.worksheet('M Coll')
