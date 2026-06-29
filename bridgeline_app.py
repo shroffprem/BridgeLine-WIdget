@@ -722,21 +722,20 @@ def save_repayment(data):
         'values': [[v]]
     } for r, c, v in updates])
 
-    # Record in M Coll for every repayment that is part of a multi-instalment
-    # history, i.e. anything except a single one-shot payment that fully
-    # closes a previously-untouched balance.
-    is_single_full_payment = (existing == 0 and new_bal < 1)
-    if not is_single_full_payment:
-        try:
-            mc = sh.worksheet('M Coll')
-            mc_vals = mc.get_all_values()
-            next_mc_row = len(mc_vals) + 1
-            mc.insert_row([
-                disb_id, coll_date, amount,
-                utr or raw_msg, info.get('customer', ''),
-            ], next_mc_row)
-        except Exception:
-            pass
+    # Record every repayment in M Coll, including single one-shot full
+    # closures -- M Coll needs to be the one definitive payment history
+    # everywhere it's read (the Customer Ledger, MIS reports, etc.), not
+    # just for multi-instalment cases.
+    try:
+        mc = sh.worksheet('M Coll')
+        mc_vals = mc.get_all_values()
+        next_mc_row = len(mc_vals) + 1
+        mc.insert_row([
+            disb_id, coll_date, amount,
+            utr or raw_msg, info.get('customer', ''),
+        ], next_mc_row)
+    except Exception:
+        pass
 
     trigger_ledger_rebuild()
     return {'new_collected': new_coll, 'new_balance': new_bal, 'status': new_status}
