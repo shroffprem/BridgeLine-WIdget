@@ -753,7 +753,13 @@ DEFAULT_CONFIG = {
     "overdue_threshold_days": 7,
     "custom_types": [],
     "ledger_webhook_url": "",
-    "ledger_webhook_token": ""
+    "ledger_webhook_token": "",
+    # Registered bank accounts used for reconciliation, e.g.
+    # [{"name": "HDFC xx0923", "account_number": "5010..."}, ...]. A
+    # transfer narration containing another registered account's number is
+    # an internal movement between our own accounts (Capital In/Out), not
+    # a real disbursement/expense/collection.
+    "bank_accounts": []
 }
 
 def load_config():
@@ -796,34 +802,62 @@ def parse_disb_date(s):
 
 RECON_LOG_SHEET_NAME = "Recon Log"
 
+def _parse_recon_date(s):
+    if not s:
+        return None
+    d = parse_disb_date(s)
+    if d:
+        return d
+    for fmt in ('%d/%m/%y', '%d/%m/%Y'):
+        try:
+            return datetime.strptime(str(s).strip(), fmt)
+        except Exception:
+            pass
+    return None
+
 def get_latest_bank_balance():
     """Read the most recent closing balance + date from the Recon Log sheet
-    tab. Each /reconcile/save call appends one row here — this replaces
-    reading back a persistent Daily Reconciliation.xlsx from a local/Drive
-    path, since the hosted version no longer keeps that file anywhere
-    central (each reconciliation save is now a one-off in-browser download).
+    tab, per registered bank account, and combine them. Each /reconcile/save
+    call appends one row here (tagged with an Account column) — this
+    replaces reading back a persistent Daily Reconciliation.xlsx from a
+    local/Drive path, since the hosted version no longer keeps that file
+    anywhere central (each reconciliation save is now a one-off in-browser
+    download).
+
+    With multiple pooled bank accounts, "the bank balance" is the SUM of
+    each account's own latest closing balance (last appended row for that
+    account). The "since this date" cutoff used elsewhere to compute
+    disbursed/collected-since-reconciliation uses the EARLIEST of the
+    accounts' latest-reconciled dates — conservative, so we never miss
+    counting a transaction that happened after one account's reconciliation
+    but before another's.
     """
     try:
         ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(RECON_LOG_SHEET_NAME)
         rows = ws.get_all_values()[1:]  # skip header
         if not rows:
             return None, None
-        last = rows[-1]
-        closing = None
-        if len(last) > 2 and last[2]:
-            try:
-                closing = float(str(last[2]).replace(',', '').replace('₹', '').strip())
-            except ValueError:
-                closing = None
-        latest_date = parse_disb_date(last[0]) if last and last[0] else None
-        if not latest_date and last and last[0]:
-            for fmt in ('%d/%m/%y', '%d/%m/%Y'):
+        # Latest row per account (blank Account = single legacy account,
+        # from before multi-account support existed)
+        latest_by_account = {}
+        for row in rows:
+            acct = row[4].strip() if len(row) > 4 else ''
+            latest_by_account[acct] = row  # last write wins -> most recent append for that account
+        closings, dates = [], []
+        for row in latest_by_account.values():
+            if len(row) > 2 and row[2]:
                 try:
-                    latest_date = datetime.strptime(str(last[0]).strip(), fmt)
-                    break
-                except Exception:
+                    closings.append(float(str(row[2]).replace(',', '').replace('₹', '').strip()))
+                except ValueError:
                     pass
-        return closing, latest_date
+            d = _parse_recon_date(row[0] if row else None)
+            if d:
+                dates.append(d)
+        if not closings:
+            return None, None
+        total_closing = sum(closings)
+        earliest_date = min(dates) if dates else None
+        return total_closing, earliest_date
     except Exception:
         return None, None
 
@@ -1148,6 +1182,21 @@ def _date_in_period(date_str, period_month):
 def _match_transactions(txns, records, mc_rows):
     """Auto-classify + match each bank transaction against Accounts + M Coll."""
 
+    # Registered bank accounts (Config 'bank_accounts') — a transfer
+    # narration containing one of THESE account numbers is money moving
+    # between our own accounts (Capital Out on the sending statement,
+    # Capital In on the receiving one), not a real disbursement/expense/
+    # collection. Distinct from acct_to_disb below, which indexes CUSTOMER
+    # beneficiary account numbers for FT collection matching.
+    own_account_numbers = set()
+    try:
+        for acc in (load_config().get('bank_accounts') or []):
+            num = str(acc.get('account_number', '')).strip()
+            if num:
+                own_account_numbers.add(num)
+    except Exception:
+        pass
+
     # UTR → disb_id from debit note column (disbursements going out)
     utr_to_disb     = {}
     utr_to_coll_acct = {}  # UTR/ref in Credit Note of Accounts → disb_id (collection receipts recorded in sheet)
@@ -1236,8 +1285,17 @@ def _match_transactions(txns, records, mc_rows):
         dr, cr = tx['debit'], tx['credit']
         tx_type = tx_ref = tx_basis = tx_notes = ''
 
+        own_acct_m = None
+        if own_account_numbers:
+            for num in own_account_numbers:
+                if num in desc:
+                    own_acct_m = num
+                    break
+
         if dr > 0:
-            if _is_fd_booking(desc):
+            if own_acct_m:
+                tx_type = 'Capital Out'; tx_notes = f'Internal transfer to own account {own_acct_m}'
+            elif _is_fd_booking(desc):
                 tx_type = 'FD Booking'; tx_notes = 'Fixed Deposit — internal capital movement'
             elif _is_expense_debit(desc, dr):
                 tx_type  = 'Expense'
@@ -1281,8 +1339,11 @@ def _match_transactions(txns, records, mc_rows):
                         tx_type = 'Expense'; tx_notes = _expense_category(desc)
 
         elif cr > 0:
+            if own_acct_m:
+                tx_type = 'Capital In'; tx_notes = f'Internal transfer from own account {own_acct_m}'
+
             # ₹1 test credits — banks/borrowers send ₹1 to verify account before full payment
-            if cr == 1.0:
+            elif cr == 1.0:
                 tx_type = 'Test Credit'; tx_notes = 'Penny verification — ignore'
 
             # Pradaan routing = collection routed via Pradaan account
@@ -1391,6 +1452,7 @@ def _sheet_statement(wb, period_label, remarks, opening, closing, classified_txn
         'Collection (via Pradaan)':s['grn_fill'],
         'Expense':                s['red_fill'],
         'Capital In':             s['blu_fill'],
+        'Capital Out':            s['blu_fill'],
         'FD Booking':             s['blu_fill'],
     }
     total_dr = total_cr = 0.0
@@ -1691,7 +1753,7 @@ def _sheet_mapped(wb, period_label, records, mc_rows, classified_txns, s):
 # ── Main save function ────────────────────────────────────────────────────────
 
 def save_reconciliation(recon_date, opening_balance, closing_balance, transactions,
-                         remarks='', remarks_map=None, existing_file_bytes=None):
+                         remarks='', remarks_map=None, existing_file_bytes=None, account=''):
     """Builds the 5-sheet reconciliation workbook in memory and returns its
     bytes for an in-browser download (no persistent Daily Reconciliation
     workbook on disk/Drive — there's no durable filesystem on a serverless
@@ -1736,6 +1798,10 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
         period_label = datetime.strptime(recon_date, '%d-%m-%Y').strftime('%b %Y')
     except Exception:
         period_label = recon_date
+    # Stamp the account name onto the period label so a downloaded workbook
+    # is unambiguous about which bank account it covers once there's more
+    # than one registered account.
+    sheet_period_label = f"{period_label} — {account}" if account else period_label
 
     # Classify and match bank transactions; drop any manually marked Skip
     classified = [tx for tx in _match_transactions(transactions, records, mc_rows)
@@ -1743,7 +1809,10 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
     rm = remarks_map or {}
 
     # Build 5 sheets: Statement, Disbursement Recon, Collection Recon, Mapped, Expenses
-    total_dr, total_cr = _sheet_statement(wb, period_label, remarks, opening_balance,
+    # (the Statement sheet's title gets the account-stamped label; the others
+    # use the plain month label since they filter records by month, and an
+    # account suffix would break that date-matching)
+    total_dr, total_cr = _sheet_statement(wb, sheet_period_label, remarks, opening_balance,
                                           closing_balance, classified, s)
     _sheet_disb_recon(wb, period_label, records, classified, s, period_label, rm)
     _sheet_coll_recon(wb, period_label, records, mc_rows, classified, s, period_label, rm)
@@ -1757,7 +1826,7 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
     try:
         log_ws = sh.worksheet(RECON_LOG_SHEET_NAME)
         log_ws.append_row([recon_date, opening_balance, closing_balance,
-                            datetime.today().strftime('%d-%m-%Y %H:%M')])
+                            datetime.today().strftime('%d-%m-%Y %H:%M'), account])
     except Exception as e:
         print(f"[Recon Log] append failed: {e}")
 
@@ -2080,6 +2149,11 @@ HTML = """<!DOCTYPE html>
         <div class="field">
           <label>Closing Balance (₹) <span style="color:#888;font-weight:400">(auto-read from statement)</span></label>
           <input type="number" id="rec-closing" placeholder="Auto-extracted from statement" step="0.01" readonly style="background:#f0f4f8">
+        </div>
+        <div class="field">
+          <label>Bank Account *</label>
+          <input type="text" id="rec-account" list="rec-account-list" placeholder="Select or type new...">
+          <datalist id="rec-account-list"></datalist>
         </div>
         <div class="field" style="grid-column:1/-1">
           <label>Remarks / Account Name</label>
@@ -2540,10 +2614,10 @@ async function parseStatement() {
   }
 }
 
-const BASE_TYPES = ['Disbursement','Collection','Collection (via Pradaan)','Expense','Capital In','Skip'];
+const BASE_TYPES = ['Disbursement','Collection','Collection (via Pradaan)','Expense','Capital In','Capital Out','Skip'];
 const TYPE_COLOR = {
   'Disbursement':'#fff8e1','Collection':'#e8f5e9','Collection (via Pradaan)':'#e8f5e9',
-  'Expense':'#fce4ec','Capital In':'#e3f2fd','Skip':'#eeeeee'
+  'Expense':'#fce4ec','Capital In':'#e3f2fd','Capital Out':'#e3f2fd','Skip':'#eeeeee'
 };
 
 let _customTypes = [];
@@ -2560,6 +2634,30 @@ async function saveCustomType(t) {
   _customTypes.push(t);
   await fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({custom_types: _customTypes})});
+}
+
+let _bankAccounts = [];
+
+async function loadBankAccounts() {
+  try {
+    const cfg = await (await fetch('/config')).json();
+    _bankAccounts = cfg.bank_accounts || [];
+  } catch { _bankAccounts = []; }
+  const dl = document.getElementById('rec-account-list');
+  if (dl) dl.innerHTML = _bankAccounts.map(a => `<option value="${a.name}">`).join('');
+}
+
+// If the typed account name isn't already registered, prompt for its
+// account number (used for Capital In/Out transfer matching between our
+// own accounts) and save it to Config so it shows up in the dropdown and
+// transfer-matching going forward.
+async function registerAccountIfNew(name) {
+  if (_bankAccounts.some(a => a.name === name)) return;
+  const acctNum = (prompt(`New bank account "${name}" — enter its account number (used to auto-detect transfers between your own accounts). Leave blank to skip.`) || '').trim();
+  _bankAccounts.push({name, account_number: acctNum});
+  await fetch('/config', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({bank_accounts: _bankAccounts})});
+  await loadBankAccounts();
 }
 
 function allTypeOpts() {
@@ -2618,7 +2716,7 @@ function renderReconResult(r) {
       const drCr = tx.debit ? `<span style="color:#c00;font-weight:600">Dr</span>`
                             : `<span style="color:#1a5c3a;font-weight:600">Cr</span>`;
       const autoColor = ({Disbursement:"#b8860b",Collection:"#1a5c3a",Expense:"#c00",
-        "FD Booking":"#1565c0","Capital In":"#1565c0"})[tx.type] || "#555";
+        "FD Booking":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0"})[tx.type] || "#555";
       return `<tr style="background:${i%2?"#f8fbff":"white"}">
         <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
         <td style="font-size:.8rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${desc}">${desc}</td>
@@ -2641,6 +2739,9 @@ function renderReconResult(r) {
 
 async function saveRecon() {
   if (!reconTxns.length) return alert('No transactions to save.');
+  const account = document.getElementById('rec-account').value.trim();
+  if (!account) return alert('Please select or enter the bank account this statement belongs to.');
+  await registerAccountIfNew(account);
 
   // Collect corrections from the review queue and apply back to full transaction list
   const reviewCorrections = {};
@@ -2670,6 +2771,7 @@ async function saveRecon() {
     opening:     parseFloat(document.getElementById('rec-opening').value) || 0,
     closing:     parseFloat(document.getElementById('rec-closing').value) || 0,
     remarks:     document.getElementById('rec-remarks').value.trim(),
+    account:     account,
     transactions: txns,
     remarks_map: remarksMap,
   };
@@ -2865,6 +2967,7 @@ window.onload = async () => {
   document.getElementById('r-date').value = today;
   document.getElementById('rec-date').value = today;
   await loadCustomTypes();
+  await loadBankAccounts();
   loadSummary();
 };
 </script>
@@ -3064,6 +3167,7 @@ def api_reconcile_save():
             remarks=data.get('remarks', ''),
             remarks_map=data.get('remarks_map', {}),
             existing_file_bytes=existing_bytes,
+            account=data.get('account', ''),
         )
         return Response(
             result['file_bytes'],
