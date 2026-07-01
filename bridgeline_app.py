@@ -3030,7 +3030,7 @@ def api_generate_mis():
 
         active_clusters = sorted(set(c['cluster'] for c in open_cases))
         zip_bytes = mis.build_zip(open_cases, all_cases, all_cases_full, metrics,
-                                   cluster_mgrs, branch_contacts, active_clusters)
+                                   cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=mcoll)
 
         date_human = mis.TODAY.strftime('%d-%b-%Y')
         filename = f'{date_human} BridgeLine MIS Package.zip'

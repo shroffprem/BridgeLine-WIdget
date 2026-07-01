@@ -213,10 +213,15 @@ def load_mcoll(wb):
         if total_collected == 0:
             continue   # skip rows with no valid collection amounts
         valid_dates = [d for d in data['dates'] if isinstance(d, datetime.date)]
+        txns = sorted(
+            [(d, a, n) for d, a, n in zip(data['dates'], data['amounts'], data['notes']) if a > 0],
+            key=lambda t: t[0] if isinstance(t[0], datetime.date) else datetime.date.min
+        )
         result[disb_id] = {
             'total_collected': total_collected,
             'latest_date':     max(valid_dates) if valid_dates else None,
             'notes':           data['notes'],
+            'transactions':    txns,
         }
     return result
 
@@ -1340,13 +1345,12 @@ def draw_guidelines(pdf):
         pdf.cell(pw - 6, 4, line, border=0, ln=False)
     pdf.set_y(y + total_h + 4)
 
-# --- DISBURSEMENT MEMO -------------------------------------------------------
-# Bold redesign (21-Jun-2026): stat-bar header (status/days/rate + headline
-# TOTAL PAYABLE), every figure bold/oversized, transparent-bg logo. Only this
-# function changed — BLPdf header/footer untouched. See memory:
-# project_memo_redesign_status.md for the design history.
-def generate_memo(case):
-    pdf = BLPdf(subtitle='DISBURSEMENT MEMO', report_date=fmt_date(TODAY))
+# --- INVOICE AND LEDGER (renamed from Disbursement Memo, 01-Jul-2026) ---------
+# Tally-style running ledger: Disbursement + Charges + GST as debits, each
+# collection as credit, running balance after every row. Sent daily for open
+# cases. Closed-today cases get paid_in_full=True and are archived separately.
+def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
+    pdf = BLPdf(subtitle='INVOICE AND LEDGER', report_date=fmt_date(TODAY))
     pdf.add_page()
 
     pw  = pdf.w
@@ -1354,19 +1358,19 @@ def generate_memo(case):
     pwi = pdf.inner_w()
     y   = pdf.content_top() + 2
 
-    # --- Title bar (Ref + Date together) ---
+    # --- Title bar ---
     pdf.set_fill_color(*C_PRI_NAVY)
     pdf.rect(x0, y, pwi, 9, 'F')
     pdf.set_xy(x0, y + 1.5)
     pdf.set_font('Helvetica', 'B', 12)
     pdf.set_text_color(*C_WHITE)
-    pdf.cell(pwi * 0.5, 6, 'DISBURSEMENT MEMO', align='C', border=0, ln=False)
+    pdf.cell(pwi * 0.5, 6, 'INVOICE AND LEDGER', align='C', border=0, ln=False)
     pdf.set_font('Helvetica', 'B', 8.5)
     pdf.set_text_color(*C_GOLD_LBL)
     pdf.cell(pwi * 0.5, 6, f'Ref: {case["id"]}   |   Date: {fmt_date(case["date"])}', align='R', border=0, ln=False)
     y += 11
 
-    # --- STAT BAR: 3 accent cells (status/days/rate) + 1 navy headline cell (total) ---
+    # --- Stat bar: 3 accent cells + 1 headline cell (balance / paid in full) ---
     sc = status_color(case['status'])
     sb_h = 15
     cells = [
@@ -1387,18 +1391,19 @@ def generate_memo(case):
         pdf.set_font('Helvetica', 'B', 12.5); pdf.set_text_color(*C_WHITE)
         pdf.cell(cw - 6, 6, val, border=0, ln=False)
     tx = x0 + 3 * cw
-    pdf.set_fill_color(*C_NAVY)
+    pdf.set_fill_color(*C_GREEN if paid_in_full else C_NAVY)
     pdf.rect(tx, y, total_w, sb_h, 'F')
-    pdf.set_fill_color(*C_GOLD_RULE); pdf.rect(tx, y, total_w, 0.8, 'F')
+    pdf.set_fill_color(*C_GREEN if paid_in_full else C_GOLD_RULE)
+    pdf.rect(tx, y, total_w, 0.8, 'F')
     pdf.set_xy(tx + 3, y + 2)
-    pdf.set_font('Helvetica', 'B', 6); pdf.set_text_color(*C_GOLD_LBL)
-    pdf.cell(total_w - 6, 3.5, 'TOTAL PAYABLE (INR)', border=0, ln=False)
+    pdf.set_font('Helvetica', 'B', 6); pdf.set_text_color(*C_WHITE)
+    pdf.cell(total_w - 6, 3.5, 'PAID IN FULL' if paid_in_full else 'BALANCE OUTSTANDING', border=0, ln=False)
     pdf.set_xy(tx + 3, y + 6.5)
     pdf.set_font('Helvetica', 'B', 14); pdf.set_text_color(*C_WHITE)
-    pdf.cell(total_w - 6, 6.5, f'Rs {inr_dec(case["total"])}', border=0, ln=False)
+    pdf.cell(total_w - 6, 6.5, 'Rs 0.00' if paid_in_full else f'Rs {inr_dec(case["balance"])}', border=0, ln=False)
     y += sb_h + 4
 
-    # --- DISBURSED TO panel ---
+    # --- Disbursed To panel ---
     ph = 34
     pdf.set_fill_color(*C_MEMO_CREAM)
     pdf.set_draw_color(*C_GOLD_RULE)
@@ -1429,81 +1434,96 @@ def generate_memo(case):
         else:
             pdf.set_font('Helvetica', 'B', 8); pdf.set_text_color(*C_TEXT_DARK)
         pdf.cell(75, 4, val, border=0, ln=False)
-    y += ph + 4
+    y += ph + 6
 
-    # --- Charge breakdown (left) + Collection details (right) ---
-    lw = pwi * 0.56
-    rw = pwi * 0.40
-    gap = pwi - lw - rw
-    rh  = 8.2
-
-    charge_rows = [
-        ('Amount Disbursed', f'Rs {inr_dec(case["amount"])}'),
-        ('Service Charges',  f'Rs {inr_dec(case["charges"])}'),
-        ('GST (18%)',         f'Rs {inr_dec(case["gst"])}'),
-        ('TOTAL PAYABLE',    f'Rs {inr_dec(case["total"])}'),
+    # --- Running Ledger table ---
+    l_cols = [
+        ('DATE',        22, 'C'),
+        ('DESCRIPTION', 82, 'L'),
+        ('DEBIT (Dr)',   27, 'R'),
+        ('CREDIT (Cr)', 27, 'R'),
+        ('BALANCE',     32, 'R'),
     ]
+    total_w_l = sum(c[1] for c in l_cols)
+    rh_l = 7
+
     pdf.set_fill_color(*C_PRI_NAVY)
-    pdf.rect(x0, y, lw, rh, 'F')
-    pdf.set_xy(x0 + 2, y + 1.8)
-    pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_WHITE)
-    pdf.cell(lw * 0.6, rh - 3, 'DESCRIPTION', align='L', border=0, ln=False)
-    pdf.cell(lw * 0.4 - 2, rh - 3, 'AMOUNT', align='R', border=0, ln=False)
-    for i, (desc, amt) in enumerate(charge_rows):
-        ry, is_tot = y + rh + i * rh, (desc == 'TOTAL PAYABLE')
-        if is_tot: pdf.set_fill_color(*C_LT_GOLD)
-        elif i % 2: pdf.set_fill_color(*C_WHITE)
-        else:       pdf.set_fill_color(*C_LT_SLATE)
-        pdf.rect(x0, ry, lw, rh, 'F')
-        if is_tot:
-            pdf.set_fill_color(*C_GOLD_RULE); pdf.rect(x0, ry, lw, 0.7, 'F')
-        # description label
-        pdf.set_xy(x0 + 2, ry + 2)
-        pdf.set_font('Helvetica', 'B', 8 if is_tot else 7.5)
-        pdf.set_text_color(*C_PRI_NAVY if is_tot else C_TEXT_DARK)
-        pdf.cell(lw * 0.6 - 2, rh - 3, desc, align='L', border=0, ln=False)
-        # amount — bolded/oversized
-        pdf.set_xy(x0, ry + 1.2)
-        pdf.set_font('Helvetica', 'B', 13 if is_tot else 10.5)
-        pdf.set_text_color(*C_PRI_NAVY)
-        pdf.cell(lw - 2, rh - 1.5, amt, align='R', border=0, ln=False)
+    pdf.rect(x0, y, total_w_l, rh_l, 'F')
+    xc = x0
+    for col, w, align in l_cols:
+        pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_WHITE)
+        pdf.set_xy(xc, y + 1.8); pdf.cell(w, rh_l - 3, col, align=align, border=0, ln=False)
+        xc += w
+    y += rh_l
 
-    rx    = x0 + lw + gap
-    cdate = fmt_date(case['coll_date']) if case['coll_date'] else '-'
-    camt  = f'Rs {inr_dec(case["coll_amt"])}' if case['coll_amt'] else '-'
-    bstr  = f'Rs {inr_dec(case["balance"])}'
-    bcol  = C_RED if case['balance'] >= 1 else C_GREEN
+    # Build ledger rows: (date_str, description, debit, credit, running_balance)
+    ledger_rows = []
+    running_bal = 0.0
 
-    coll_rows = [
-        ('Collected Date',   cdate,                 C_TEXT_DARK, False),
-        ('Collected Amount', camt,                  C_PRI_NAVY,  False),
-        ('Balance O/S',      bstr,                  bcol,        True),
-        ('Days Outstanding', str(case['days_out']), C_RED if case['days_out'] > 2 else C_TEXT_DARK, False),
-    ]
-    pdf.set_fill_color(*C_PRI_NAVY)
-    pdf.rect(rx, y, rw, rh, 'F')
-    pdf.set_xy(rx, y + 1.8)
-    pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_WHITE)
-    pdf.cell(rw, rh - 3, 'COLLECTION DETAILS', align='C', border=0, ln=False)
-    for i, (desc, val, vc, is_bal) in enumerate(coll_rows):
-        ry2 = y + rh + i * rh
-        if is_bal: pdf.set_fill_color(*C_LT_GOLD)
-        elif i % 2: pdf.set_fill_color(*C_WHITE)
-        else:       pdf.set_fill_color(*C_LT_SLATE)
-        pdf.rect(rx, ry2, rw, rh, 'F')
-        if is_bal:
-            pdf.set_fill_color(*C_GOLD_RULE); pdf.rect(rx, ry2, rw, 0.7, 'F')
-        # label
-        pdf.set_xy(rx + 2, ry2 + 2)
-        pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_TEXT_MED)
-        pdf.cell(rw * 0.55, rh - 3, desc, align='L', border=0, ln=False)
-        # value — bolded/oversized
-        pdf.set_xy(rx + 2, ry2 + 1.2)
-        pdf.set_font('Helvetica', 'B', 12.5 if is_bal else 10)
-        pdf.set_text_color(*vc)
-        pdf.cell(rw - 3, rh - 1.5, val, align='R', border=0, ln=False)
+    running_bal += case['amount']
+    ledger_rows.append((fmt_date(case['date']), 'Loan Disbursed', case['amount'], 0.0, running_bal))
 
-    y += rh + len(charge_rows) * rh + 5
+    running_bal += case['charges']
+    ledger_rows.append((fmt_date(case['date']), 'Service Charges', case['charges'], 0.0, running_bal))
+
+    running_bal += case['gst']
+    ledger_rows.append((fmt_date(case['date']), 'GST on Service Charges (18%)', case['gst'], 0.0, running_bal))
+
+    if case.get('discount') and case['discount'] != 0:
+        disc_abs = abs(case['discount'])
+        running_bal -= disc_abs
+        ledger_rows.append((fmt_date(case['date']), 'Discount Applied', 0.0, disc_abs, running_bal))
+
+    # Collections: per-transaction from M Coll if available, else single Accounts entry
+    if mcoll_entry and mcoll_entry.get('transactions'):
+        for idx, (cdate, camt, cnote) in enumerate(mcoll_entry['transactions'], 1):
+            if camt <= 0:
+                continue
+            running_bal -= camt
+            desc = f'Collection {idx}' + (f'  {cnote}' if cnote else '')
+            ledger_rows.append((fmt_date(cdate), desc, 0.0, camt, running_bal))
+    elif case['coll_amt'] > 0:
+        running_bal -= case['coll_amt']
+        ledger_rows.append((fmt_date(case['coll_date']), 'Collection', 0.0, case['coll_amt'], running_bal))
+
+    for idx, (date_s, desc, dr, cr, bal) in enumerate(ledger_rows):
+        pdf.set_fill_color(*C_LT_GOLD if idx % 2 == 0 else C_WHITE)
+        pdf.rect(x0, y, total_w_l, rh_l, 'F')
+        vals = [
+            date_s, desc,
+            f'Rs {inr_dec(dr)}' if dr else '\xe2\x80\x94',
+            f'Rs {inr_dec(cr)}' if cr else '\xe2\x80\x94',
+            f'Rs {inr_dec(bal)}',
+        ]
+        xc = x0
+        for (col, w, align), val in zip(l_cols, vals):
+            if col == 'DEBIT (Dr)' and dr:
+                pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_RED)
+            elif col == 'CREDIT (Cr)' and cr:
+                pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_GREEN)
+            elif col == 'BALANCE':
+                pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_TEXT_DARK)
+            else:
+                pdf.set_font('Helvetica', '', 7); pdf.set_text_color(*C_TEXT_DARK)
+            pdf.set_xy(xc, y + 1.8); pdf.cell(w, rh_l - 3, val, align=align, border=0, ln=False)
+            xc += w
+        y += rh_l
+
+    # Footer row: Balance Outstanding / Paid in Full
+    final_bal = 0.0 if paid_in_full else case['balance']
+    pdf.set_fill_color(*C_PRI_NAVY); pdf.rect(x0, y, total_w_l, rh_l + 1, 'F')
+    footer_vals = ['', 'PAID IN FULL' if paid_in_full else 'BALANCE OUTSTANDING',
+                   '', '', f'Rs {inr_dec(final_bal)}']
+    xc = x0
+    for (col, w, align), val in zip(l_cols, footer_vals):
+        if col == 'BALANCE':
+            pdf.set_font('Helvetica', 'B', 9)
+            pdf.set_text_color(*C_GREEN if paid_in_full else C_WHITE)
+        else:
+            pdf.set_font('Helvetica', 'B', 7.5); pdf.set_text_color(*C_GOLD_LBL)
+        pdf.set_xy(xc, y + 2); pdf.cell(w, rh_l - 1, val, align=align, border=0, ln=False)
+        xc += w
+    y += rh_l + 1 + 6
 
     # --- TAT charge policy note ---
     note_h = 18
@@ -1522,9 +1542,10 @@ def generate_memo(case):
     pdf.cell(0, 4, 'Charges fixed at disbursement. Refunds must be from same disbursing account (BLP/CIR/002/2026-27).', border=0, ln=False)
     y += note_h + 8
 
-    # --- Signatures (drops in actual signature image once SIGNATURE_PATH exists) ---
+    # --- Signatures ---
     sig_w = (pwi - 10) / 2
-    for i, (label, name) in enumerate([('AUTHORISED BY', 'Prem / Harsha'), ('RECEIVED BY', case['customer'])]):
+    recv_label = 'PAID IN FULL — RECEIVED BY' if paid_in_full else 'RECEIVED BY'
+    for i, (label, name) in enumerate([('AUTHORISED BY', 'Prem / Harsha'), (recv_label, case['customer'])]):
         sx = x0 + i * (sig_w + 10)
         if i == 0 and os.path.exists(SIGNATURE_PATH) and os.path.getsize(SIGNATURE_PATH) > 0:
             sig_img_h = 12
@@ -1540,8 +1561,8 @@ def generate_memo(case):
 
     pdf.set_text_color(*C_TEXT_DARK)
 
-    # --- SCAN OR TAP TO PAY (UPI) panel — only for cases under the Collection Card threshold ---
-    if case['amount'] < COLLECTION_CARD_THRESHOLD or case['balance'] < COLLECTION_CARD_THRESHOLD:
+    # --- UPI panel (open cases only, same threshold logic as before) ---
+    if not paid_in_full and (case['amount'] < COLLECTION_CARD_THRESHOLD or case['balance'] < COLLECTION_CARD_THRESHOLD):
         y += 33
         panel_w = 55
         px0 = x0 + (pwi - panel_w) / 2
@@ -1568,7 +1589,6 @@ def generate_memo(case):
             pdf.set_font('Helvetica', 'BI', 7); pdf.set_text_color(*C_RULE)
             pdf.cell(qr_size, 6, 'QR PENDING', align='C', border=0, ln=False)
         pdf.link(qx, qy, qr_size, qr_size, pay_page_url)
-        # Pay Now button — fills the slack to the right of the QR within the same box, same tap target
         btn_x = qx + qr_size + 3
         btn_w = px0 + panel_w - 2 - btn_x
         btn_h = qr_size
@@ -2227,7 +2247,7 @@ def main():
     print(f'\nActive clusters: {active_clusters}')
 
     zip_bytes = build_zip(open_cases, all_cases, all_cases_full, metrics,
-                           cluster_mgrs, branch_contacts, active_clusters)
+                           cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=mcoll)
 
     date_human = TODAY.strftime('%d-%b-%Y')
     zip_name   = f'{date_human} BridgeLine MIS Package.zip'
@@ -2239,7 +2259,7 @@ def main():
 
 
 def build_zip(open_cases, all_cases, all_cases_full, metrics,
-               cluster_mgrs, branch_contacts, active_clusters):
+               cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=None):
     """Builds the full BridgeLine MIS Package zip (in memory) and returns its bytes.
 
     Shared by the CLI entrypoint (main()) and any other caller (e.g. a web route
@@ -2275,6 +2295,7 @@ def build_zip(open_cases, all_cases, all_cases_full, metrics,
             print(f'  Card: {card_name}')
             zf.writestr(f'{cc_folder}/{card_name}', generate_collection_card(c, branch_contacts, cluster_mgrs))
 
+        # --- Cluster folders: cluster MIS + Invoice and Ledger per open case ---
         for cluster in active_clusters:
             folder = f'{date_label} {cluster}'
             print(f'Generating {cluster} cluster MIS...')
@@ -2282,9 +2303,27 @@ def build_zip(open_cases, all_cases, all_cases_full, metrics,
                         generate_cluster_mis(cluster, open_cases, all_cases, metrics))
             for c in [x for x in open_cases if x['cluster'] == cluster]:
                 safe = c['customer'].replace('/', '-').replace('\\', '-')
-                memo_name = f'{date_label} {cluster} {safe} {c["id"]} Disbursement Memo.pdf'
-                print(f'  Memo: {memo_name}')
-                zf.writestr(f'{folder}/{memo_name}', generate_memo(c))
+                mc_entry = mcoll_raw.get(c['id']) if mcoll_raw else None
+                inv_name = f'{date_label} {cluster} {safe} {c["id"]} Invoice and Ledger.pdf'
+                print(f'  Invoice: {inv_name}')
+                zf.writestr(f'{folder}/{inv_name}',
+                            generate_invoice_ledger(c, mcoll_entry=mc_entry))
+
+        # --- Closed Cases folder: final Paid in Full snapshot for cases closed today ---
+        closed_today = [c for c in all_cases
+                        if c['status'] == 'Closed'
+                        and isinstance(c.get('coll_date'), datetime.date)
+                        and c['coll_date'] == TODAY]
+        if closed_today:
+            closed_folder = f'{date_label} Closed Cases'
+            print(f'Archiving {len(closed_today)} case(s) closed today...')
+            for c in closed_today:
+                safe = c['customer'].replace('/', '-').replace('\\', '-')
+                mc_entry = mcoll_raw.get(c['id']) if mcoll_raw else None
+                closed_name = f'{date_human} {c["cluster"]} {safe} {c["id"]} Invoice and Ledger.pdf'
+                print(f'  Closed: {closed_name}')
+                zf.writestr(f'{closed_folder}/{closed_name}',
+                            generate_invoice_ledger(c, mcoll_entry=mc_entry, paid_in_full=True))
 
     return buf.getvalue()
 
