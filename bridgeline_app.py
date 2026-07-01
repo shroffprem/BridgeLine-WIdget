@@ -452,9 +452,11 @@ def read_accounts_from_gsheet():
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet(SHEET_NAME)
     all_vals = ws.get_all_values()
-    headers = all_vals[1]
+    # Find header row dynamically — it's the row containing "Disbursement ID"
+    header_idx = next((i for i, r in enumerate(all_vals) if r and 'Disbursement ID' in r), 1)
+    headers = all_vals[header_idx]
     rows = []
-    for i, row in enumerate(all_vals[2:], start=3):
+    for i, row in enumerate(all_vals[header_idx + 1:], start=header_idx + 2):
         if row and row[0].startswith('BLP-'):
             record = {'_row': i, '_sheet': SHEET_NAME}
             for j, h in enumerate(headers):
