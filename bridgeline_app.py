@@ -73,6 +73,23 @@ def get_sheet():
     sh = gc.open_by_key(SPREADSHEET_ID)
     return sh.worksheet(SHEET_NAME)
 
+REQUESTS_SHEET_NAME = "Requests"
+REQUESTS_HEADERS = [
+    "Request ID", "Submitted At", "Customer Name", "Cluster", "Branch",
+    "Amount", "Account No", "IFSC", "Phone", "SO Name", "Gold Weight",
+    "Status", "Disb ID", "Notes"
+]
+
+def get_requests_sheet():
+    gc = get_gspread_client()
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        return sh, sh.worksheet(REQUESTS_SHEET_NAME)
+    except Exception:
+        ws = sh.add_worksheet(title=REQUESTS_SHEET_NAME, rows=1000, cols=len(REQUESTS_HEADERS))
+        ws.append_row(REQUESTS_HEADERS)
+        return sh, ws
+
 # ── Config ────────────────────────────────────────────────────────────────────
 COMPANIES = ["HDB", "ICICI"]
 CLUSTERS  = ["Bellary", "Hassan", "Hubli", "Mandya", "Mangalore", "Mysore", "Other"]
@@ -660,6 +677,14 @@ def save_disbursement(data):
 
     ws.insert_row(row_data, next_row)
     trigger_ledger_rebuild()
+
+    request_id = data.get('request_id', '').strip()
+    if request_id:
+        try:
+            _mark_request_disbursed(request_id, disb_id)
+        except Exception:
+            pass  # don't fail the disbursement if Requests update errors
+
     return disb_id
 
 def _cell_num(ws, row, col):
@@ -1980,7 +2005,7 @@ HTML = """<!DOCTYPE html>
   </div>
 
   <div class="tabs">
-    <button class="tab-btn active" onclick="showTab('disb',this)">➕ New Disbursement</button>
+    <button class="tab-btn active" onclick="showTab('disb',this); loadPendingRequests()">➕ New Disbursement</button>
     <button class="tab-btn" onclick="showTab('repa',this); loadOpenCases()">💰 Repayment</button>
     <button class="tab-btn" onclick="showTab('calc',this)">🧮 Calculator</button>
     <button class="tab-btn" onclick="showTab('recon',this)">🏦 Bank Reconciliation</button>
@@ -1992,6 +2017,17 @@ HTML = """<!DOCTYPE html>
 
   <!-- DISBURSEMENT TAB -->
   <div id="disb" class="tab-content active">
+    <div class="section" id="pending-requests-section">
+      <h3 style="cursor:pointer;user-select:none;" onclick="togglePendingReqs()">
+        📥 Pending Field Requests <span id="pending-count" style="font-size:13px;color:#888;font-weight:400;"></span>
+        <span id="pending-chevron" style="float:right;font-size:13px;">▼</span>
+      </h3>
+      <div id="pending-requests-body">
+        <div id="pending-requests-list" style="margin-top:8px;"></div>
+        <div id="pending-selected-info" style="display:none;margin-top:10px;padding:10px 12px;background:#f0f7ff;border:1px solid #b3d4f5;border-radius:6px;font-size:13px;line-height:1.6;"></div>
+        <input type="hidden" id="d-request-id">
+      </div>
+    </div>
     <div class="section">
       <h3>1 — Paste Customer / Disbursement Note</h3>
       <textarea id="d-msg" placeholder="Paste customer note, WhatsApp message, or disbursement details here..."></textarea>
@@ -2248,6 +2284,61 @@ HTML = """<!DOCTYPE html>
 <script>
 let openCasesData = [];
 let reconTxns     = [];
+let _pendingReqsOpen = true;
+
+async function loadPendingRequests() {
+  const list = document.getElementById('pending-requests-list');
+  const countEl = document.getElementById('pending-count');
+  list.innerHTML = '<span style="color:#888;font-size:13px;">Loading...</span>';
+  try {
+    const items = await (await fetch('/requests/pending')).json();
+    if (!Array.isArray(items) || items.length === 0) {
+      list.innerHTML = '<span style="color:#aaa;font-size:13px;">No pending requests</span>';
+      countEl.textContent = '';
+      return;
+    }
+    countEl.textContent = `(${items.length})`;
+    list.innerHTML = '';
+    items.forEach(r => {
+      const card = document.createElement('div');
+      card.style.cssText = 'border:1px solid #dce8f5;border-radius:6px;padding:10px 12px;margin-bottom:8px;cursor:pointer;background:#fff;transition:background 0.15s;';
+      card.onmouseenter = () => card.style.background = '#f0f7ff';
+      card.onmouseleave = () => card.style.background = '#fff';
+      const amt = Number(r.amount) > 0 ? '₹' + Number(r.amount).toLocaleString('en-IN', {maximumFractionDigits:0}) : r.amount;
+      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${r.customer}</div>
+        <div style="font-size:12px;color:#555;margin-top:3px;">${r.cluster} · ${r.branch} · ${amt}</div>
+        <div style="font-size:11px;color:#999;margin-top:2px;">${r.request_id} · ${r.submitted_at}</div>`;
+      card.addEventListener('click', () => selectPendingRequest(r));
+      list.appendChild(card);
+    });
+  } catch(e) {
+    list.innerHTML = `<span style="color:#c00;font-size:13px;">Error loading requests: ${e.message}</span>`;
+  }
+}
+
+function selectPendingRequest(r) {
+  document.getElementById('d-customer').value = r.customer || '';
+  document.getElementById('d-cluster').value  = r.cluster  || '';
+  document.getElementById('d-branch').value   = r.branch   || '';
+  if (r.amount) { document.getElementById('d-amount').value = r.amount; calcCharges(); }
+  document.getElementById('d-request-id').value = r.request_id;
+
+  const info = document.getElementById('pending-selected-info');
+  const amt = Number(r.amount) > 0 ? '₹' + Number(r.amount).toLocaleString('en-IN', {maximumFractionDigits:0}) : r.amount;
+  info.innerHTML = `<b>Selected:</b> ${r.customer} &nbsp;·&nbsp; ${r.cluster} / ${r.branch} &nbsp;·&nbsp; ${amt}<br>
+    <b>Account:</b> ${r.account_no || '—'} &nbsp; <b>IFSC:</b> ${r.ifsc || '—'}<br>
+    <b>Phone:</b> ${r.phone || '—'} &nbsp; <b>SO:</b> ${r.so_name || '—'} &nbsp; <b>Gold:</b> ${r.gold_weight || '—'} gms<br>
+    <span style="color:#2a7ae2;font-size:11px;">${r.request_id}</span>
+    <button onclick="clearDisb()" style="float:right;font-size:11px;padding:2px 8px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">✕ Clear</button>`;
+  info.style.display = 'block';
+  document.getElementById('d-customer').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function togglePendingReqs() {
+  _pendingReqsOpen = !_pendingReqsOpen;
+  document.getElementById('pending-requests-body').style.display = _pendingReqsOpen ? '' : 'none';
+  document.getElementById('pending-chevron').textContent = _pendingReqsOpen ? '▼' : '▶';
+}
 
 // ── Date picker helper ────────────────────────────────────────────────────
 function _openDatePicker(nativeId) {
@@ -2403,8 +2494,9 @@ async function saveDisb() {
     amount: document.getElementById('d-amount').value,
     serviced_branch: document.getElementById('d-srv-branch').value.trim(),
     serviced_cluster: document.getElementById('d-srv-cluster').value.trim(),
-    utr:     document.getElementById('d-utr').value.trim(),
-    remarks: document.getElementById('d-remarks').value.trim(),
+    utr:        document.getElementById('d-utr').value.trim(),
+    remarks:    document.getElementById('d-remarks').value.trim(),
+    request_id: document.getElementById('d-request-id').value.trim(),
   };
   if (!data.customer || !data.amount || !data.company || !data.cluster || !data.branch)
     return showStatus('d-status','error','Please fill all required (*) fields.');
@@ -2412,7 +2504,7 @@ async function saveDisb() {
   const r = await (await fetch('/save/disbursement', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)})).json();
   btn.disabled = false; btn.textContent = '✅ Save Disbursement to Google Sheet';
-  if (r.ok) { showStatus('d-status','success',`✅ Saved! ID: ${r.disb_id}`); clearDisb(); }
+  if (r.ok) { showStatus('d-status','success',`✅ Saved! ID: ${r.disb_id}`); clearDisb(); loadPendingRequests(); }
   else       showStatus('d-status','error','❌ ' + r.error);
 }
 
@@ -2463,6 +2555,8 @@ function clearDisb() {
   document.getElementById('d-msg').value = '';
   document.getElementById('d-utr-msg').value = '';
   document.getElementById('d-date').value = new Date().toLocaleDateString('en-GB').replace(/\\//g,'-');
+  document.getElementById('d-request-id').value = '';
+  document.getElementById('pending-selected-info').style.display = 'none';
 }
 
 // ── Summary banner ──────────────────────────────────────────────────────────
@@ -2969,6 +3063,7 @@ window.onload = async () => {
   await loadCustomTypes();
   await loadBankAccounts();
   loadSummary();
+  loadPendingRequests();
 };
 </script>
 </body></html>"""
@@ -2993,6 +3088,48 @@ def api_extract_repayment():
 def api_open_cases():
     try:
         return jsonify(get_open_cases())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def _mark_request_disbursed(request_id, disb_id):
+    _, ws = get_requests_sheet()
+    all_vals = ws.get_all_values()
+    for i, row in enumerate(all_vals[1:], start=2):
+        if row and row[0] == request_id:
+            ws.update_cell(i, 12, 'Disbursed')
+            ws.update_cell(i, 13, disb_id)
+            return
+
+@app.route('/requests/pending')
+def api_requests_pending():
+    try:
+        _, ws = get_requests_sheet()
+        all_vals = ws.get_all_values()
+        if len(all_vals) < 2:
+            return jsonify([])
+        headers = all_vals[0]
+        idx = {h: i for i, h in enumerate(headers)}
+        items = []
+        for row in reversed(all_vals[1:]):
+            if not row or not row[0]:
+                continue
+            status = row[idx.get('Status', 11)] if len(row) > 11 else ''
+            if status != 'Pending':
+                continue
+            items.append({
+                'request_id':  row[idx.get('Request ID', 0)],
+                'submitted_at': row[idx.get('Submitted At', 1)],
+                'customer':    row[idx.get('Customer Name', 2)],
+                'cluster':     row[idx.get('Cluster', 3)],
+                'branch':      row[idx.get('Branch', 4)],
+                'amount':      row[idx.get('Amount', 5)],
+                'account_no':  row[idx.get('Account No', 6)],
+                'ifsc':        row[idx.get('IFSC', 7)],
+                'phone':       row[idx.get('Phone', 8)],
+                'so_name':     row[idx.get('SO Name', 9)],
+                'gold_weight': row[idx.get('Gold Weight', 10)],
+            })
+        return jsonify(items)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
