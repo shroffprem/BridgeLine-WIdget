@@ -66,7 +66,10 @@ def get_gspread_client():
         scopes=SCOPES,
     )
     creds.refresh(Request())
-    return gspread.authorize(creds)
+    # BackOffHTTPClient retries 429 quota errors with exponential backoff —
+    # without it a burst of reads (multi-step edits, recon rebuilds) can die
+    # mid-operation and leave Accounts/M Coll half-updated.
+    return gspread.authorize(creds, http_client=gspread.BackOffHTTPClient)
 
 def get_sheet():
     gc = get_gspread_client()
