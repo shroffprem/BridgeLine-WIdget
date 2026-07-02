@@ -172,14 +172,23 @@ def load_data_from_sheet(sh):
     same spreadsheet the widget already reads/writes, instead of a manually
     downloaded Excel snapshot."""
     acc_vals = sh.worksheet(SHEET_NAME).get_all_values()
-    raw_rows = list(acc_vals[2:])  # min_row=3 in generate_mis.load_data: skip 2 header rows
+    # Find header row dynamically — it's the row containing "Disbursement ID"
+    # (same approach as read_accounts_from_gsheet()). A row inserted/removed
+    # above the header otherwise makes it get read as a data row and crashes
+    # float() conversion on header text like 'Amount'.
+    header_idx = next((i for i, r in enumerate(acc_vals) if r and 'Disbursement ID' in r), 1)
+    raw_rows = list(acc_vals[header_idx + 1:])
 
     # Monthly archive tabs (cases relocated out of Accounts but still need
-    # follow-up until Closed). No header row — same column order as Accounts,
-    # so it merges in the same way read_accounts_from_gsheet() already does.
+    # follow-up until Closed). Same column order as Accounts, but unlike the
+    # comment here used to claim, not all of them are header-row-free (e.g.
+    # 'Jun 26' has a title row + column-header row) — filter to actual case
+    # rows by disb-id prefix, same as read_accounts_from_gsheet()'s archive
+    # loop already does, instead of assuming a fixed/no-header shape.
     for archive_name in get_archive_tab_names():
         try:
-            raw_rows += list(sh.worksheet(archive_name).get_all_values())
+            raw_rows += [r for r in sh.worksheet(archive_name).get_all_values()
+                         if r and str(r[0]).strip().startswith('BLP-')]
         except gspread.exceptions.WorksheetNotFound:
             continue
 
@@ -2011,6 +2020,7 @@ HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="showTab('repa',this); loadOpenCases()">💰 Repayment</button>
     <button class="tab-btn" onclick="showTab('calc',this)">🧮 Calculator</button>
     <button class="tab-btn" onclick="showTab('recon',this)">🏦 Bank Reconciliation</button>
+    <button class="tab-btn" onclick="showTab('invoice',this); loadInvoiceCases()">📄 Invoice</button>
     <button class="tab-btn" onclick="showTab('contacts',this); loadContacts()">👥 Contacts</button>
     <button class="tab-btn" onclick="showTab('settings',this); loadSettings()">⚙ Settings</button>
     <button class="tab-btn" id="mis-btn" onclick="generateMis()" style="background:#1a3a5c;color:#fff">📦 Generate MIS Package</button>
@@ -2281,6 +2291,26 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- INVOICE TAB -->
+  <div id="invoice" class="tab-content">
+    <div class="section">
+      <h3>Generate Invoice &amp; Ledger</h3>
+      <div class="field" style="margin-bottom:14px">
+        <label>Select Open Case</label>
+        <select id="inv-open-cases" onchange="onInvCaseSelect()" style="width:100%;font-size:.85rem">
+          <option value="">Loading open cases...</option>
+        </select>
+      </div>
+      <div class="field" style="margin-bottom:14px">
+        <label>Or enter Disbursement ID manually <span style="font-weight:400;color:#888">(for any case incl. closed)</span></label>
+        <input type="text" id="inv-manual-id" placeholder="e.g. BLP-010726-001" style="text-transform:uppercase" oninput="this.value=this.value.toUpperCase()">
+      </div>
+      <div id="inv-case-info" style="display:none;padding:10px 12px;background:#f0f7ff;border:1px solid #b3d4f5;border-radius:6px;font-size:13px;margin-bottom:14px;line-height:1.6;"></div>
+      <button class="btn btn-save" onclick="generateInvoice()" id="inv-btn" style="width:auto;padding:10px 28px">📄 Generate &amp; Download PDF</button>
+      <div id="inv-status" class="status" style="margin-top:10px"></div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -2334,6 +2364,71 @@ function selectPendingRequest(r) {
     <button onclick="clearDisb()" style="float:right;font-size:11px;padding:2px 8px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">✕ Clear</button>`;
   info.style.display = 'block';
   document.getElementById('d-customer').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// ── Invoice tab ──────────────────────────────────────────────────────────────
+async function loadInvoiceCases() {
+  const sel = document.getElementById('inv-open-cases');
+  sel.innerHTML = '<option value="">Loading...</option>';
+  try {
+    const cases = await (await fetch('/open-cases')).json();
+    sel.innerHTML = '<option value="">— Select an open case —</option>';
+    cases.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.disb_id;
+      opt.textContent = `${c.disb_id}  |  ${c.customer}  |  ₹${fmt(c.balance)} due`;
+      sel.appendChild(opt);
+    });
+  } catch(e) {
+    sel.innerHTML = '<option value="">Error loading cases</option>';
+  }
+}
+
+function onInvCaseSelect() {
+  const id = document.getElementById('inv-open-cases').value;
+  document.getElementById('inv-manual-id').value = '';
+  const info = document.getElementById('inv-case-info');
+  if (!id) { info.style.display = 'none'; return; }
+  const c = openCasesData.find(x => x.disb_id === id);
+  if (c) {
+    info.innerHTML = `<b>${c.customer}</b> &nbsp;|&nbsp; Disbursed: ₹${fmt(c.amount)} &nbsp;|&nbsp; Total Due: ₹${fmt(c.total)} &nbsp;|&nbsp; <b>Balance: ₹${fmt(c.balance)}</b> &nbsp;|&nbsp; ${c.status}`;
+    info.style.display = 'block';
+  }
+}
+
+async function generateInvoice() {
+  const fromDrop = document.getElementById('inv-open-cases').value;
+  const fromText = document.getElementById('inv-manual-id').value.trim().toUpperCase();
+  const disb_id = fromText || fromDrop;
+  if (!disb_id) return showStatus('inv-status', 'error', 'Select a case or enter a Disbursement ID.');
+  const btn = document.getElementById('inv-btn');
+  btn.disabled = true; btn.textContent = '⏳ Generating...';
+  showStatus('inv-status', 'success', 'Fetching data and building PDF...');
+  try {
+    const r = await fetch('/generate-invoice', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({disb_id}),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+      throw new Error(err.error || `HTTP ${r.status}`);
+    }
+    const blob = await r.blob();
+    const disposition = r.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="(.+)"/);
+    const filename = match ? match[1] : `${disb_id} Invoice and Ledger.pdf`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    showStatus('inv-status', 'success', `✅ Downloaded: ${filename}`);
+  } catch(e) {
+    showStatus('inv-status', 'error', '❌ ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '📄 Generate & Download PDF';
+  }
 }
 
 function togglePendingReqs() {
@@ -3148,6 +3243,29 @@ def api_save_repayment():
         return jsonify({'ok': True, **save_repayment(request.json)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/generate-invoice', methods=['POST'])
+def api_generate_invoice():
+    try:
+        disb_id = (request.json or {}).get('disb_id', '').strip().upper()
+        if not disb_id:
+            return jsonify({'error': 'disb_id required'}), 400
+        ensure_mis_assets_cached()
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+        rows, db_raw, mcoll, _ = load_data_from_sheet(sh)
+        _, _, all_cases_full = mis.parse_cases(rows, mcoll)
+        case = next((c for c in all_cases_full if c['id'].upper() == disb_id), None)
+        if not case:
+            return jsonify({'error': f'{disb_id} not found'}), 404
+        mcoll_entry = mcoll.get(disb_id)
+        paid = case['status'] == 'Closed'
+        pdf_bytes = mis.generate_invoice_ledger(case, mcoll_entry=mcoll_entry, paid_in_full=paid)
+        safe = case['customer'].replace('/', '-')
+        filename = f"{disb_id} {safe} Invoice and Ledger.pdf"
+        return Response(pdf_bytes, mimetype='application/pdf',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/generate-mis', methods=['POST'])
 def api_generate_mis():
