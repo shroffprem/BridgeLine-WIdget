@@ -1788,21 +1788,83 @@ def _sheet_mapped(wb, period_label, records, mc_rows, classified_txns, s):
 
 # ── Main save function ────────────────────────────────────────────────────────
 
-def save_reconciliation(recon_date, opening_balance, closing_balance, transactions,
-                         remarks='', remarks_map=None, existing_file_bytes=None, account=''):
-    """Builds the 5-sheet reconciliation workbook in memory and returns its
-    bytes for an in-browser download (no persistent Daily Reconciliation
-    workbook on disk/Drive — there's no durable filesystem on a serverless
-    host). Each call also appends one row to the 'Recon Log' sheet tab so
-    get_latest_bank_balance() / the dashboard's bank-balance figure keeps
-    working without needing to read back any saved file.
+RECON_TXNS_SHEET_NAME = "Recon Txns"
+RECON_TXNS_HEADERS = [
+    "Batch ID", "Recon Date", "Account", "Period Label", "Opening", "Closing",
+    "Remarks", "Txn Date", "Description", "UTR", "Debit", "Credit", "Balance",
+    "Type", "Matched Ref", "Match Basis", "Match Notes"
+]
 
-    If existing_file_bytes is given (the user re-uploaded their last saved
-    Daily Reconciliation.xlsx), the new period is appended underneath
-    whatever's already in that workbook's 5 sheets — the _sheet_* builder
-    functions already know how to append into an existing sheet (they check
-    `ws.max_row` and continue from there) rather than overwrite it. Without
-    a re-upload, this just produces one fresh, standalone workbook as before.
+def get_recon_txns_sheet(sh):
+    try:
+        return sh.worksheet(RECON_TXNS_SHEET_NAME)
+    except Exception:
+        ws = sh.add_worksheet(title=RECON_TXNS_SHEET_NAME, rows=5000, cols=len(RECON_TXNS_HEADERS))
+        ws.append_row(RECON_TXNS_HEADERS)
+        return ws
+
+def _recon_num(v):
+    try:
+        return float(str(v).replace(',', '').strip() or 0)
+    except Exception:
+        return 0.0
+
+def _load_recon_periods(ws):
+    """Read the Recon Txns tab and return the stored periods sorted
+    chronologically. Where the same (recon_date, account) was saved more than
+    once, only the latest Batch ID wins — re-running a day's recon replaces
+    that period instead of duplicating it."""
+    all_vals = ws.get_all_values()
+    # batches[(recon_date, account)] = {batch_id, meta, txns}
+    batches = {}
+    for row in all_vals[1:]:
+        if len(row) < 14 or not row[0]:
+            continue
+        key = (row[1], row[2])
+        batch_id = row[0]
+        if key not in batches or batch_id > batches[key]['batch_id']:
+            batches[key] = {'batch_id': batch_id,
+                            'recon_date': row[1], 'account': row[2],
+                            'period_label': row[3],
+                            'opening': _recon_num(row[4]), 'closing': _recon_num(row[5]),
+                            'remarks': row[6], 'txns': []}
+        # Placeholder rows (period saved with zero transactions) carry the
+        # metadata only — don't surface them as ledger lines.
+        if batches[key]['batch_id'] == batch_id and (row[8] or _recon_num(row[10]) or _recon_num(row[11])):
+            batches[key]['txns'].append({
+                'date':        row[7],
+                'description': row[8],
+                'utr':         row[9],
+                'debit':       _recon_num(row[10]),
+                'credit':      _recon_num(row[11]),
+                'balance':     _recon_num(row[12]),
+                'type':        row[13],
+                'matched_ref': row[14] if len(row) > 14 else '',
+                'match_basis': row[15] if len(row) > 15 else '',
+                'match_notes': row[16] if len(row) > 16 else '',
+            })
+
+    def _period_sort_key(p):
+        try:
+            return datetime.strptime(p['recon_date'], '%d-%m-%Y')
+        except Exception:
+            return datetime.min
+    return sorted(batches.values(), key=_period_sort_key)
+
+def save_reconciliation(recon_date, opening_balance, closing_balance, transactions,
+                         remarks='', remarks_map=None, account=''):
+    """Persists this period's classified transactions to the 'Recon Txns'
+    sheet tab, then rebuilds the FULL cumulative reconciliation workbook from
+    every stored period and returns its bytes for an in-browser download.
+
+    The Google Sheet is the system of record — the user never re-uploads a
+    previous file to keep history; every download contains all periods saved
+    so far. Saving the same (recon_date, account) again replaces that period
+    (latest Batch ID wins in _load_recon_periods), so corrections are safe.
+
+    Each call also appends one summary row to the 'Recon Log' tab so
+    get_latest_bank_balance() / the dashboard's bank-balance figure keeps
+    working without reading back any saved file.
     """
     try:
         records = read_accounts_from_gsheet()
@@ -1816,44 +1878,61 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
         sh      = get_gspread_client().open_by_key(SPREADSHEET_ID)
         mc_rows = []
 
-    s = _xl_styles()
-
-    KEEP_SHEETS = {'Statement', 'Disbursement Recon', 'Collection Recon', 'Mapped', 'Expenses'}
-    if existing_file_bytes:
-        wb = openpyxl.load_workbook(io.BytesIO(existing_file_bytes))
-        for sn in list(wb.sheetnames):
-            if sn not in KEEP_SHEETS:
-                del wb[sn]
-    else:
-        wb = openpyxl.Workbook()
-        if 'Sheet' in wb.sheetnames:
-            del wb['Sheet']
-
     # Derive period label from date  e.g. "Jun 2026"
     try:
         period_label = datetime.strptime(recon_date, '%d-%m-%Y').strftime('%b %Y')
     except Exception:
         period_label = recon_date
-    # Stamp the account name onto the period label so a downloaded workbook
-    # is unambiguous about which bank account it covers once there's more
-    # than one registered account.
-    sheet_period_label = f"{period_label} — {account}" if account else period_label
 
     # Classify and match bank transactions; drop any manually marked Skip
     classified = [tx for tx in _match_transactions(transactions, records, mc_rows)
                   if tx.get('type_override', '') != 'Skip']
     rm = remarks_map or {}
 
-    # Build 5 sheets: Statement, Disbursement Recon, Collection Recon, Mapped, Expenses
-    # (the Statement sheet's title gets the account-stamped label; the others
-    # use the plain month label since they filter records by month, and an
-    # account suffix would break that date-matching)
-    total_dr, total_cr = _sheet_statement(wb, sheet_period_label, remarks, opening_balance,
-                                          closing_balance, classified, s)
-    _sheet_disb_recon(wb, period_label, records, classified, s, period_label, rm)
-    _sheet_coll_recon(wb, period_label, records, mc_rows, classified, s, period_label, rm)
-    _sheet_mapped(wb, period_label, records, mc_rows, classified, s)
-    expenses, exp_total = _sheet_expenses(wb, period_label, classified, s)
+    # Persist this period's classified rows to the Recon Txns tab (one batch
+    # write), then read everything back so current + historical periods flow
+    # through one rebuild path.
+    txns_ws = get_recon_txns_sheet(sh)
+    batch_id = datetime.now().strftime('%Y%m%d%H%M%S')
+    txns_ws.append_rows([[
+        batch_id, recon_date, account, period_label,
+        opening_balance, closing_balance, remarks,
+        tx['date'], tx['description'], tx.get('utr', ''),
+        tx['debit'], tx['credit'], tx['balance'],
+        tx['type'], tx['matched_ref'], tx['match_basis'], tx['match_notes'],
+    ] for tx in classified] or [[batch_id, recon_date, account, period_label,
+                                 opening_balance, closing_balance, remarks,
+                                 '', '', '', 0, 0, 0, '', '', '', '']])
+    periods = _load_recon_periods(txns_ws)
+
+    s = _xl_styles()
+    wb = openpyxl.Workbook()
+    if 'Sheet' in wb.sheetnames:
+        del wb['Sheet']
+
+    # Rebuild every stored period in chronological order. The _sheet_*
+    # builders append below existing content (ws.max_row + 2) when the sheet
+    # already exists, so periods stack naturally. Historical periods use their
+    # STORED classified values — never re-matched, so past results don't shift
+    # as live sheet data changes. Mapped is built once (it's a full-book UTR
+    # map with no period filter — per-period calls would duplicate the book).
+    total_dr = total_cr = 0.0
+    for p in periods:
+        p_label = p['period_label']
+        sheet_label = f"{p_label} — {p['account']}" if p['account'] else p_label
+        dr, cr = _sheet_statement(wb, sheet_label, p['remarks'], p['opening'],
+                                  p['closing'], p['txns'], s)
+        is_current = (p['recon_date'] == recon_date and p['account'] == account)
+        if is_current:
+            total_dr, total_cr = dr, cr
+        _sheet_disb_recon(wb, p_label, records, p['txns'], s, p_label,
+                          rm if is_current else {})
+        _sheet_coll_recon(wb, p_label, records, mc_rows, p['txns'], s, p_label,
+                          rm if is_current else {})
+        _sheet_expenses(wb, p_label, p['txns'], s)
+    if periods:
+        latest = periods[-1]
+        _sheet_mapped(wb, latest['period_label'], records, mc_rows, latest['txns'], s)
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -1866,7 +1945,7 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
     except Exception as e:
         print(f"[Recon Log] append failed: {e}")
 
-    filename = f"Daily Reconciliation - {period_label} - {recon_date.replace('/', '-')}.xlsx"
+    filename = f"Daily Reconciliation - {account or 'All Accounts'}.xlsx"
 
     return {
         'total_debit':  total_dr,
@@ -2247,10 +2326,7 @@ HTML = """<!DOCTYPE html>
         </div>
       </div>
 
-      <div class="field" style="margin-bottom:10px">
-        <label>Append to existing Daily Reconciliation Excel <span style="color:#888;font-weight:400">(optional — re-upload your last saved file to keep one growing workbook instead of getting a brand-new file each time)</span></label>
-        <input type="file" id="rec-existing-file" accept=".xlsx">
-      </div>
+      <p style="font-size:.8rem;color:#666;margin:8px 0 4px">History is stored automatically — every download contains <b>all periods saved so far</b>. No need to re-upload previous files.</p>
       <button class="btn btn-save" onclick="saveRecon()" style="margin-top:4px">💾 Complete Reconciliation &amp; Save Excel</button>
       <div id="recon-status" class="status"></div>
     </div>
@@ -2968,17 +3044,8 @@ async function saveRecon() {
   };
   const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
   try {
-    const existingFile = document.getElementById('rec-existing-file').files[0];
-    let resp;
-    if (existingFile) {
-      const form = new FormData();
-      form.append('data', JSON.stringify(data));
-      form.append('existing_file', existingFile);
-      resp = await fetch('/reconcile/save', {method:'POST', body: form});
-    } else {
-      resp = await fetch('/reconcile/save', {method:'POST',
-        headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
-    }
+    const resp = await fetch('/reconcile/save', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)});
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({error: 'Unknown error'}));
       throw new Error(err.error || `HTTP ${resp.status}`);
@@ -2995,7 +3062,7 @@ async function saveRecon() {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
     showStatus('recon-status','success',
-      `✅ Downloaded ${filename} — ${rowsSaved} transactions, Closing Balance: ₹${fmtDec(closingBal)}`);
+      `✅ Downloaded ${filename} (full history) — ${rowsSaved} transactions this period, Closing Balance: ₹${fmtDec(closingBal)}`);
   } catch (e) {
     showStatus('recon-status','error','❌ ' + e.message);
   } finally {
@@ -3435,27 +3502,16 @@ def api_reconcile_records():
 
 @app.route('/reconcile/save', methods=['POST'])
 def api_reconcile_save():
-    """Builds the reconciliation workbook and returns it as a direct download
-    (no persistent Daily Reconciliation.xlsx is kept centrally on the hosted
-    version — see save_reconciliation()'s docstring). Summary numbers (rows
-    saved, closing balance) are echoed back in response headers so the
-    frontend can show a status message without parsing a JSON body on a
-    binary response.
-
-    Accepts either a plain JSON body (fresh standalone workbook, the
-    default) or multipart/form-data with a 'data' field (same JSON, as a
-    string) plus an optional 'existing_file' upload — the user's last saved
-    Daily Reconciliation.xlsx to append the new period into.
+    """Persists the period to the 'Recon Txns' sheet tab and returns the FULL
+    cumulative reconciliation workbook (all saved periods) as a direct
+    download — see save_reconciliation()'s docstring. No file re-upload is
+    needed to keep history; the Google Sheet is the system of record.
+    Summary numbers (rows saved, closing balance) are echoed back in response
+    headers so the frontend can show a status message without parsing a JSON
+    body on a binary response.
     """
     try:
-        existing_bytes = None
-        if request.content_type and 'multipart/form-data' in request.content_type:
-            data = json.loads(request.form['data'])
-            f = request.files.get('existing_file')
-            if f and f.filename:
-                existing_bytes = f.read()
-        else:
-            data = request.json
+        data = request.json
         result = save_reconciliation(
             recon_date=data['date'],
             opening_balance=float(data.get('opening') or 0),
@@ -3463,7 +3519,6 @@ def api_reconcile_save():
             transactions=data['transactions'],
             remarks=data.get('remarks', ''),
             remarks_map=data.get('remarks_map', {}),
-            existing_file_bytes=existing_bytes,
             account=data.get('account', ''),
         )
         return Response(
