@@ -324,11 +324,24 @@ def find_branch_contact(cluster, branch, branch_contacts, cluster_mgrs):
     return {'name': '-', 'phone': '-'}, True
 
 # --- DATA LOADING ------------------------------------------------------------
+def find_accounts_header_row(ws):
+    """Locate the row containing 'Disbursement ID' in col A instead of assuming
+    a fixed row number — a row inserted/removed above the header (as happened
+    01-Jul-2026) otherwise makes the header row get parsed as a data row and
+    crashes float() conversion on header text like 'Amount'."""
+    for i, raw in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True), start=1):
+        cell = str(raw[0] or '').strip().lower()
+        if cell == 'disbursement id':
+            return i
+    return 3  # fallback to the historical assumption
+
+
 def load_data(path):
     wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb['Accounts']
+    header_row = find_accounts_header_row(ws)
     rows = []
-    for raw in ws.iter_rows(min_row=3, values_only=True):
+    for raw in ws.iter_rows(min_row=header_row + 1, values_only=True):
         # Read 22 cols — col A(0) through col V(21) to capture debit note
         row = list(raw[:22])
         row += [None] * (22 - len(row))
@@ -1491,8 +1504,8 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
         pdf.rect(x0, y, total_w_l, rh_l, 'F')
         vals = [
             date_s, desc,
-            f'Rs {inr_dec(dr)}' if dr else '\xe2\x80\x94',
-            f'Rs {inr_dec(cr)}' if cr else '\xe2\x80\x94',
+            f'Rs {inr_dec(dr)}' if dr else '\x96',
+            f'Rs {inr_dec(cr)}' if cr else '\x96',
             f'Rs {inr_dec(bal)}',
         ]
         xc = x0
