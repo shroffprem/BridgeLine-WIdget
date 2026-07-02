@@ -3244,6 +3244,46 @@ def api_save_repayment():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
+def _load_for_invoice(sh, disb_id):
+    """Read only Accounts + M Coll (2 API calls) instead of the full
+    load_data_from_sheet() which also reads archives, Contact, DashBoard."""
+    acc_vals = sh.worksheet(SHEET_NAME).get_all_values()
+    header_idx = next((i for i, r in enumerate(acc_vals) if r and 'Disbursement ID' in r), 1)
+    raw_rows = [r for r in acc_vals[header_idx + 1:] if r and str(r[0]).strip().startswith('BLP-')]
+
+    # Only scan archive tabs if the case isn't in the main Accounts sheet
+    if not any(str(r[0]).strip().upper() == disb_id for r in raw_rows):
+        for archive_name in get_archive_tab_names():
+            try:
+                archive_rows = [r for r in sh.worksheet(archive_name).get_all_values()
+                                if r and str(r[0]).strip().startswith('BLP-')]
+                raw_rows += archive_rows
+                if any(str(r[0]).strip().upper() == disb_id for r in archive_rows):
+                    break
+            except gspread.exceptions.WorksheetNotFound:
+                continue
+
+    rows = []
+    for raw in raw_rows:
+        row = list(raw[:22]) + [None] * max(0, 22 - len(raw))
+        row = [None if c == '' else c for c in row]
+        for i in _MIS_NUMERIC_COLS:
+            row[i] = _clean_numeric_cell(row[i])
+        if row[0]:
+            rows.append(row)
+
+    sheets = {}
+    try:
+        mcoll_vals = sh.worksheet('M Coll').get_all_values()
+        mcoll_vals = [[_clean_numeric_cell(c) if i == 2 else c for i, c in enumerate(r)]
+                      for r in mcoll_vals]
+        sheets['M Coll'] = _SheetShim(mcoll_vals)
+    except gspread.exceptions.WorksheetNotFound:
+        pass
+
+    mcoll = mis.load_mcoll(_WorkbookShim(sheets))
+    return rows, mcoll
+
 @app.route('/generate-invoice', methods=['POST'])
 def api_generate_invoice():
     try:
@@ -3252,7 +3292,7 @@ def api_generate_invoice():
             return jsonify({'error': 'disb_id required'}), 400
         ensure_mis_assets_cached()
         sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
-        rows, db_raw, mcoll, _ = load_data_from_sheet(sh)
+        rows, mcoll = _load_for_invoice(sh, disb_id)
         _, _, all_cases_full = mis.parse_cases(rows, mcoll)
         case = next((c for c in all_cases_full if c['id'].upper() == disb_id), None)
         if not case:
