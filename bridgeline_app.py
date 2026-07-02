@@ -1600,11 +1600,15 @@ def _sheet_coll_recon(wb, period_label, records, mc_rows, classified_txns, s, pe
     c.alignment = Alignment(horizontal='left')
     row += 1
 
-    # Bank credits indexed by UTR for narration lookup
+    # Bank credits indexed by UTR for narration lookup; also by amount for
+    # backfilling a UTR when the M Coll note has none embedded.
     bank_cr_by_utr = {}
+    bank_cr_by_amt = {}
     for tx in classified_txns:
-        if tx['credit'] > 0 and tx.get('utr'):
-            bank_cr_by_utr[tx['utr'].upper()] = tx
+        if tx['credit'] > 0:
+            if tx.get('utr'):
+                bank_cr_by_utr[tx['utr'].upper()] = tx
+            bank_cr_by_amt.setdefault(round(tx['credit']), []).append(tx)
 
     # M Coll grouped by disb_id — filter to payments made this period
     mc_map = {}
@@ -1647,9 +1651,21 @@ def _sheet_coll_recon(wb, period_label, records, mc_rows, classified_txns, s, pe
 
         first = True
         for mc in payments:
-            mc_utr  = str(mc[3] if len(mc)>3 else '').strip()
+            # M Coll col D holds `utr or raw_msg` (see save_repayment) — pull
+            # the UTR out of SMS text when that's what landed there, and if
+            # there's still none, backfill from a unique same-amount bank
+            # credit in this period.
+            mc_raw  = str(mc[3] if len(mc)>3 else '').strip()
             mc_amt  = _clean_amount(mc[2]) if len(mc)>2 else 0
-            bank_tx = bank_cr_by_utr.get(mc_utr.upper())
+            mc_utr  = extract_utr(mc_raw)
+            if not mc_utr and re.fullmatch(r'[A-Za-z0-9\-/]{6,25}', mc_raw or ''):
+                mc_utr = mc_raw  # already a bare ref, just not SMS-shaped
+            bank_tx = bank_cr_by_utr.get(mc_utr.upper()) if mc_utr else None
+            if not mc_utr:
+                amt_matches = bank_cr_by_amt.get(round(mc_amt), [])
+                if len(amt_matches) == 1:
+                    bank_tx = amt_matches[0]
+                    mc_utr  = bank_tx.get('utr', '')
             narr    = bank_tx['description'][:50] + '…' if bank_tx else '—'
 
             _row(ws, row, [
@@ -1710,7 +1726,11 @@ def _sheet_expenses(wb, period_label, classified_txns, s):
 
 # ── Sheet 5: Mapped (Disb ID ↔ Disb UTR ↔ Collection UTR) ───────────────
 
-def _sheet_mapped(wb, period_label, records, mc_rows, classified_txns, s):
+def _sheet_mapped(wb, period_label, records, mc_rows, classified_txns, s, period_month=None):
+    """Only cases with activity in the period month: disbursed in-month, an
+    M Coll payment in-month, or a bank debit/credit match in this period's
+    statement. Without this filter every case ever (incl. archive tabs)
+    repeats in each period section."""
     sname = 'Mapped'
     cols = [('Disb ID',18),('Customer',26),('Disb Date',12),('Disb Amount (₹)',16),
             ('Disb UTR (Bank)',26),('Coll Date',12),('Coll Amount (₹)',16),
@@ -1733,21 +1753,37 @@ def _sheet_mapped(wb, period_label, records, mc_rows, classified_txns, s):
 
     bank_debit_by_ref  = {}
     bank_credit_by_utr = {}
+    bank_credit_refs   = set()
+    bank_cr_by_amt     = {}
     for tx in classified_txns:
         if tx['debit'] > 0 and tx['matched_ref']:
             bank_debit_by_ref[tx['matched_ref']] = tx
-        if tx['credit'] > 0 and tx.get('utr'):
-            bank_credit_by_utr[tx['utr'].upper()] = tx
+        if tx['credit'] > 0:
+            if tx.get('utr'):
+                bank_credit_by_utr[tx['utr'].upper()] = tx
+            if tx['matched_ref']:
+                bank_credit_refs.add(tx['matched_ref'])
+            bank_cr_by_amt.setdefault(round(tx['credit']), []).append(tx)
 
+    # Payments filtered to the period month — pre-period instalments don't
+    # belong in this period's mapping.
     mc_map = {}
     for mc in mc_rows:
-        did = (mc[0] if len(mc) > 0 else '').strip()
-        if did:
+        did   = (mc[0] if len(mc) > 0 else '').strip()
+        pdate = str(mc[1] if len(mc) > 1 else '')
+        if did and (not period_month or _date_in_period(pdate, period_month)):
             mc_map.setdefault(did, []).append(mc)
 
     for r in records:
         did   = r.get('Disbursement ID', '')
         ddate = str(r.get('Disbursement Date', '') or '')
+        # Strictly this period: disbursed in-month, paid in-month, or matched
+        # against this period's bank statement.
+        if period_month and not (_date_in_period(ddate, period_month)
+                                 or did in mc_map
+                                 or did in bank_debit_by_ref
+                                 or did in bank_credit_refs):
+            continue
         amt   = _to_num(r.get('Amount', 0))
         books_utr = str(r.get('Debit Note', '') or '').strip()
 
@@ -1767,10 +1803,21 @@ def _sheet_mapped(wb, period_label, records, mc_rows, classified_txns, s):
         else:
             first = True
             for mc in payments:
-                mc_utr  = str(mc[3] if len(mc) > 3 else '').strip()
+                # Same UTR handling as Collection Recon: col D may hold raw
+                # SMS text — extract, else backfill from a unique same-amount
+                # bank credit.
+                mc_raw  = str(mc[3] if len(mc) > 3 else '').strip()
                 mc_amt  = _clean_amount(mc[2]) if len(mc) > 2 else 0
                 mc_date = mc[1] if len(mc) > 1 else ''
-                bank_cr = bank_credit_by_utr.get(mc_utr.upper())
+                mc_utr  = extract_utr(mc_raw)
+                if not mc_utr and re.fullmatch(r'[A-Za-z0-9\-/]{6,25}', mc_raw or ''):
+                    mc_utr = mc_raw  # already a bare ref, just not SMS-shaped
+                bank_cr = bank_credit_by_utr.get(mc_utr.upper()) if mc_utr else None
+                if not mc_utr:
+                    amt_matches = bank_cr_by_amt.get(round(mc_amt), [])
+                    if len(amt_matches) == 1:
+                        bank_cr = amt_matches[0]
+                        mc_utr  = bank_cr.get('utr', '')
                 row_fill = (dr_fill if first else (s['grn_fill'] if bank_cr else s['amb_fill']))
                 _row(ws, row, [
                     did if first else '',
@@ -1918,21 +1965,22 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
     # map with no period filter — per-period calls would duplicate the book).
     total_dr = total_cr = 0.0
     for p in periods:
-        p_label = p['period_label']
-        sheet_label = f"{p_label} — {p['account']}" if p['account'] else p_label
+        p_label = p['period_label']  # month scope, e.g. "Jul 2026" — drives filtering
+        # Daily sections need the day in the header, otherwise consecutive
+        # saves within a month are indistinguishable.
+        day_label = f"{p['recon_date']} ({p_label})"
+        sheet_label = f"{day_label} — {p['account']}" if p['account'] else day_label
         dr, cr = _sheet_statement(wb, sheet_label, p['remarks'], p['opening'],
                                   p['closing'], p['txns'], s)
         is_current = (p['recon_date'] == recon_date and p['account'] == account)
         if is_current:
             total_dr, total_cr = dr, cr
-        _sheet_disb_recon(wb, p_label, records, p['txns'], s, p_label,
+        _sheet_disb_recon(wb, day_label, records, p['txns'], s, p_label,
                           rm if is_current else {})
-        _sheet_coll_recon(wb, p_label, records, mc_rows, p['txns'], s, p_label,
+        _sheet_coll_recon(wb, day_label, records, mc_rows, p['txns'], s, p_label,
                           rm if is_current else {})
-        _sheet_expenses(wb, p_label, p['txns'], s)
-    if periods:
-        latest = periods[-1]
-        _sheet_mapped(wb, latest['period_label'], records, mc_rows, latest['txns'], s)
+        _sheet_expenses(wb, day_label, p['txns'], s)
+        _sheet_mapped(wb, day_label, records, mc_rows, p['txns'], s, p_label)
 
     buf = io.BytesIO()
     wb.save(buf)
