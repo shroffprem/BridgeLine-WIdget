@@ -776,6 +776,162 @@ def save_repayment(data):
     trigger_ledger_rebuild()
     return {'new_collected': new_coll, 'new_balance': new_bal, 'status': new_status}
 
+# ── Case editing (fix mistakes in saved disbursements / repayments) ───────────
+
+def _case_detail(disb_id):
+    """Everything the Edit Case screen needs: the Accounts row's editable +
+    computed fields, and the case's individual payments from M Coll (each
+    with its live M Coll row number so edits/deletes can target it)."""
+    disb_id = disb_id.strip().upper()
+    info = lookup_case(disb_id)
+    if not info['found']:
+        return None
+    sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
+    vals = ws.row_values(info['row'])
+    def cell(key):
+        i = COL[key] - 1
+        return vals[i] if i < len(vals) else ''
+
+    payments = []
+    try:
+        mc = sh.worksheet('M Coll')
+        for i, r in enumerate(mc.get_all_values(), start=1):
+            if r and str(r[0]).strip().upper() == disb_id:
+                payments.append({
+                    'mc_row': i,
+                    'date':   r[1] if len(r) > 1 else '',
+                    'amount': _to_num(r[2]) if len(r) > 2 else 0,
+                    'utr':    r[3] if len(r) > 3 else '',
+                })
+    except Exception:
+        pass
+
+    return {
+        'disb_id': disb_id, 'sheet': info['sheet'],
+        'date': cell('date'), 'customer': cell('customer'), 'chq': cell('chq'),
+        'company': cell('company'), 'cluster': cell('cluster'), 'branch': cell('branch'),
+        'amount': _to_num(cell('amount')), 'charges': _to_num(cell('charges')),
+        'gst': _to_num(cell('gst')), 'total': _to_num(cell('total')),
+        'discount': _to_num(cell('discount')), 'collected': _to_num(cell('coll_amount')),
+        'balance': _to_num(cell('balance')), 'status': cell('status'),
+        'srv_branch': cell('srv_branch'), 'srv_cluster': cell('srv_cluster'),
+        'debit_note': cell('debit_note'), 'remarks': cell('remarks'),
+        'payments': payments,
+    }
+
+EDITABLE_TEXT_FIELDS = ('date', 'customer', 'chq', 'company', 'cluster', 'branch',
+                        'srv_branch', 'srv_cluster', 'debit_note', 'remarks')
+
+def update_disbursement(data):
+    """Writes corrected disbursement fields back to the case's Accounts row.
+    An amount change recomputes the derived money chain (charges 0.5%, GST
+    18% on charges, total) and re-derives status against existing
+    collections. The Balance column is a live formula in the sheet — never
+    written back (same as save_repayment)."""
+    disb_id = data['disb_id'].strip().upper()
+    info = lookup_case(disb_id)
+    if not info['found']:
+        raise ValueError(f"Disbursement ID '{disb_id}' not found.")
+    sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
+    row = info['row']
+
+    updates = [(row, COL[k], str(data[k]).strip())
+               for k in EDITABLE_TEXT_FIELDS if k in data]
+
+    if str(data.get('amount', '')).strip() != '':
+        amount  = float(data['amount'])
+        charges = round(amount * 0.005, 2)
+        gst     = round(charges * 0.18, 2)
+        total   = round(amount + charges + gst, 2)
+        collected = _cell_num(ws, row, COL['coll_amount'])
+        discount  = _cell_num(ws, row, COL['discount'])
+        bal       = max(0, total - collected - discount)
+        # Same sub-₹1 closed threshold as save_repayment; a previously Closed
+        # case whose corrected amount leaves money owed reopens.
+        status = 'Closed' if bal < 1 else (
+            'Follow Up!' if info['status'] in ('', 'Closed') else info['status'])
+        updates += [(row, COL['amount'],  amount),
+                    (row, COL['charges'], charges),
+                    (row, COL['gst'],     gst),
+                    (row, COL['total'],   total),
+                    (row, COL['status'],  status)]
+
+    if updates:
+        ws.batch_update([{
+            'range': gspread.utils.rowcol_to_a1(r, c),
+            'values': [[v]]
+        } for r, c, v in updates])
+        trigger_ledger_rebuild()
+
+def _recompute_case_from_mcoll(disb_id):
+    """After an M Coll payment row is edited or deleted, re-derive the
+    Accounts row's aggregates from the full M Coll history — M Coll is the
+    one definitive payment record. Balance stays formula-driven."""
+    disb_id = disb_id.strip().upper()
+    info = lookup_case(disb_id)
+    if not info['found']:
+        raise ValueError(f"Disbursement ID '{disb_id}' not found.")
+    sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
+    row = info['row']
+
+    pays = [r for r in sh.worksheet('M Coll').get_all_values()
+            if r and str(r[0]).strip().upper() == disb_id]
+    collected = sum(_to_num(r[2]) if len(r) > 2 else 0 for r in pays)
+
+    def _pd(dstr):
+        for f in ('%d-%m-%Y', '%d/%m/%Y', '%d-%b-%Y', '%Y-%m-%d'):
+            try:
+                return datetime.strptime(str(dstr).strip(), f)
+            except Exception:
+                pass
+        return None
+    dated = [(d, r[1]) for r in pays if len(r) > 1 for d in [_pd(r[1])] if d]
+    coll_date = max(dated)[1] if dated else (pays[-1][1] if pays and len(pays[-1]) > 1 else '')
+
+    total    = _cell_num(ws, row, COL['total']) or calc_total(_cell_num(ws, row, COL['amount']))
+    discount = _cell_num(ws, row, COL['discount'])
+    bal      = max(0, total - collected - discount)
+    status   = 'Closed' if bal < 1 else 'Follow Up!'
+
+    ws.batch_update([{
+        'range': gspread.utils.rowcol_to_a1(row, c),
+        'values': [[v]]
+    } for c, v in [(COL['coll_date'], coll_date), (COL['coll_amount'], collected),
+                   (COL['status'], status)]])
+    trigger_ledger_rebuild()
+
+def _mcoll_row_checked(sh, disb_id, mc_row):
+    """Guard against stale row numbers: the M Coll row being targeted must
+    still belong to this case."""
+    mc = sh.worksheet('M Coll')
+    current = mc.row_values(mc_row)
+    if not current or str(current[0]).strip().upper() != disb_id.strip().upper():
+        raise ValueError('That payment row has moved — reload the case and try again.')
+    return mc
+
+def update_repayment(data):
+    disb_id = data['disb_id'].strip().upper()
+    mc_row  = int(data['mc_row'])
+    sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    mc = _mcoll_row_checked(sh, disb_id, mc_row)
+    mc.batch_update([
+        {'range': gspread.utils.rowcol_to_a1(mc_row, 2), 'values': [[str(data.get('date', '')).strip()]]},
+        {'range': gspread.utils.rowcol_to_a1(mc_row, 3), 'values': [[float(data['amount'])]]},
+        {'range': gspread.utils.rowcol_to_a1(mc_row, 4), 'values': [[str(data.get('utr', '')).strip()]]},
+    ])
+    _recompute_case_from_mcoll(disb_id)
+
+def delete_repayment(data):
+    disb_id = data['disb_id'].strip().upper()
+    mc_row  = int(data['mc_row'])
+    sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    mc = _mcoll_row_checked(sh, disb_id, mc_row)
+    mc.delete_rows(mc_row)
+    _recompute_case_from_mcoll(disb_id)
+
 # ── Config (stored in a 'Config' tab of the same spreadsheet) ─────────────────
 # No persistent local disk exists on a serverless host, so config lives in the
 # Sheet (key/value rows, one per top-level key; dict/list values JSON-encoded
@@ -2148,6 +2304,7 @@ HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="showTab('calc',this)">🧮 Calculator</button>
     <button class="tab-btn" onclick="showTab('recon',this)">🏦 Bank Reconciliation</button>
     <button class="tab-btn" onclick="showTab('invoice',this); loadInvoiceCases()">📄 Invoice</button>
+    <button class="tab-btn" onclick="showTab('edit',this)">✏️ Edit Case</button>
     <button class="tab-btn" onclick="showTab('contacts',this); loadContacts()">👥 Contacts</button>
     <button class="tab-btn" onclick="showTab('settings',this); loadSettings()">⚙ Settings</button>
     <button class="tab-btn" id="mis-btn" onclick="generateMis()" style="background:#1a3a5c;color:#fff">📦 Generate MIS Package</button>
@@ -2415,6 +2572,58 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- EDIT CASE TAB -->
+  <div id="edit" class="tab-content">
+    <div class="section">
+      <h3>Load a Case</h3>
+      <div style="display:flex;gap:10px;align-items:flex-end">
+        <div class="field" style="flex:1"><label>Disbursement ID</label>
+          <input type="text" id="e-disb-id" placeholder="e.g. BLP-010726-001" style="text-transform:uppercase" oninput="this.value=this.value.toUpperCase()"></div>
+        <button class="btn btn-extract" style="width:auto;padding:10px 24px" onclick="loadEditCase()">🔍 Load Case</button>
+      </div>
+      <div id="e-load-status" class="status"></div>
+    </div>
+    <div id="e-body" style="display:none">
+      <div class="section">
+        <h3>Disbursement Details <span id="e-case-id" style="font-weight:400;color:#888;font-size:13px"></span></h3>
+        <div class="grid">
+          <div class="field"><label>Date (DD-MM-YYYY)</label><input type="text" id="e-date"></div>
+          <div class="field"><label>Customer Name</label><input type="text" id="e-customer"></div>
+          <div class="field"><label>Company</label>
+            <input type="text" id="e-company" list="company-list"></div>
+          <div class="field"><label>Cluster</label>
+            <input type="text" id="e-cluster" list="cluster-list"></div>
+          <div class="field"><label>Branch</label>
+            <input type="text" id="e-branch" list="branch-list"></div>
+          <div class="field"><label>Cheque No.</label><input type="text" id="e-chq"></div>
+          <div class="field"><label>Amount (₹)</label>
+            <input type="number" id="e-amount"><span class="hint">Changing this recomputes charges, GST, total &amp; status</span></div>
+          <div class="field"><label>Serviced Branch</label>
+            <input type="text" id="e-srv-branch" list="srv-branch-list"></div>
+          <div class="field"><label>Serviced Cluster</label>
+            <input type="text" id="e-srv-cluster" list="srv-cluster-list"></div>
+          <div class="field" style="grid-column:1/-1"><label>Disbursement UTR / Debit Note</label>
+            <input type="text" id="e-debit-note"></div>
+          <div class="field" style="grid-column:1/-1"><label>Remarks</label>
+            <input type="text" id="e-remarks"></div>
+        </div>
+        <div id="e-computed" style="margin-top:10px;padding:10px 12px;background:#f0f7ff;border:1px solid #b3d4f5;border-radius:6px;font-size:13px;line-height:1.7"></div>
+        <button class="btn btn-save" style="margin-top:12px" onclick="saveEditDisb()">💾 Save Disbursement Changes</button>
+        <div id="e-disb-status" class="status"></div>
+      </div>
+      <div class="section">
+        <h3>Repayments</h3>
+        <div style="overflow-x:auto">
+          <table class="recon-table" style="width:100%">
+            <thead><tr><th>Date</th><th style="text-align:right">Amount (₹)</th><th>UTR / Note</th><th style="width:130px">Actions</th></tr></thead>
+            <tbody id="e-pay-tbody"></tbody>
+          </table>
+        </div>
+        <div id="e-pay-status" class="status"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- INVOICE TAB -->
   <div id="invoice" class="tab-content">
     <div class="section">
@@ -2488,6 +2697,113 @@ function selectPendingRequest(r) {
     <button onclick="clearDisb()" style="float:right;font-size:11px;padding:2px 8px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">✕ Clear</button>`;
   info.style.display = 'block';
   document.getElementById('d-customer').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// ── Edit Case tab ────────────────────────────────────────────────────────────
+let _editCase = null;
+
+async function loadEditCase() {
+  const id = document.getElementById('e-disb-id').value.trim().toUpperCase();
+  if (!id) return showStatus('e-load-status','error','Enter a Disbursement ID.');
+  showStatus('e-load-status','success','Loading...');
+  try {
+    const r = await (await fetch(`/case/${encodeURIComponent(id)}/detail`)).json();
+    if (!r.ok) throw new Error(r.error || 'Not found');
+    renderEditCase(r.case);
+    showStatus('e-load-status','success',`✅ Loaded ${id}`);
+  } catch(e) {
+    document.getElementById('e-body').style.display = 'none';
+    showStatus('e-load-status','error','❌ ' + e.message);
+  }
+}
+
+function renderEditCase(c) {
+  _editCase = c;
+  document.getElementById('e-body').style.display = '';
+  document.getElementById('e-case-id').textContent = `— ${c.disb_id} (${c.sheet})`;
+  const set = (id,v) => document.getElementById(id).value = v ?? '';
+  set('e-date', c.date); set('e-customer', c.customer); set('e-chq', c.chq);
+  set('e-company', c.company); set('e-cluster', c.cluster); set('e-branch', c.branch);
+  set('e-amount', c.amount); set('e-srv-branch', c.srv_branch); set('e-srv-cluster', c.srv_cluster);
+  set('e-debit-note', c.debit_note); set('e-remarks', c.remarks);
+  document.getElementById('e-computed').innerHTML =
+    `<b>Computed:</b> Charges ₹${fmtDec(c.charges)} &nbsp;|&nbsp; GST ₹${fmtDec(c.gst)} &nbsp;|&nbsp; Total ₹${fmtDec(c.total)}` +
+    ` &nbsp;|&nbsp; Collected ₹${fmtDec(c.collected)} &nbsp;|&nbsp; Discount ₹${fmtDec(c.discount)}` +
+    ` &nbsp;|&nbsp; <b>Balance ₹${fmtDec(c.balance)}</b> &nbsp;|&nbsp; Status: <b>${c.status || '—'}</b>`;
+  renderEditPayments();
+}
+
+function renderEditPayments() {
+  const tb = document.getElementById('e-pay-tbody');
+  tb.innerHTML = '';
+  if (!_editCase.payments.length) {
+    tb.innerHTML = '<tr><td colspan="4" style="color:#aaa">No payments recorded in M Coll for this case.</td></tr>';
+    return;
+  }
+  _editCase.payments.forEach((p, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${p.date}</td><td style="text-align:right">${fmtDec(p.amount)}</td>` +
+      `<td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(p.utr||'').replace(/"/g,'&quot;')}">${p.utr || '—'}</td>` +
+      `<td><button onclick="editPayRow(${i})" style="padding:3px 10px;font-size:12px;cursor:pointer">✏️ Edit</button> ` +
+      `<button onclick="delPayRow(${i})" style="padding:3px 10px;font-size:12px;cursor:pointer;color:#a00">🗑</button></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+function editPayRow(i) {
+  const p = _editCase.payments[i];
+  const tr = document.getElementById('e-pay-tbody').children[i];
+  tr.innerHTML = `<td><input type="text" id="ep-date-${i}" value="${p.date}" style="width:110px"></td>` +
+    `<td style="text-align:right"><input type="number" id="ep-amt-${i}" value="${p.amount}" style="width:120px;text-align:right"></td>` +
+    `<td><input type="text" id="ep-utr-${i}" value="${(p.utr||'').replace(/"/g,'&quot;')}" style="width:100%"></td>` +
+    `<td><button onclick="savePayRow(${i})" style="padding:3px 10px;font-size:12px;cursor:pointer;color:#155724">✅ Save</button> ` +
+    `<button onclick="renderEditPayments()" style="padding:3px 10px;font-size:12px;cursor:pointer">✕</button></td>`;
+}
+
+async function savePayRow(i) {
+  const p = _editCase.payments[i];
+  const body = {
+    disb_id: _editCase.disb_id, mc_row: p.mc_row,
+    date:   document.getElementById(`ep-date-${i}`).value.trim(),
+    amount: document.getElementById(`ep-amt-${i}`).value,
+    utr:    document.getElementById(`ep-utr-${i}`).value.trim(),
+  };
+  if (!body.amount) return showStatus('e-pay-status','error','Amount is required.');
+  showStatus('e-pay-status','success','Saving...');
+  const r = await (await fetch('/case/update-repayment', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
+  if (r.ok) { renderEditCase(r.case); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
+  else showStatus('e-pay-status','error','❌ ' + r.error);
+}
+
+async function delPayRow(i) {
+  const p = _editCase.payments[i];
+  if (!confirm(`Delete this payment?\n\n${p.date}  ₹${fmtDec(p.amount)}\n${p.utr || ''}\n\nThe case balance and status will be recomputed.`)) return;
+  showStatus('e-pay-status','success','Deleting...');
+  const r = await (await fetch('/case/delete-repayment', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({disb_id: _editCase.disb_id, mc_row: p.mc_row})})).json();
+  if (r.ok) { renderEditCase(r.case); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
+  else showStatus('e-pay-status','error','❌ ' + r.error);
+}
+
+async function saveEditDisb() {
+  if (!_editCase) return;
+  const g = id => document.getElementById(id).value.trim();
+  const body = {
+    disb_id: _editCase.disb_id,
+    date: g('e-date'), customer: g('e-customer'), chq: g('e-chq'),
+    company: g('e-company'), cluster: g('e-cluster'), branch: g('e-branch'),
+    amount: g('e-amount'), srv_branch: g('e-srv-branch'), srv_cluster: g('e-srv-cluster'),
+    debit_note: g('e-debit-note'), remarks: g('e-remarks'),
+  };
+  if (!body.customer || !body.amount) return showStatus('e-disb-status','error','Customer and Amount are required.');
+  const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
+  const r = await (await fetch('/case/update-disbursement', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
+  btn.disabled = false; btn.textContent = '💾 Save Disbursement Changes';
+  if (r.ok) { renderEditCase(r.case); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
+  else showStatus('e-disb-status','error','❌ ' + r.error);
 }
 
 // ── Invoice tab ──────────────────────────────────────────────────────────────
@@ -3356,6 +3672,40 @@ def api_save_disbursement():
 def api_save_repayment():
     try:
         return jsonify({'ok': True, **save_repayment(request.json)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/case/<disb_id>/detail')
+def api_case_detail(disb_id):
+    try:
+        detail = _case_detail(disb_id)
+        if not detail:
+            return jsonify({'ok': False, 'error': f'{disb_id.upper()} not found'}), 404
+        return jsonify({'ok': True, 'case': detail})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/case/update-disbursement', methods=['POST'])
+def api_case_update_disbursement():
+    try:
+        update_disbursement(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/case/update-repayment', methods=['POST'])
+def api_case_update_repayment():
+    try:
+        update_repayment(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/case/delete-repayment', methods=['POST'])
+def api_case_delete_repayment():
+    try:
+        delete_repayment(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
