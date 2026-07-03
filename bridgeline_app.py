@@ -983,6 +983,26 @@ def delete_repayment(data):
     mc.delete_rows(mc_row)
     _recompute_case_from_mcoll(disb_id)
 
+def add_repayment(data):
+    """Append a new M Coll payment row from the Edit Case tab — the same
+    write save_repayment() does, minus the WhatsApp-extraction fields that
+    only apply to the standalone Repayment tab's paste-a-message flow."""
+    disb_id = data['disb_id'].strip().upper()
+    info = lookup_case(disb_id)
+    if not info['found']:
+        raise ValueError(f"Disbursement ID '{disb_id}' not found.")
+    sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    mc = sh.worksheet('M Coll')
+    next_row = len(mc.get_all_values()) + 1
+    mc.insert_row([
+        disb_id,
+        str(data.get('date', '')).strip(),
+        float(data['amount']),
+        str(data.get('utr', '')).strip(),
+        info.get('customer', ''),
+    ], next_row)
+    _recompute_case_from_mcoll(disb_id)
+
 # ── Config (stored in a 'Config' tab of the same spreadsheet) ─────────────────
 # No persistent local disk exists on a serverless host, so config lives in the
 # Sheet (key/value rows, one per top-level key; dict/list values JSON-encoded
@@ -2682,6 +2702,15 @@ HTML = """<!DOCTYPE html>
             <tbody id="e-pay-tbody"></tbody>
           </table>
         </div>
+        <div style="display:flex;gap:10px;align-items:flex-end;margin-top:14px;padding-top:14px;border-top:1px solid #e0e6ed">
+          <div class="field" style="flex:0 0 130px;margin:0"><label>Date</label>
+            <input type="text" id="e-new-pay-date" placeholder="DD-MM-YYYY"></div>
+          <div class="field" style="flex:0 0 140px;margin:0"><label>Amount (₹)</label>
+            <input type="number" id="e-new-pay-amount"></div>
+          <div class="field" style="flex:1;margin:0"><label>UTR / Note</label>
+            <input type="text" id="e-new-pay-utr"></div>
+          <button class="btn btn-save" style="width:auto;padding:10px 20px" onclick="addPayRow()">➕ Add Payment</button>
+        </div>
         <div id="e-pay-status" class="status"></div>
       </div>
     </div>
@@ -2831,6 +2860,7 @@ function renderEditCase(c) {
   set('e-company', c.company); set('e-cluster', c.cluster); set('e-branch', c.branch);
   set('e-amount', c.amount); set('e-srv-branch', c.srv_branch); set('e-srv-cluster', c.srv_cluster);
   set('e-debit-note', c.debit_note); set('e-remarks', c.remarks);
+  document.getElementById('e-new-pay-date').value = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
   document.getElementById('e-computed').innerHTML =
     `<b>Computed:</b> Charges ₹${fmtDec(c.charges)} &nbsp;|&nbsp; GST ₹${fmtDec(c.gst)} &nbsp;|&nbsp; Total ₹${fmtDec(c.total)}` +
     ` &nbsp;|&nbsp; Collected ₹${fmtDec(c.collected)} &nbsp;|&nbsp; Discount ₹${fmtDec(c.discount)}` +
@@ -2890,6 +2920,26 @@ async function delPayRow(i) {
     body: JSON.stringify({disb_id: _editCase.disb_id, mc_row: p.mc_row})})).json();
   if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
   else showStatus('e-pay-status','error','❌ ' + r.error);
+}
+
+async function addPayRow() {
+  if (!_editCase) return;
+  const body = {
+    disb_id: _editCase.disb_id,
+    date:   document.getElementById('e-new-pay-date').value.trim(),
+    amount: document.getElementById('e-new-pay-amount').value,
+    utr:    document.getElementById('e-new-pay-utr').value.trim(),
+  };
+  if (!body.date || !body.amount) return showStatus('e-pay-status','error','Date and Amount are required.');
+  showStatus('e-pay-status','success','Adding...');
+  const r = await (await fetch('/case/add-repayment', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
+  if (r.ok) {
+    renderEditCase(r.case); loadRecentCases();
+    document.getElementById('e-new-pay-amount').value = '';
+    document.getElementById('e-new-pay-utr').value = '';
+    showStatus('e-pay-status','success','✅ Payment added — balance & status recomputed.');
+  } else showStatus('e-pay-status','error','❌ ' + r.error);
 }
 
 async function saveEditDisb() {
@@ -3818,6 +3868,14 @@ def api_case_update_repayment():
 def api_case_delete_repayment():
     try:
         delete_repayment(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/case/add-repayment', methods=['POST'])
+def api_case_add_repayment():
+    try:
+        add_repayment(request.json)
         return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
