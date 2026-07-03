@@ -796,19 +796,13 @@ def _parse_any_date(s):
 def get_recent_cases(days=7):
     """Cases with disbursement or collection activity in the last N days —
     lets Edit Case surface a pick-list instead of requiring the exact Disb
-    ID. Reads only the live Accounts sheet (not the archive tabs, which by
-    definition hold cases already aged out of recent activity)."""
-    ws = get_sheet()
-    all_vals = ws.get_all_values()
-    header_idx = next((i for i, r in enumerate(all_vals) if r and 'Disbursement ID' in r), 1)
-    headers = all_vals[header_idx]
+    ID. Uses read_accounts_from_gsheet(), which merges the live Accounts
+    sheet with every active monthly archive tab — a case can be archived
+    (rolled out of Accounts by disbursement month) while still receiving
+    repayments today, so archives must be scanned too, not skipped."""
     cutoff = datetime.today() - timedelta(days=days)
-
     cases = []
-    for row in all_vals[header_idx + 1:]:
-        if not row or not row[0].startswith('BLP-'):
-            continue
-        r = {headers[j]: (row[j] if j < len(row) else '') for j in range(len(headers))}
+    for r in read_accounts_from_gsheet():
         ddate = _parse_any_date(r.get('Disbursement Date', ''))
         cdate = _parse_any_date(r.get('Collection Date', ''))
         latest = max([d for d in (ddate, cdate) if d], default=None)
@@ -825,6 +819,7 @@ def get_recent_cases(days=7):
             'status':   r.get('Overdue Status', '').strip(),
             'disb_date': r.get('Disbursement Date', ''),
             'coll_date': r.get('Collection Date', ''),
+            'sheet':    r.get('_sheet', SHEET_NAME),
             '_latest':  latest,
         })
 
@@ -2830,7 +2825,9 @@ async function loadRecentCases() {
       card.onmouseenter = () => card.style.background = '#f0f7ff';
       card.onmouseleave = () => card.style.background = '#fff';
       const activity = c.coll_date ? `Last payment ${c.coll_date}` : `Disbursed ${c.disb_date}`;
-      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${c.customer} <span style="font-weight:400;color:#888;font-size:12px">${c.disb_id}</span></div>
+      const archTag = c.sheet && c.sheet !== 'Accounts'
+        ? ` <span style="background:#fff3cd;color:#8a6500;font-size:10px;padding:1px 6px;border-radius:3px;">📁 ${c.sheet}</span>` : '';
+      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${c.customer} <span style="font-weight:400;color:#888;font-size:12px">${c.disb_id}</span>${archTag}</div>
         <div style="font-size:12px;color:#555;margin-top:3px;">${c.cluster} · ${c.branch} · ₹${fmt(c.balance)} balance &nbsp;·&nbsp; ${c.status || '—'}</div>
         <div style="font-size:11px;color:#999;margin-top:2px;">${activity}</div>`;
       card.addEventListener('click', () => {
