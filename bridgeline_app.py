@@ -1080,11 +1080,16 @@ def get_latest_bank_balance():
         rows = ws.get_all_values()[1:]  # skip header
         if not rows:
             return None, None
-        # Latest row per account (blank Account = single legacy account,
-        # from before multi-account support existed)
+        # Only count accounts currently registered in Config — a blank/
+        # unrecognised Account tag is orphaned data (e.g. rows saved before
+        # multi-account support existed, or a since-removed account) and
+        # must not be summed in as if it were still a live account.
+        registered = {a.get('name', '').strip() for a in (load_config().get('bank_accounts') or [])}
         latest_by_account = {}
         for row in rows:
             acct = row[4].strip() if len(row) > 4 else ''
+            if registered and acct not in registered:
+                continue
             latest_by_account[acct] = row  # last write wins -> most recent append for that account
         closings, dates = [], []
         for row in latest_by_account.values():
