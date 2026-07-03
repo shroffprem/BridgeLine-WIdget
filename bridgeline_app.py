@@ -741,6 +741,10 @@ def save_repayment(data):
         (row, COL['coll_date'],   coll_date),
         (row, COL['coll_amount'], new_coll),
         (row, COL['status'],      new_status),
+        # Balance was previously left stale in the sheet (never written
+        # after creation) — only the in-memory API response had the right
+        # number. Write it back so the raw sheet matches reality too.
+        (row, COL['balance'],     new_bal),
     ]
     if discount:
         updates.append((row, COL['discount'], discount))
@@ -858,14 +862,24 @@ def _case_detail(disb_id):
     except Exception:
         pass
 
+    total     = _to_num(cell('total')) or calc_total(_to_num(cell('amount')))
+    collected = _to_num(cell('coll_amount'))
+    discount  = _to_num(cell('discount'))
+    # Balance is computed live from Total/Collected/Discount, same as
+    # _parse_case() everywhere else in the app — the sheet's stored Balance
+    # column (col O) is a stale snapshot written once at creation and never
+    # updated by save_repayment()/save_disbursement(), so it must not be
+    # read directly here.
+    balance = max(0, total - collected - discount)
+
     return {
         'disb_id': disb_id, 'sheet': info['sheet'],
         'date': cell('date'), 'customer': cell('customer'), 'chq': cell('chq'),
         'company': cell('company'), 'cluster': cell('cluster'), 'branch': cell('branch'),
         'amount': _to_num(cell('amount')), 'charges': _to_num(cell('charges')),
-        'gst': _to_num(cell('gst')), 'total': _to_num(cell('total')),
-        'discount': _to_num(cell('discount')), 'collected': _to_num(cell('coll_amount')),
-        'balance': _to_num(cell('balance')), 'status': cell('status'),
+        'gst': _to_num(cell('gst')), 'total': total,
+        'discount': discount, 'collected': collected,
+        'balance': balance, 'status': cell('status'),
         'srv_branch': cell('srv_branch'), 'srv_cluster': cell('srv_cluster'),
         'debit_note': cell('debit_note'), 'remarks': cell('remarks'),
         'payments': payments,
@@ -877,9 +891,8 @@ EDITABLE_TEXT_FIELDS = ('date', 'customer', 'chq', 'company', 'cluster', 'branch
 def update_disbursement(data):
     """Writes corrected disbursement fields back to the case's Accounts row.
     An amount change recomputes the derived money chain (charges 0.5%, GST
-    18% on charges, total) and re-derives status against existing
-    collections. The Balance column is a live formula in the sheet — never
-    written back (same as save_repayment)."""
+    18% on charges, total) and re-derives status/balance against existing
+    collections."""
     disb_id = data['disb_id'].strip().upper()
     info = lookup_case(disb_id)
     if not info['found']:
@@ -907,7 +920,8 @@ def update_disbursement(data):
                     (row, COL['charges'], charges),
                     (row, COL['gst'],     gst),
                     (row, COL['total'],   total),
-                    (row, COL['status'],  status)]
+                    (row, COL['status'],  status),
+                    (row, COL['balance'], bal)]
 
     if updates:
         ws.batch_update([{
@@ -917,9 +931,9 @@ def update_disbursement(data):
         trigger_ledger_rebuild()
 
 def _recompute_case_from_mcoll(disb_id):
-    """After an M Coll payment row is edited or deleted, re-derive the
-    Accounts row's aggregates from the full M Coll history — M Coll is the
-    one definitive payment record. Balance stays formula-driven."""
+    """After an M Coll payment row is added, edited, or deleted, re-derive
+    the Accounts row's aggregates from the full M Coll history — M Coll is
+    the one definitive payment record."""
     disb_id = disb_id.strip().upper()
     info = lookup_case(disb_id)
     if not info['found']:
@@ -951,7 +965,7 @@ def _recompute_case_from_mcoll(disb_id):
         'range': gspread.utils.rowcol_to_a1(row, c),
         'values': [[v]]
     } for c, v in [(COL['coll_date'], coll_date), (COL['coll_amount'], collected),
-                   (COL['status'], status)]])
+                   (COL['status'], status), (COL['balance'], bal)]])
     trigger_ledger_rebuild()
 
 def _mcoll_row_checked(sh, disb_id, mc_row):
