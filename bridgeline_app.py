@@ -793,40 +793,70 @@ def _parse_any_date(s):
             pass
     return None
 
-def get_recent_cases(days=7):
-    """Cases with disbursement or collection activity in the last N days —
-    lets Edit Case surface a pick-list instead of requiring the exact Disb
-    ID. Uses read_accounts_from_gsheet(), which merges the live Accounts
-    sheet with every active monthly archive tab — a case can be archived
-    (rolled out of Accounts by disbursement month) while still receiving
-    repayments today, so archives must be scanned too, not skipped."""
+def get_recent_activity(days=7):
+    """Every individual disbursement AND every individual repayment recorded
+    in the last N days — a flat, unfiltered event log rather than one
+    deduped row per case, so a case with several separate repayments today
+    (e.g. Gunashekar with 2 repayments) shows each one instead of collapsing
+    them into a single 'last activity' summary.
+
+    Disbursements come from read_accounts_from_gsheet() (merges Accounts +
+    every active monthly archive tab). Repayments come straight from M Coll,
+    the definitive payment-event log — cluster/branch are looked up from the
+    matching Accounts/archive record since M Coll doesn't carry them."""
     cutoff = datetime.today() - timedelta(days=days)
-    cases = []
-    for r in read_accounts_from_gsheet():
-        ddate = _parse_any_date(r.get('Disbursement Date', ''))
-        cdate = _parse_any_date(r.get('Collection Date', ''))
-        latest = max([d for d in (ddate, cdate) if d], default=None)
-        if not latest or latest < cutoff:
+    records = read_accounts_from_gsheet()
+    by_disb_id = {r.get('Disbursement ID', ''): r for r in records}
+
+    events = []
+    for r in records:
+        d = _parse_any_date(r.get('Disbursement Date', ''))
+        if not d or d < cutoff:
             continue
-        amount, total, collected, balance = _parse_case(r)
-        cases.append({
+        events.append({
+            'type': 'Disbursement',
             'disb_id':  r.get('Disbursement ID', ''),
             'customer': r.get('Customer Name', ''),
             'cluster':  r.get('Cluster', ''),
             'branch':   r.get('Branch', ''),
-            'amount':   amount,
-            'balance':  balance,
+            'amount':   _to_num(r.get('Amount', 0)),
+            'date':     r.get('Disbursement Date', ''),
+            'utr':      r.get('Debit Note', ''),
             'status':   r.get('Overdue Status', '').strip(),
-            'disb_date': r.get('Disbursement Date', ''),
-            'coll_date': r.get('Collection Date', ''),
             'sheet':    r.get('_sheet', SHEET_NAME),
-            '_latest':  latest,
+            '_sortkey': d,
         })
 
-    cases.sort(key=lambda c: c['_latest'], reverse=True)
-    for c in cases:
-        del c['_latest']
-    return cases
+    try:
+        mc_rows = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet('M Coll').get_all_values()[1:]
+    except Exception:
+        mc_rows = []
+    for row in mc_rows:
+        if not row or not row[0]:
+            continue
+        d = _parse_any_date(row[1] if len(row) > 1 else '')
+        if not d or d < cutoff:
+            continue
+        disb_id = row[0].strip()
+        case = by_disb_id.get(disb_id, {})
+        events.append({
+            'type': 'Repayment',
+            'disb_id':  disb_id,
+            'customer': row[4] if len(row) > 4 else case.get('Customer Name', ''),
+            'cluster':  case.get('Cluster', ''),
+            'branch':   case.get('Branch', ''),
+            'amount':   _to_num(row[2]) if len(row) > 2 else 0,
+            'date':     row[1] if len(row) > 1 else '',
+            'utr':      row[3] if len(row) > 3 else '',
+            'status':   case.get('Overdue Status', '').strip(),
+            'sheet':    case.get('_sheet', SHEET_NAME),
+            '_sortkey': d,
+        })
+
+    events.sort(key=lambda e: e['_sortkey'], reverse=True)
+    for e in events:
+        del e['_sortkey']
+    return events
 
 def _case_detail(disb_id):
     """Everything the Edit Case screen needs: the Accounts row's editable +
@@ -2811,27 +2841,34 @@ async function loadRecentCases() {
   try {
     const r = await (await fetch('/case/recent?days=7')).json();
     if (!r.ok) throw new Error(r.error || 'Failed to load');
-    const cases = r.cases;
-    if (!cases.length) {
-      list.innerHTML = '<span style="color:#aaa;font-size:13px;">No cases recorded in the last 7 days</span>';
+    const events = r.events;
+    if (!events.length) {
+      list.innerHTML = '<span style="color:#aaa;font-size:13px;">No disbursements or repayments recorded in the last 7 days</span>';
       countEl.textContent = '';
       return;
     }
-    countEl.textContent = `(${cases.length})`;
+    countEl.textContent = `(${events.length})`;
     list.innerHTML = '';
-    cases.forEach(c => {
+    events.forEach(e => {
       const card = document.createElement('div');
       card.style.cssText = 'border:1px solid #dce8f5;border-radius:6px;padding:10px 12px;margin-bottom:8px;cursor:pointer;background:#fff;transition:background 0.15s;';
       card.onmouseenter = () => card.style.background = '#f0f7ff';
       card.onmouseleave = () => card.style.background = '#fff';
-      const activity = c.coll_date ? `Last payment ${c.coll_date}` : `Disbursed ${c.disb_date}`;
-      const archTag = c.sheet && c.sheet !== 'Accounts'
-        ? ` <span style="background:#fff3cd;color:#8a6500;font-size:10px;padding:1px 6px;border-radius:3px;">📁 ${c.sheet}</span>` : '';
-      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${c.customer} <span style="font-weight:400;color:#888;font-size:12px">${c.disb_id}</span>${archTag}</div>
-        <div style="font-size:12px;color:#555;margin-top:3px;">${c.cluster} · ${c.branch} · ₹${fmt(c.balance)} balance &nbsp;·&nbsp; ${c.status || '—'}</div>
-        <div style="font-size:11px;color:#999;margin-top:2px;">${activity}</div>`;
+      const isDisb = e.type === 'Disbursement';
+      const typeTag = isDisb
+        ? '<span style="background:#e8f0fe;color:#1a3a5c;font-size:10px;padding:1px 6px;border-radius:3px;">➕ DISBURSEMENT</span>'
+        : '<span style="background:#e8f4ec;color:#155724;font-size:10px;padding:1px 6px;border-radius:3px;">💰 REPAYMENT</span>';
+      const archTag = e.sheet && e.sheet !== 'Accounts'
+        ? ` <span style="background:#fff3cd;color:#8a6500;font-size:10px;padding:1px 6px;border-radius:3px;">📁 ${e.sheet}</span>` : '';
+      card.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+          <div style="font-weight:600;font-size:14px;">${e.customer} <span style="font-weight:400;color:#888;font-size:12px">${e.disb_id}</span></div>
+          <div style="font-weight:700;font-size:14px;color:${isDisb ? '#1a3a5c' : '#155724'}">₹${fmt(e.amount)}</div>
+        </div>
+        <div style="margin-top:3px">${typeTag}${archTag}</div>
+        <div style="font-size:12px;color:#555;margin-top:5px;">${e.cluster} · ${e.branch} &nbsp;·&nbsp; ${e.status || '—'}${e.utr ? ' &nbsp;·&nbsp; ' + e.utr : ''}</div>
+        <div style="font-size:11px;color:#999;margin-top:2px;">${e.date}</div>`;
       card.addEventListener('click', () => {
-        document.getElementById('e-disb-id').value = c.disb_id;
+        document.getElementById('e-disb-id').value = e.disb_id;
         loadEditCase();
       });
       list.appendChild(card);
@@ -3879,7 +3916,7 @@ def api_save_repayment():
 def api_case_recent():
     try:
         days = int(request.args.get('days', 7))
-        return jsonify({'ok': True, 'cases': get_recent_cases(days)})
+        return jsonify({'ok': True, 'events': get_recent_activity(days)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
