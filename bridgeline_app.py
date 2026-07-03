@@ -9,7 +9,7 @@ import json
 import io
 import threading
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from flask import Flask, request, jsonify, render_template_string, Response
 
 # ── Google Sheets setup ───────────────────────────────────────────────────────
@@ -780,6 +780,54 @@ def save_repayment(data):
     return {'new_collected': new_coll, 'new_balance': new_bal, 'status': new_status}
 
 # ── Case editing (fix mistakes in saved disbursements / repayments) ───────────
+
+def _parse_any_date(s):
+    for f in ('%d-%m-%Y', '%d/%m/%Y', '%d-%b-%Y', '%Y-%m-%d', '%d-%b-%y'):
+        try:
+            return datetime.strptime(str(s).strip(), f)
+        except Exception:
+            pass
+    return None
+
+def get_recent_cases(days=7):
+    """Cases with disbursement or collection activity in the last N days —
+    lets Edit Case surface a pick-list instead of requiring the exact Disb
+    ID. Reads only the live Accounts sheet (not the archive tabs, which by
+    definition hold cases already aged out of recent activity)."""
+    ws = get_sheet()
+    all_vals = ws.get_all_values()
+    header_idx = next((i for i, r in enumerate(all_vals) if r and 'Disbursement ID' in r), 1)
+    headers = all_vals[header_idx]
+    cutoff = datetime.today() - timedelta(days=days)
+
+    cases = []
+    for row in all_vals[header_idx + 1:]:
+        if not row or not row[0].startswith('BLP-'):
+            continue
+        r = {headers[j]: (row[j] if j < len(row) else '') for j in range(len(headers))}
+        ddate = _parse_any_date(r.get('Disbursement Date', ''))
+        cdate = _parse_any_date(r.get('Collection Date', ''))
+        latest = max([d for d in (ddate, cdate) if d], default=None)
+        if not latest or latest < cutoff:
+            continue
+        amount, total, collected, balance = _parse_case(r)
+        cases.append({
+            'disb_id':  r.get('Disbursement ID', ''),
+            'customer': r.get('Customer Name', ''),
+            'cluster':  r.get('Cluster', ''),
+            'branch':   r.get('Branch', ''),
+            'amount':   amount,
+            'balance':  balance,
+            'status':   r.get('Overdue Status', '').strip(),
+            'disb_date': r.get('Disbursement Date', ''),
+            'coll_date': r.get('Collection Date', ''),
+            '_latest':  latest,
+        })
+
+    cases.sort(key=lambda c: c['_latest'], reverse=True)
+    for c in cases:
+        del c['_latest']
+    return cases
 
 def _case_detail(disb_id):
     """Everything the Edit Case screen needs: the Accounts row's editable +
@@ -2307,7 +2355,7 @@ HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="showTab('calc',this)">🧮 Calculator</button>
     <button class="tab-btn" onclick="showTab('recon',this)">🏦 Bank Reconciliation</button>
     <button class="tab-btn" onclick="showTab('invoice',this); loadInvoiceCases()">📄 Invoice</button>
-    <button class="tab-btn" onclick="showTab('edit',this)">✏️ Edit Case</button>
+    <button class="tab-btn" onclick="showTab('edit',this); loadRecentCases()">✏️ Edit Case</button>
     <button class="tab-btn" onclick="showTab('contacts',this); loadContacts()">👥 Contacts</button>
     <button class="tab-btn" onclick="showTab('settings',this); loadSettings()">⚙ Settings</button>
     <button class="tab-btn" id="mis-btn" onclick="generateMis()" style="background:#1a3a5c;color:#fff">📦 Generate MIS Package</button>
@@ -2586,6 +2634,13 @@ HTML = """<!DOCTYPE html>
       </div>
       <div id="e-load-status" class="status"></div>
     </div>
+    <div class="section" id="e-recent-section">
+      <h3 style="cursor:pointer;user-select:none;" onclick="toggleRecentCases()">
+        🕐 Recently Recorded (last 7 days) <span id="e-recent-count" style="font-size:13px;color:#888;font-weight:400;"></span>
+        <span id="e-recent-chevron" style="float:right;font-size:13px;">▼</span>
+      </h3>
+      <div id="e-recent-body"><div id="e-recent-list" style="margin-top:8px;"></div></div>
+    </div>
     <div id="e-body" style="display:none">
       <div class="section">
         <h3>Disbursement Details <span id="e-case-id" style="font-weight:400;color:#888;font-size:13px"></span></h3>
@@ -2704,6 +2759,48 @@ function selectPendingRequest(r) {
 
 // ── Edit Case tab ────────────────────────────────────────────────────────────
 let _editCase = null;
+let _recentCasesOpen = true;
+
+async function loadRecentCases() {
+  const list = document.getElementById('e-recent-list');
+  const countEl = document.getElementById('e-recent-count');
+  list.innerHTML = '<span style="color:#888;font-size:13px;">Loading...</span>';
+  try {
+    const r = await (await fetch('/case/recent?days=7')).json();
+    if (!r.ok) throw new Error(r.error || 'Failed to load');
+    const cases = r.cases;
+    if (!cases.length) {
+      list.innerHTML = '<span style="color:#aaa;font-size:13px;">No cases recorded in the last 7 days</span>';
+      countEl.textContent = '';
+      return;
+    }
+    countEl.textContent = `(${cases.length})`;
+    list.innerHTML = '';
+    cases.forEach(c => {
+      const card = document.createElement('div');
+      card.style.cssText = 'border:1px solid #dce8f5;border-radius:6px;padding:10px 12px;margin-bottom:8px;cursor:pointer;background:#fff;transition:background 0.15s;';
+      card.onmouseenter = () => card.style.background = '#f0f7ff';
+      card.onmouseleave = () => card.style.background = '#fff';
+      const activity = c.coll_date ? `Last payment ${c.coll_date}` : `Disbursed ${c.disb_date}`;
+      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${c.customer} <span style="font-weight:400;color:#888;font-size:12px">${c.disb_id}</span></div>
+        <div style="font-size:12px;color:#555;margin-top:3px;">${c.cluster} · ${c.branch} · ₹${fmt(c.balance)} balance &nbsp;·&nbsp; ${c.status || '—'}</div>
+        <div style="font-size:11px;color:#999;margin-top:2px;">${activity}</div>`;
+      card.addEventListener('click', () => {
+        document.getElementById('e-disb-id').value = c.disb_id;
+        loadEditCase();
+      });
+      list.appendChild(card);
+    });
+  } catch(e) {
+    list.innerHTML = `<span style="color:#c00;font-size:13px;">Error: ${e.message}</span>`;
+  }
+}
+
+function toggleRecentCases() {
+  _recentCasesOpen = !_recentCasesOpen;
+  document.getElementById('e-recent-body').style.display = _recentCasesOpen ? '' : 'none';
+  document.getElementById('e-recent-chevron').textContent = _recentCasesOpen ? '▼' : '▶';
+}
 
 async function loadEditCase() {
   const id = document.getElementById('e-disb-id').value.trim().toUpperCase();
@@ -2775,7 +2872,7 @@ async function savePayRow(i) {
   showStatus('e-pay-status','success','Saving...');
   const r = await (await fetch('/case/update-repayment', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
-  if (r.ok) { renderEditCase(r.case); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
+  if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
   else showStatus('e-pay-status','error','❌ ' + r.error);
 }
 
@@ -2786,7 +2883,7 @@ async function delPayRow(i) {
   const r = await (await fetch('/case/delete-repayment', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({disb_id: _editCase.disb_id, mc_row: p.mc_row})})).json();
-  if (r.ok) { renderEditCase(r.case); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
+  if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
   else showStatus('e-pay-status','error','❌ ' + r.error);
 }
 
@@ -2805,7 +2902,7 @@ async function saveEditDisb() {
   const r = await (await fetch('/case/update-disbursement', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
   btn.disabled = false; btn.textContent = '💾 Save Disbursement Changes';
-  if (r.ok) { renderEditCase(r.case); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
+  if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
   else showStatus('e-disb-status','error','❌ ' + r.error);
 }
 
@@ -3677,6 +3774,14 @@ def api_save_repayment():
         return jsonify({'ok': True, **save_repayment(request.json)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/case/recent')
+def api_case_recent():
+    try:
+        days = int(request.args.get('days', 7))
+        return jsonify({'ok': True, 'cases': get_recent_cases(days)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/case/<disb_id>/detail')
 def api_case_detail(disb_id):
