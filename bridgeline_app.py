@@ -2855,7 +2855,7 @@ async function loadEditCase() {
   if (!id) return showStatus('e-load-status','error','Enter a Disbursement ID.');
   showStatus('e-load-status','success','Loading...');
   try {
-    const r = await (await fetch(`/case/${encodeURIComponent(id)}/detail`)).json();
+    const r = await _fetchJsonWithTimeout(`/case/${encodeURIComponent(id)}/detail`, {});
     if (!r.ok) throw new Error(r.error || 'Not found');
     renderEditCase(r.case);
     showStatus('e-load-status','success',`✅ Loaded ${id}`);
@@ -2909,6 +2909,23 @@ function editPayRow(i) {
     `<button onclick="renderEditPayments()" style="padding:3px 10px;font-size:12px;cursor:pointer">✕</button></td>`;
 }
 
+// 25s client-side ceiling so a slow/hung request (e.g. Sheets API retrying
+// a rate-limit under the hood) always resolves to a visible error instead
+// of leaving the button/status stuck on "Saving..." forever.
+async function _fetchJsonWithTimeout(url, opts, ms) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), ms || 25000);
+  try {
+    const res = await fetch(url, {...opts, signal: ctrl.signal});
+    return await res.json();
+  } catch (e) {
+    if (e.name === 'AbortError') throw new Error('Request timed out — the sheet may be busy, please try again.');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function savePayRow(i) {
   const p = _editCase.payments[i];
   const body = {
@@ -2919,21 +2936,29 @@ async function savePayRow(i) {
   };
   if (!body.amount) return showStatus('e-pay-status','error','Amount is required.');
   showStatus('e-pay-status','success','Saving...');
-  const r = await (await fetch('/case/update-repayment', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
-  if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
-  else showStatus('e-pay-status','error','❌ ' + r.error);
+  try {
+    const r = await _fetchJsonWithTimeout('/case/update-repayment', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
+    else showStatus('e-pay-status','error','❌ ' + r.error);
+  } catch (e) {
+    showStatus('e-pay-status','error','❌ ' + e.message);
+  }
 }
 
 async function delPayRow(i) {
   const p = _editCase.payments[i];
   if (!confirm(`Delete this payment?\n\n${p.date}  ₹${fmtDec(p.amount)}\n${p.utr || ''}\n\nThe case balance and status will be recomputed.`)) return;
   showStatus('e-pay-status','success','Deleting...');
-  const r = await (await fetch('/case/delete-repayment', {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({disb_id: _editCase.disb_id, mc_row: p.mc_row})})).json();
-  if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
-  else showStatus('e-pay-status','error','❌ ' + r.error);
+  try {
+    const r = await _fetchJsonWithTimeout('/case/delete-repayment', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({disb_id: _editCase.disb_id, mc_row: p.mc_row})});
+    if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
+    else showStatus('e-pay-status','error','❌ ' + r.error);
+  } catch (e) {
+    showStatus('e-pay-status','error','❌ ' + e.message);
+  }
 }
 
 async function addPayRow() {
@@ -2946,14 +2971,18 @@ async function addPayRow() {
   };
   if (!body.date || !body.amount) return showStatus('e-pay-status','error','Date and Amount are required.');
   showStatus('e-pay-status','success','Adding...');
-  const r = await (await fetch('/case/add-repayment', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
-  if (r.ok) {
-    renderEditCase(r.case); loadRecentCases();
-    document.getElementById('e-new-pay-amount').value = '';
-    document.getElementById('e-new-pay-utr').value = '';
-    showStatus('e-pay-status','success','✅ Payment added — balance & status recomputed.');
-  } else showStatus('e-pay-status','error','❌ ' + r.error);
+  try {
+    const r = await _fetchJsonWithTimeout('/case/add-repayment', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (r.ok) {
+      renderEditCase(r.case); loadRecentCases();
+      document.getElementById('e-new-pay-amount').value = '';
+      document.getElementById('e-new-pay-utr').value = '';
+      showStatus('e-pay-status','success','✅ Payment added — balance & status recomputed.');
+    } else showStatus('e-pay-status','error','❌ ' + r.error);
+  } catch (e) {
+    showStatus('e-pay-status','error','❌ ' + e.message);
+  }
 }
 
 async function saveEditDisb() {
@@ -2968,11 +2997,16 @@ async function saveEditDisb() {
   };
   if (!body.customer || !body.amount) return showStatus('e-disb-status','error','Customer and Amount are required.');
   const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
-  const r = await (await fetch('/case/update-disbursement', {method:'POST',
-    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
-  btn.disabled = false; btn.textContent = '💾 Save Disbursement Changes';
-  if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
-  else showStatus('e-disb-status','error','❌ ' + r.error);
+  try {
+    const r = await _fetchJsonWithTimeout('/case/update-disbursement', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
+    else showStatus('e-disb-status','error','❌ ' + r.error);
+  } catch (e) {
+    showStatus('e-disb-status','error','❌ ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '💾 Save Disbursement Changes';
+  }
 }
 
 // ── Invoice tab ──────────────────────────────────────────────────────────────
