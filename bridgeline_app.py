@@ -2978,6 +2978,7 @@ function renderEditCase(c) {
   _editCase = c;
   document.getElementById('e-body').style.display = '';
   document.getElementById('e-case-id').textContent = `— ${c.disb_id} (${c.sheet})`;
+  document.getElementById('e-body').scrollIntoView({ behavior: 'smooth', block: 'start' });
   const set = (id,v) => document.getElementById(id).value = v ?? '';
   set('e-date', c.date); set('e-customer', c.customer); set('e-chq', c.chq);
   set('e-company', c.company); set('e-cluster', c.cluster); set('e-branch', c.branch);
