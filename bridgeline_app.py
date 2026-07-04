@@ -8,6 +8,7 @@ import re
 import json
 import io
 import threading
+import time
 import os
 from datetime import datetime, date, timedelta
 from flask import Flask, request, jsonify, render_template_string, Response
@@ -35,6 +36,9 @@ def trigger_ledger_rebuild():
     response is sent — unlike the old Mac-only version, this call must
     complete (or time out) before the request returns.
     """
+    global _accounts_cache
+    _recent_activity_cache.clear()
+    _accounts_cache = None
     cfg = load_config()
     url = (cfg.get("ledger_webhook_url") or "").strip()
     token = (cfg.get("ledger_webhook_token") or "").strip()
@@ -460,7 +464,27 @@ def get_archive_tab_names():
         return [FOLLOWUP_SHEET_NAME]
     return tabs
 
+_accounts_cache = None  # (timestamp, rows)
+_ACCOUNTS_CACHE_TTL = 15  # seconds
+
 def read_accounts_from_gsheet():
+    """Cached: this is the shared hot path for lookup_case(), get_open_cases(),
+    _case_detail()'s fallback, get_recent_activity(), and more — each call
+    re-scans Accounts + every active archive tab (4-5 Sheets reads). Left
+    uncached, ordinary usage (dashboard load + opening Edit Case + a save)
+    burns through the per-minute Sheets quota fast, and gspread's backoff
+    then silently retries instead of failing, making saves take 20-40s.
+    A warm serverless instance reuses this across requests within the TTL;
+    trigger_ledger_rebuild() clears it after every write so a save's own
+    follow-up read never sees stale data."""
+    global _accounts_cache
+    if _accounts_cache and (time.time() - _accounts_cache[0]) < _ACCOUNTS_CACHE_TTL:
+        return _accounts_cache[1]
+    rows = _read_accounts_from_gsheet_uncached()
+    _accounts_cache = (time.time(), rows)
+    return rows
+
+def _read_accounts_from_gsheet_uncached():
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet(SHEET_NAME)
     all_vals = ws.get_all_values()
@@ -793,7 +817,25 @@ def _parse_any_date(s):
             pass
     return None
 
+_recent_activity_cache = {}  # {days: (timestamp, events)}
+_RECENT_ACTIVITY_TTL = 25  # seconds
+
 def get_recent_activity(days=7):
+    """Cached wrapper: this view fires automatically every time the Edit
+    Case tab opens and costs 5-6 Sheets reads (Accounts + every active
+    archive tab + M Coll). Left uncached, repeated tab opens compete for
+    the same per-minute Sheets quota as the actual Load Case / Save
+    requests, making THOSE more likely to hit 429 and hang. A warm
+    serverless instance reuses this module-level cache across requests
+    within the TTL window; a cold start just recomputes once."""
+    cached = _recent_activity_cache.get(days)
+    if cached and (time.time() - cached[0]) < _RECENT_ACTIVITY_TTL:
+        return cached[1]
+    events = _get_recent_activity_uncached(days)
+    _recent_activity_cache[days] = (time.time(), events)
+    return events
+
+def _get_recent_activity_uncached(days=7):
     """Every individual disbursement AND every individual repayment recorded
     in the last N days — a flat, unfiltered event log rather than one
     deduped row per case, so a case with several separate repayments today
@@ -858,21 +900,12 @@ def get_recent_activity(days=7):
         del e['_sortkey']
     return events
 
-def _case_detail(disb_id):
-    """Everything the Edit Case screen needs: the Accounts row's editable +
-    computed fields, and the case's individual payments from M Coll (each
-    with its live M Coll row number so edits/deletes can target it)."""
-    disb_id = disb_id.strip().upper()
-    info = lookup_case(disb_id)
-    if not info['found']:
-        return None
-    sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
-    ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
-    vals = ws.row_values(info['row'])
-    def cell(key):
-        i = COL[key] - 1
-        return vals[i] if i < len(vals) else ''
-
+def _get_case_payments(sh, disb_id):
+    """M Coll rows for one case, each carrying its live row number so edits/
+    deletes can target it. Pulled into its own helper so callers that
+    already read M Coll for another reason (recomputing collected/balance)
+    can build this list from data they already have in hand, instead of
+    _case_detail() re-reading the whole M Coll sheet from scratch."""
     payments = []
     try:
         mc = sh.worksheet('M Coll')
@@ -886,6 +919,36 @@ def _case_detail(disb_id):
                 })
     except Exception:
         pass
+    return payments
+
+def _case_detail(disb_id, known=None):
+    """Everything the Edit Case screen needs: the Accounts row's editable +
+    computed fields, and the case's individual payments from M Coll.
+
+    `known`, if given, is {'sheet', 'row', 'payments'} already resolved by
+    the caller's own write (update_disbursement / _recompute_case_from_mcoll)
+    — this skips a second full lookup_case() (which re-scans Accounts plus
+    every archive tab) and, when payments are already known, a second full
+    M Coll read. Without it, both are looked up fresh here as before."""
+    disb_id = disb_id.strip().upper()
+    sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+
+    if known:
+        sheet, row, payments = known['sheet'], known['row'], known.get('payments')
+    else:
+        info = lookup_case(disb_id)
+        if not info['found']:
+            return None
+        sheet, row, payments = info['sheet'], info['row'], None
+
+    ws = sh.worksheet(sheet)
+    vals = ws.row_values(row)
+    def cell(key):
+        i = COL[key] - 1
+        return vals[i] if i < len(vals) else ''
+
+    if payments is None:
+        payments = _get_case_payments(sh, disb_id)
 
     total     = _to_num(cell('total')) or calc_total(_to_num(cell('amount')))
     collected = _to_num(cell('coll_amount'))
@@ -898,7 +961,7 @@ def _case_detail(disb_id):
     balance = max(0, total - collected - discount)
 
     return {
-        'disb_id': disb_id, 'sheet': info['sheet'],
+        'disb_id': disb_id, 'sheet': sheet,
         'date': cell('date'), 'customer': cell('customer'), 'chq': cell('chq'),
         'company': cell('company'), 'cluster': cell('cluster'), 'branch': cell('branch'),
         'amount': _to_num(cell('amount')), 'charges': _to_num(cell('charges')),
@@ -955,10 +1018,16 @@ def update_disbursement(data):
         } for r, c, v in updates])
         trigger_ledger_rebuild()
 
+    # Handed back to the route so it can build the response via _case_detail()
+    # without a second full lookup_case() (Accounts + every archive tab scan).
+    return {'sheet': info['sheet'], 'row': row}
+
 def _recompute_case_from_mcoll(disb_id):
     """After an M Coll payment row is added, edited, or deleted, re-derive
     the Accounts row's aggregates from the full M Coll history — M Coll is
-    the one definitive payment record."""
+    the one definitive payment record. Returns the resolved sheet/row plus
+    the case's payments (built from the M Coll data already read here) so
+    the caller's response can skip a second lookup_case() + M Coll read."""
     disb_id = disb_id.strip().upper()
     info = lookup_case(disb_id)
     if not info['found']:
@@ -967,8 +1036,12 @@ def _recompute_case_from_mcoll(disb_id):
     ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
     row = info['row']
 
-    pays = [r for r in sh.worksheet('M Coll').get_all_values()
-            if r and str(r[0]).strip().upper() == disb_id]
+    mc_all = sh.worksheet('M Coll').get_all_values()
+    payments = [{
+        'mc_row': i, 'date': r[1] if len(r) > 1 else '',
+        'amount': _to_num(r[2]) if len(r) > 2 else 0, 'utr': r[3] if len(r) > 3 else '',
+    } for i, r in enumerate(mc_all, start=1) if r and str(r[0]).strip().upper() == disb_id]
+    pays = [r for r in mc_all if r and str(r[0]).strip().upper() == disb_id]
     collected = sum(_to_num(r[2]) if len(r) > 2 else 0 for r in pays)
 
     def _pd(dstr):
@@ -993,6 +1066,8 @@ def _recompute_case_from_mcoll(disb_id):
                    (COL['status'], status), (COL['balance'], bal)]])
     trigger_ledger_rebuild()
 
+    return {'sheet': info['sheet'], 'row': row, 'payments': payments}
+
 def _mcoll_row_checked(sh, disb_id, mc_row):
     """Guard against stale row numbers: the M Coll row being targeted must
     still belong to this case."""
@@ -1012,7 +1087,7 @@ def update_repayment(data):
         {'range': gspread.utils.rowcol_to_a1(mc_row, 3), 'values': [[float(data['amount'])]]},
         {'range': gspread.utils.rowcol_to_a1(mc_row, 4), 'values': [[str(data.get('utr', '')).strip()]]},
     ])
-    _recompute_case_from_mcoll(disb_id)
+    return _recompute_case_from_mcoll(disb_id)
 
 def delete_repayment(data):
     disb_id = data['disb_id'].strip().upper()
@@ -1020,7 +1095,7 @@ def delete_repayment(data):
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
     mc = _mcoll_row_checked(sh, disb_id, mc_row)
     mc.delete_rows(mc_row)
-    _recompute_case_from_mcoll(disb_id)
+    return _recompute_case_from_mcoll(disb_id)
 
 def add_repayment(data):
     """Append a new M Coll payment row from the Edit Case tab — the same
@@ -1040,7 +1115,7 @@ def add_repayment(data):
         str(data.get('utr', '')).strip(),
         info.get('customer', ''),
     ], next_row)
-    _recompute_case_from_mcoll(disb_id)
+    return _recompute_case_from_mcoll(disb_id)
 
 # ── Config (stored in a 'Config' tab of the same spreadsheet) ─────────────────
 # No persistent local disk exists on a serverless host, so config lives in the
@@ -2839,7 +2914,7 @@ async function loadRecentCases() {
   const countEl = document.getElementById('e-recent-count');
   list.innerHTML = '<span style="color:#888;font-size:13px;">Loading...</span>';
   try {
-    const r = await (await fetch('/case/recent?days=7')).json();
+    const r = await _fetchJsonWithTimeout('/case/recent?days=7', {});
     if (!r.ok) throw new Error(r.error || 'Failed to load');
     const events = r.events;
     if (!events.length) {
@@ -2943,12 +3018,16 @@ function editPayRow(i) {
     `<button onclick="renderEditPayments()" style="padding:3px 10px;font-size:12px;cursor:pointer">✕</button></td>`;
 }
 
-// 25s client-side ceiling so a slow/hung request (e.g. Sheets API retrying
+// 55s client-side ceiling so a slow/hung request (e.g. Sheets API retrying
 // a rate-limit under the hood) always resolves to a visible error instead
-// of leaving the button/status stuck on "Saving..." forever.
+// of leaving the button/status stuck on "Saving..." forever. Set above the
+// server's own 60s function timeout isn't possible client-side, but 55s
+// gives real Sheets calls (which can legitimately take 20-40s under
+// quota pressure) room to finish rather than aborting a write that would
+// have succeeded a few seconds later.
 async function _fetchJsonWithTimeout(url, opts, ms) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), ms || 25000);
+  const timer = setTimeout(() => ctrl.abort(), ms || 55000);
   try {
     const res = await fetch(url, {...opts, signal: ctrl.signal});
     return await res.json();
@@ -3933,32 +4012,32 @@ def api_case_detail(disb_id):
 @app.route('/case/update-disbursement', methods=['POST'])
 def api_case_update_disbursement():
     try:
-        update_disbursement(request.json)
-        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+        known = update_disbursement(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/update-repayment', methods=['POST'])
 def api_case_update_repayment():
     try:
-        update_repayment(request.json)
-        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+        known = update_repayment(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/delete-repayment', methods=['POST'])
 def api_case_delete_repayment():
     try:
-        delete_repayment(request.json)
-        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+        known = delete_repayment(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/add-repayment', methods=['POST'])
 def api_case_add_repayment():
     try:
-        add_repayment(request.json)
-        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'])})
+        known = add_repayment(request.json)
+        return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
 
