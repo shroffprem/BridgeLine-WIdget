@@ -2859,6 +2859,8 @@ HTML = """<!DOCTYPE html>
       </div>
       <div id="bulk-empty" style="color:#aaa;font-size:13px;">Loading...</div>
       <div id="bulk-footer" style="display:none;margin-top:10px;padding:8px 12px;background:#f0f7ff;border:1px solid #b3d4f5;border-radius:6px;font-size:13px;font-weight:600;"></div>
+      <button class="btn" style="margin-top:10px;width:auto;padding:8px 18px;background:#fff;color:#c0392b;border:1px solid #e0b4b4;" onclick="deleteBulkRequests()">🗑 Delete Selected</button>
+      <div id="bulk-delete-status" class="status"></div>
     </div>
     <div class="section">
       <h3>⚙ Export Bank File</h3>
@@ -4185,6 +4187,24 @@ async function exportBulk() {
   }
 }
 
+async function deleteBulkRequests() {
+  const ids = _selectedBulkIds();
+  if (!ids.length) { showStatus('bulk-delete-status', 'error', '❌ Select at least one request'); return; }
+  const reason = prompt(`Delete ${ids.length} request(s) from the queue?\n\nReason (optional — saved to the sheet):`);
+  if (reason === null) return;
+  if (!confirm(`Confirm: remove ${ids.join(', ')} from the queue? The row stays in the sheet marked Deleted.`)) return;
+  try {
+    const r = await (await fetch('/requests/delete', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({request_ids: ids, reason: reason.trim()})})).json();
+    if (!r.ok) throw new Error(r.error || 'Failed');
+    showStatus('bulk-delete-status', 'success', `✅ Deleted ${r.deleted} request(s)`);
+    loadBulkRequests();
+  } catch(e) {
+    showStatus('bulk-delete-status', 'error', '❌ ' + e.message);
+  }
+}
+
 async function parseBulkMsg() {
   const msg = document.getElementById('bulk-paste').value;
   if (!msg.trim()) return;
@@ -4517,6 +4537,45 @@ def api_requests_parse():
     fields, warnings = parse_request_message((request.json or {}).get('message', ''))
     return jsonify({'fields': fields, 'warnings': warnings})
 
+@app.route('/requests/delete', methods=['POST'])
+def api_requests_delete():
+    try:
+        body = request.json or {}
+        ids = body.get('request_ids') or []
+        reason = (body.get('reason') or '').strip()
+        if not ids:
+            return jsonify({'ok': False, 'error': 'No requests selected'}), 400
+        _, ws = get_requests_sheet()
+        all_vals = ws.get_all_values()
+        idx = {h: i for i, h in enumerate(all_vals[0])} if all_vals else {}
+        by_id = {}
+        for rownum, row in enumerate(all_vals[1:], start=2):
+            if row and row[0] in ids:
+                by_id[row[0]] = (rownum, row)
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            return jsonify({'ok': False, 'error': 'Requests not found',
+                            'request_ids': missing}), 404
+        # Soft delete: Status → Deleted, reason + timestamp appended to Notes.
+        # The row stays in the sheet as the audit trail of what was removed
+        # and why; every queue view filters on Status so it disappears
+        # from pending/export/disb-picker immediately.
+        stamp = f"Deleted{': ' + reason if reason else ''} {datetime.today().strftime('%d-%m-%Y %H:%M')}"
+        notes_col = idx.get('Notes', 13)
+        status_letter = chr(ord('A') + idx.get('Status', 11))
+        notes_letter = chr(ord('A') + notes_col)
+        updates = []
+        for req_id in ids:
+            rownum, row = by_id[req_id]
+            old_note = row[notes_col] if len(row) > notes_col else ''
+            note = f"{old_note} | {stamp}" if old_note.strip() else stamp
+            updates.append({'range': f'{status_letter}{rownum}', 'values': [['Deleted']]})
+            updates.append({'range': f'{notes_letter}{rownum}', 'values': [[note]]})
+        ws.batch_update(updates)
+        return jsonify({'ok': True, 'deleted': len(ids)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
 def _find_duplicate_request(all_vals, account_no, amount):
     """Same beneficiary account + same amount submitted today = duplicate,
     whatever its status — a request already exported or disbursed today is
@@ -4529,6 +4588,8 @@ def _find_duplicate_request(all_vals, account_no, amount):
     for row in all_vals[1:]:
         if len(row) < 12 or not row[0] or not row[1].startswith(today):
             continue
+        if row[11] == 'Deleted':
+            continue  # deleted requests don't block resubmission
         if digits(row[6]) == acct and digits(row[5]) == amt:
             return {'request_id': row[0], 'submitted_at': row[1], 'status': row[11]}
     return None
