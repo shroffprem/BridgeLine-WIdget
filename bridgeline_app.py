@@ -5,12 +5,13 @@ Hosted on Vercel via api/index.py (WSGI entrypoint into the `app` object below).
 """
 
 import re
+import csv
 import json
 import io
 import threading
 import time
 import os
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, Response
 
 # ── Google Sheets setup ───────────────────────────────────────────────────────
@@ -84,18 +85,104 @@ REQUESTS_SHEET_NAME = "Requests"
 REQUESTS_HEADERS = [
     "Request ID", "Submitted At", "Customer Name", "Cluster", "Branch",
     "Amount", "Account No", "IFSC", "Phone", "SO Name", "Gold Weight",
-    "Status", "Disb ID", "Notes"
+    "Status", "Disb ID", "Notes", "Bank"
 ]
 
 def get_requests_sheet():
     gc = get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
     try:
-        return sh, sh.worksheet(REQUESTS_SHEET_NAME)
+        ws = sh.worksheet(REQUESTS_SHEET_NAME)
     except Exception:
         ws = sh.add_worksheet(title=REQUESTS_SHEET_NAME, rows=1000, cols=len(REQUESTS_HEADERS))
         ws.append_row(REQUESTS_HEADERS)
         return sh, ws
+    # Bank was appended to the schema after the tab was created with exactly
+    # 14 columns — the grid must grow before col 15 is addressable.
+    header = ws.row_values(1)
+    if "Bank" not in header:
+        if ws.col_count < len(REQUESTS_HEADERS):
+            ws.resize(cols=len(REQUESTS_HEADERS))
+        ws.update_cell(1, len(REQUESTS_HEADERS), "Bank")
+    return sh, ws
+
+# ── Bank bulk-upload templates ────────────────────────────────────────────────
+# Declarative layouts for the bulk NEFT/RTGS files each portal accepts. Field
+# names resolve against the per-request dict built in /requests/export-bulk;
+# ('const', X) emits the literal X. Portals validate their own template files
+# literally (IDFC especially), so adjust headers here after diffing against
+# the portal's current downloaded template — never hardcode layouts elsewhere.
+BANK_TEMPLATES = {
+    'hdfc': {
+        'label': 'HDFC NetBanking Plus',
+        'filetype': 'xlsx',
+        'filename': 'HDFC_Bulk_{date}.xlsx',
+        'columns': [
+            ('Beneficiary Name', 'customer'),
+            ('Beneficiary Account Number', 'account_no'),
+            ('IFSC Code', 'ifsc'),
+            ('Amount', 'amount'),
+            ('Payment Mode', 'mode'),
+            ('Debit Account Number', 'debit_account'),
+            ('Value Date', 'value_date'),
+            ('Narration', 'narration'),
+            ('Beneficiary Mobile', 'phone'),
+        ],
+    },
+    'idfc': {
+        'label': 'IDFC FIRST Bank',
+        'filetype': 'xlsx',
+        'filename': 'IDFC_Bulk_{date}.xlsx',
+        'columns': [
+            ('Beneficiary Name', 'customer'),
+            ('Beneficiary Account Number', 'account_no'),
+            ('IFSC', 'ifsc'),
+            ('Amount', 'amount'),
+            ('Payment Mode', 'mode'),
+            ('Debit Account Number', 'debit_account'),
+            ('Value Date', 'value_date'),
+            ('Narration', 'narration'),
+            ('Beneficiary Mobile', 'phone'),
+            ('Beneficiary Email', ('const', '')),
+        ],
+    },
+    'saraswat': {
+        'label': 'Saraswat Bank',
+        'filetype': 'csv',
+        'filename': 'Saraswat_Bulk_{date}.csv',
+        'columns': [
+            ('Beneficiary Name', 'customer'),
+            ('Beneficiary Account Number', 'account_no'),
+            ('IFSC Code', 'ifsc'),
+            ('Amount', 'amount'),
+            ('Payment Mode', 'mode'),
+            ('Narration', 'narration'),
+            ('Debit Account Number', 'debit_account'),
+            ('Value Date', 'value_date'),
+        ],
+    },
+    'razorpayx': {
+        'label': 'RazorpayX',
+        'filetype': 'csv',
+        'filename': 'RazorpayX_Bulk_{date}.csv',
+        'columns': [
+            ('RazorpayX Account Number', 'debit_account'),
+            ('Payout Amount', 'amount'),
+            ('Payout Currency', ('const', 'INR')),
+            ('Payout Mode', 'mode'),
+            ('Payout Purpose', ('const', 'payout')),
+            ('Fund Account Type', ('const', 'bank_account')),
+            ('Contact Name', 'customer'),
+            ('Account IFSC', 'ifsc'),
+            ('Account Number', 'account_no'),
+            ('Contact Phone', 'phone'),
+            ('Payout Narration', 'narration'),
+            ('Payout Reference Id', 'request_id'),
+        ],
+    },
+}
+
+RTGS_MIN_AMOUNT = 200000
 
 # ── Config ────────────────────────────────────────────────────────────────────
 COMPANIES = ["HDB", "ICICI"]
@@ -1136,7 +1223,11 @@ DEFAULT_CONFIG = {
     # transfer narration containing another registered account's number is
     # an internal movement between our own accounts (Capital In/Out), not
     # a real disbursement/expense/collection.
-    "bank_accounts": []
+    "bank_accounts": [],
+    # Defaults for the Bank File tab's bulk-upload exports (overridable per
+    # export in the UI).
+    "bulk_debit_account": "",
+    "bulk_narration": "BridgeLine Disbursement",
 }
 
 def load_config():
@@ -2491,6 +2582,7 @@ HTML = """<!DOCTYPE html>
   <div class="tabs">
     <button class="tab-btn active" onclick="showTab('disb',this); loadPendingRequests()">➕ New Disbursement</button>
     <button class="tab-btn" onclick="showTab('repa',this); loadOpenCases()">💰 Repayment</button>
+    <button class="tab-btn" onclick="showTab('bulk',this); loadBulkRequests()">💸 Bank File</button>
     <button class="tab-btn" onclick="showTab('calc',this)">🧮 Calculator</button>
     <button class="tab-btn" onclick="showTab('recon',this)">🏦 Bank Reconciliation</button>
     <button class="tab-btn" onclick="showTab('invoice',this); loadInvoiceCases()">📄 Invoice</button>
@@ -2746,12 +2838,84 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- BANK FILE TAB -->
+  <div id="bulk" class="tab-content">
+    <div class="section">
+      <h3>📥 Pending Requests <span id="bulk-count" style="font-size:13px;color:#888;font-weight:400;"></span>
+        <button onclick="loadBulkRequests()" style="float:right;font-size:12px;padding:3px 10px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">↻ Refresh</button></h3>
+      <div style="overflow-x:auto;">
+        <table id="bulk-table" style="width:100%;border-collapse:collapse;font-size:13px;display:none;">
+          <thead><tr style="text-align:left;border-bottom:2px solid #dce8f5;">
+            <th style="padding:6px 8px;"><input type="checkbox" id="bulk-select-all" onchange="toggleBulkSelectAll(this.checked)"></th>
+            <th style="padding:6px 8px;">Request ID</th><th style="padding:6px 8px;">Submitted</th>
+            <th style="padding:6px 8px;">Customer</th><th style="padding:6px 8px;">Cluster / Branch</th>
+            <th style="padding:6px 8px;">Amount</th><th style="padding:6px 8px;">Account</th>
+            <th style="padding:6px 8px;">IFSC</th><th style="padding:6px 8px;">Bank</th>
+            <th style="padding:6px 8px;">Phone</th><th style="padding:6px 8px;">SO</th>
+            <th style="padding:6px 8px;">Gold g</th>
+          </tr></thead>
+          <tbody id="bulk-tbody"></tbody>
+        </table>
+      </div>
+      <div id="bulk-empty" style="color:#aaa;font-size:13px;">Loading...</div>
+      <div id="bulk-footer" style="display:none;margin-top:10px;padding:8px 12px;background:#f0f7ff;border:1px solid #b3d4f5;border-radius:6px;font-size:13px;font-weight:600;"></div>
+    </div>
+    <div class="section">
+      <h3>⚙ Export Bank File</h3>
+      <div class="grid">
+        <div class="field"><label>Bank Format *</label>
+          <select id="bulk-bank" style="width:100%;padding:9px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;">""" + \
+          "".join(f'<option value="{k}">{v["label"]} (.{v["filetype"]})</option>' for k, v in BANK_TEMPLATES.items()) + """</select></div>
+        <div class="field"><label>Debit Account</label>
+          <input type="text" id="bulk-debit" placeholder="Your BridgeLine account no."></div>
+        <div class="field"><label>Narration / Reference</label>
+          <input type="text" id="bulk-narration" maxlength="20" placeholder="Shows on beneficiary statement"></div>
+        <div class="field"><label>Value Date (DD/MM/YYYY)</label>
+          <input type="text" id="bulk-value-date"></div>
+      </div>
+      <button class="btn btn-save" style="margin-top:12px" onclick="exportBulk()">💸 Generate &amp; Download</button>
+      <div id="bulk-status" class="status"></div>
+      <p style="font-size:12px;color:#888;margin-top:8px;">Selected requests are marked <b>Exported</b> in the sheet after download — they leave this list but stay visible in New Disbursement for recording. RTGS is auto-assigned for amounts ≥ ₹2,00,000, NEFT below.</p>
+    </div>
+    <div class="section">
+      <h3>📋 Paste WhatsApp Request</h3>
+      <p style="font-size:12px;color:#888;">For requests that arrive as a DISBURSEMENT REQUEST message instead of through the field app. Parsed requests join the same pending queue.</p>
+      <textarea id="bulk-paste" placeholder="Paste the DISBURSEMENT REQUEST message here..."></textarea>
+      <button class="btn btn-extract" onclick="parseBulkMsg()">⚡ Parse Message</button>
+      <div id="bulk-parse-preview" style="display:none;margin-top:12px;">
+        <div class="grid">
+          <div class="field"><label>Customer Name *</label><input type="text" id="bp-customer"></div>
+          <div class="field"><label>Amount (₹) *</label><input type="number" id="bp-amount"></div>
+          <div class="field"><label>Account No *</label><input type="text" id="bp-account"></div>
+          <div class="field"><label>IFSC *</label><input type="text" id="bp-ifsc" style="text-transform:uppercase"></div>
+          <div class="field"><label>Bank Name</label><input type="text" id="bp-bank"></div>
+          <div class="field"><label>Phone</label><input type="text" id="bp-phone"></div>
+          <div class="field"><label>Cluster</label><input type="text" id="bp-cluster" list="cluster-list"></div>
+          <div class="field"><label>Branch</label><input type="text" id="bp-branch" list="branch-list"></div>
+          <div class="field"><label>SO Name</label><input type="text" id="bp-so"></div>
+          <div class="field"><label>Gold Wt (gms)</label><input type="text" id="bp-gold"></div>
+        </div>
+        <div id="bulk-parse-warnings" style="margin-top:8px;font-size:12px;color:#b8860b;"></div>
+        <button class="btn btn-save" style="margin-top:10px" onclick="addParsedRequest()">➕ Add to Queue</button>
+      </div>
+      <div id="bulk-paste-status" class="status"></div>
+    </div>
+  </div>
+
   <div id="settings" class="tab-content">
     <div class="section">
       <h3>General Settings</h3>
       <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
         <label style="font-size:.85rem;font-weight:600">Daily Report Time:</label>
         <input type="time" id="report-time" style="width:120px">
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
+        <label style="font-size:.85rem;font-weight:600">Bulk Export Debit Account:</label>
+        <input type="text" id="set-bulk-debit" style="width:220px" placeholder="Default debit account no.">
+      </div>
+      <div style="display:flex;gap:12px;align-items:center;margin-bottom:12px">
+        <label style="font-size:.85rem;font-weight:600">Bulk Export Narration:</label>
+        <input type="text" id="set-bulk-narration" style="width:220px" maxlength="20">
       </div>
       <button class="btn btn-save" onclick="saveSettings()" style="width:auto;padding:10px 24px">💾 Save Settings</button>
       <div id="settings-status" class="status"></div>
@@ -2862,7 +3026,7 @@ async function loadPendingRequests() {
   const countEl = document.getElementById('pending-count');
   list.innerHTML = '<span style="color:#888;font-size:13px;">Loading...</span>';
   try {
-    const items = await (await fetch('/requests/pending')).json();
+    const items = await (await fetch('/requests/pending?include=exported')).json();
     if (!Array.isArray(items) || items.length === 0) {
       list.innerHTML = '<span style="color:#aaa;font-size:13px;">No pending requests</span>';
       countEl.textContent = '';
@@ -2876,7 +3040,10 @@ async function loadPendingRequests() {
       card.onmouseenter = () => card.style.background = '#f0f7ff';
       card.onmouseleave = () => card.style.background = '#fff';
       const amt = Number(r.amount) > 0 ? '₹' + Number(r.amount).toLocaleString('en-IN', {maximumFractionDigits:0}) : r.amount;
-      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${r.customer}</div>
+      const badge = r.status === 'Exported'
+        ? ' <span style="font-size:11px;background:#fff3cd;color:#856404;border:1px solid #ffeeba;border-radius:4px;padding:1px 6px;font-weight:400;">Exported</span>'
+        : '';
+      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${r.customer}${badge}</div>
         <div style="font-size:12px;color:#555;margin-top:3px;">${r.cluster} · ${r.branch} · ${amt}</div>
         <div style="font-size:11px;color:#999;margin-top:2px;">${r.request_id} · ${r.submitted_at}</div>`;
       card.addEventListener('click', () => selectPendingRequest(r));
@@ -3891,13 +4058,177 @@ async function saveContacts() {
 async function loadSettings() {
   const cfg = await (await fetch('/config')).json();
   document.getElementById('report-time').value = cfg.report_time || '09:00';
+  document.getElementById('set-bulk-debit').value = cfg.bulk_debit_account || '';
+  document.getElementById('set-bulk-narration').value = cfg.bulk_narration || '';
 }
 
 async function saveSettings() {
-  const cfg = { report_time: document.getElementById('report-time').value };
+  const cfg = {
+    report_time: document.getElementById('report-time').value,
+    bulk_debit_account: document.getElementById('set-bulk-debit').value.trim(),
+    bulk_narration: document.getElementById('set-bulk-narration').value.trim(),
+  };
   const r = await (await fetch('/config', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})).json();
   showStatus('settings-status', r.ok ? 'success' : 'error', r.ok ? '✅ Settings saved!' : '❌ '+r.error);
+}
+
+// ── Bank File tab ─────────────────────────────────────────────────────────────
+let bulkRequests = [];
+
+function _fmtInr(v) {
+  const n = Number(v);
+  return n > 0 ? '₹' + n.toLocaleString('en-IN', {maximumFractionDigits:0}) : (v || '—');
+}
+
+async function loadBulkRequests() {
+  const tbody = document.getElementById('bulk-tbody');
+  const empty = document.getElementById('bulk-empty');
+  const table = document.getElementById('bulk-table');
+  empty.style.display = ''; empty.textContent = 'Loading...';
+  try {
+    const items = await (await fetch('/requests/pending')).json();
+    if (items.error) throw new Error(items.error);
+    bulkRequests = items;
+    document.getElementById('bulk-count').textContent = items.length ? `(${items.length})` : '';
+    if (!items.length) {
+      table.style.display = 'none';
+      empty.textContent = 'No pending requests';
+      updateBulkFooter();
+      return;
+    }
+    tbody.innerHTML = '';
+    items.forEach(r => {
+      const tr = document.createElement('tr');
+      tr.style.borderBottom = '1px solid #eef3f9';
+      tr.innerHTML = `
+        <td style="padding:6px 8px;"><input type="checkbox" class="bulk-check" value="${r.request_id}" onchange="updateBulkFooter()"></td>
+        <td style="padding:6px 8px;white-space:nowrap;color:#2a7ae2;">${r.request_id}</td>
+        <td style="padding:6px 8px;white-space:nowrap;font-size:12px;color:#888;">${r.submitted_at}</td>
+        <td style="padding:6px 8px;font-weight:600;">${r.customer}</td>
+        <td style="padding:6px 8px;">${r.cluster} / ${r.branch}</td>
+        <td style="padding:6px 8px;white-space:nowrap;">${_fmtInr(r.amount)}</td>
+        <td style="padding:6px 8px;font-family:monospace;">${r.account_no || '—'}</td>
+        <td style="padding:6px 8px;font-family:monospace;">${r.ifsc || '—'}</td>
+        <td style="padding:6px 8px;">${r.bank || '—'}</td>
+        <td style="padding:6px 8px;">${r.phone || '—'}</td>
+        <td style="padding:6px 8px;">${r.so_name || '—'}</td>
+        <td style="padding:6px 8px;">${r.gold_weight || '—'}</td>`;
+      tbody.appendChild(tr);
+    });
+    table.style.display = '';
+    empty.style.display = 'none';
+    document.getElementById('bulk-select-all').checked = false;
+    updateBulkFooter();
+  } catch(e) {
+    table.style.display = 'none';
+    empty.textContent = 'Error: ' + e.message;
+  }
+}
+
+function toggleBulkSelectAll(checked) {
+  document.querySelectorAll('.bulk-check').forEach(c => c.checked = checked);
+  updateBulkFooter();
+}
+
+function _selectedBulkIds() {
+  return Array.from(document.querySelectorAll('.bulk-check:checked')).map(c => c.value);
+}
+
+function updateBulkFooter() {
+  const ids = _selectedBulkIds();
+  const footer = document.getElementById('bulk-footer');
+  if (!ids.length) { footer.style.display = 'none'; return; }
+  const total = bulkRequests.filter(r => ids.includes(r.request_id))
+    .reduce((s, r) => s + (Number(String(r.amount).replace(/[^\\d.]/g,'')) || 0), 0);
+  footer.style.display = '';
+  footer.textContent = `${ids.length} selected · total ${_fmtInr(total)}`;
+}
+
+async function exportBulk() {
+  const ids = _selectedBulkIds();
+  if (!ids.length) { showStatus('bulk-status', 'error', '❌ Select at least one request'); return; }
+  const body = {
+    request_ids: ids,
+    bank: document.getElementById('bulk-bank').value,
+    debit_account: document.getElementById('bulk-debit').value.trim(),
+    narration: document.getElementById('bulk-narration').value.trim(),
+    value_date: document.getElementById('bulk-value-date').value.trim(),
+  };
+  showStatus('bulk-status', 'success', '⏳ Generating...');
+  try {
+    const r = await fetch('/requests/export-bulk', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+      if (r.status === 409) {
+        showStatus('bulk-status', 'error',
+          `❌ Already exported/disbursed: ${(err.request_ids||[]).join(', ')} — list refreshed`);
+        loadBulkRequests();
+        return;
+      }
+      throw new Error(err.error || `HTTP ${r.status}`);
+    }
+    const blob = await r.blob();
+    const disposition = r.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="(.+)"/);
+    const filename = match ? match[1] : 'bulk_payment.csv';
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    showStatus('bulk-status', 'success', `✅ Downloaded ${filename} — ${ids.length} request(s) marked Exported`);
+    loadBulkRequests();
+  } catch(e) {
+    showStatus('bulk-status', 'error', '❌ ' + e.message);
+  }
+}
+
+async function parseBulkMsg() {
+  const msg = document.getElementById('bulk-paste').value;
+  if (!msg.trim()) return;
+  const r = await (await fetch('/requests/parse', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({message: msg})})).json();
+  const f = r.fields || {};
+  document.getElementById('bp-customer').value = f.customer || '';
+  document.getElementById('bp-amount').value = f.amount || '';
+  document.getElementById('bp-account').value = f.account_no || '';
+  document.getElementById('bp-ifsc').value = f.ifsc || '';
+  document.getElementById('bp-bank').value = f.bank || '';
+  document.getElementById('bp-phone').value = f.phone || '';
+  document.getElementById('bp-cluster').value = f.cluster || '';
+  document.getElementById('bp-branch').value = f.branch || '';
+  document.getElementById('bp-so').value = f.so_name || '';
+  document.getElementById('bp-gold').value = f.gold_weight || '';
+  document.getElementById('bulk-parse-warnings').innerHTML =
+    (r.warnings || []).map(w => `⚠ ${w}`).join('<br>');
+  document.getElementById('bulk-parse-preview').style.display = '';
+}
+
+async function addParsedRequest() {
+  const body = {
+    customer: document.getElementById('bp-customer').value.trim(),
+    amount: document.getElementById('bp-amount').value.trim(),
+    account_no: document.getElementById('bp-account').value.trim(),
+    ifsc: document.getElementById('bp-ifsc').value.trim().toUpperCase(),
+    bank: document.getElementById('bp-bank').value.trim(),
+    phone: document.getElementById('bp-phone').value.trim(),
+    cluster: document.getElementById('bp-cluster').value.trim(),
+    branch: document.getElementById('bp-branch').value.trim(),
+    so_name: document.getElementById('bp-so').value.trim(),
+    gold_weight: document.getElementById('bp-gold').value.trim(),
+  };
+  const r = await (await fetch('/requests/add', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})).json();
+  if (r.ok) {
+    showStatus('bulk-paste-status', 'success', `✅ Added to queue as ${r.request_id}`);
+    document.getElementById('bulk-paste').value = '';
+    document.getElementById('bulk-parse-preview').style.display = 'none';
+    loadBulkRequests();
+  } else {
+    showStatus('bulk-paste-status', 'error', '❌ ' + (r.error || 'Failed'));
+  }
 }
 
 window.onload = async () => {
@@ -3905,10 +4236,16 @@ window.onload = async () => {
   document.getElementById('d-date').value = today;
   document.getElementById('r-date').value = today;
   document.getElementById('rec-date').value = today;
+  document.getElementById('bulk-value-date').value = new Date().toLocaleDateString('en-GB');
   await loadCustomTypes();
   await loadBankAccounts();
   loadSummary();
   loadPendingRequests();
+  try {
+    const cfg = await (await fetch('/config')).json();
+    document.getElementById('bulk-debit').value = cfg.bulk_debit_account || '';
+    document.getElementById('bulk-narration').value = cfg.bulk_narration || '';
+  } catch(e) {}
 };
 </script>
 </body></html>"""
@@ -3945,38 +4282,269 @@ def _mark_request_disbursed(request_id, disb_id):
             ws.update_cell(i, 13, disb_id)
             return
 
+def _request_row_to_item(row, idx):
+    def col(name, default_i):
+        i = idx.get(name, default_i)
+        return row[i] if len(row) > i else ''
+    return {
+        'request_id':  col('Request ID', 0),
+        'submitted_at': col('Submitted At', 1),
+        'customer':    col('Customer Name', 2),
+        'cluster':     col('Cluster', 3),
+        'branch':      col('Branch', 4),
+        'amount':      col('Amount', 5),
+        'account_no':  col('Account No', 6),
+        'ifsc':        col('IFSC', 7),
+        'phone':       col('Phone', 8),
+        'so_name':     col('SO Name', 9),
+        'gold_weight': col('Gold Weight', 10),
+        'status':      col('Status', 11),
+        'bank':        col('Bank', 14),
+    }
+
 @app.route('/requests/pending')
 def api_requests_pending():
     try:
+        # ?include=exported keeps just-exported requests visible (used by the
+        # New Disbursement picker so click-to-fill still works after a bank
+        # run); the Bank File tab calls this plain and sees Pending only.
+        wanted = {'Pending'}
+        if request.args.get('include') == 'exported':
+            wanted.add('Exported')
         _, ws = get_requests_sheet()
         all_vals = ws.get_all_values()
         if len(all_vals) < 2:
             return jsonify([])
-        headers = all_vals[0]
-        idx = {h: i for i, h in enumerate(headers)}
+        idx = {h: i for i, h in enumerate(all_vals[0])}
         items = []
         for row in reversed(all_vals[1:]):
             if not row or not row[0]:
                 continue
             status = row[idx.get('Status', 11)] if len(row) > 11 else ''
-            if status != 'Pending':
+            if status not in wanted:
                 continue
-            items.append({
-                'request_id':  row[idx.get('Request ID', 0)],
-                'submitted_at': row[idx.get('Submitted At', 1)],
-                'customer':    row[idx.get('Customer Name', 2)],
-                'cluster':     row[idx.get('Cluster', 3)],
-                'branch':      row[idx.get('Branch', 4)],
-                'amount':      row[idx.get('Amount', 5)],
-                'account_no':  row[idx.get('Account No', 6)],
-                'ifsc':        row[idx.get('IFSC', 7)],
-                'phone':       row[idx.get('Phone', 8)],
-                'so_name':     row[idx.get('SO Name', 9)],
-                'gold_weight': row[idx.get('Gold Weight', 10)],
-            })
+            items.append(_request_row_to_item(row, idx))
         return jsonify(items)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+def _build_bulk_csv(template, rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow([h for h, _ in template['columns']])
+    for r in rows:
+        w.writerow([_resolve_bulk_field(f, r) for _, f in template['columns']])
+    return buf.getvalue().encode('utf-8')
+
+def _build_bulk_xlsx(template, rows):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append([h for h, _ in template['columns']])
+    for r in rows:
+        ws.append([_resolve_bulk_field(f, r) for _, f in template['columns']])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+def _resolve_bulk_field(field, row):
+    if isinstance(field, tuple) and field[0] == 'const':
+        return field[1]
+    return row.get(field, '')
+
+def _clean_request_amount(raw):
+    """'₹11,75,000' / 'Rs. 1175000.00' → numeric; portals reject ₹ and commas.
+    Extracts the first number pattern rather than stripping globally, so the
+    dot in a 'Rs.' prefix can't corrupt the value. Distinct from the recon
+    _clean_amount(), which must preserve negative signs."""
+    m = re.search(r'\d[\d,]*(?:\.\d{1,2})?', str(raw or ''))
+    if not m:
+        return 0
+    val = float(m.group(0).replace(',', ''))
+    return int(val) if val == int(val) else val
+
+@app.route('/requests/export-bulk', methods=['POST'])
+def api_requests_export_bulk():
+    try:
+        body = request.json or {}
+        ids = body.get('request_ids') or []
+        bank_key = body.get('bank', '')
+        template = BANK_TEMPLATES.get(bank_key)
+        if not template:
+            return jsonify({'ok': False, 'error': f'Unknown bank format: {bank_key}'}), 400
+        if not ids:
+            return jsonify({'ok': False, 'error': 'No requests selected'}), 400
+
+        cfg = load_config()
+        debit_account = body.get('debit_account') or cfg.get('bulk_debit_account', '')
+        narration = body.get('narration') or cfg.get('bulk_narration', '')
+        value_date = body.get('value_date') or datetime.today().strftime('%d/%m/%Y')
+
+        _, ws = get_requests_sheet()
+        all_vals = ws.get_all_values()
+        idx = {h: i for i, h in enumerate(all_vals[0])} if all_vals else {}
+        by_id = {}
+        for rownum, row in enumerate(all_vals[1:], start=2):
+            if row and row[0] in ids:
+                by_id[row[0]] = (rownum, row)
+
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            return jsonify({'ok': False, 'error': 'Requests not found',
+                            'request_ids': missing}), 404
+        # Double-export guard: anything not Pending has already been exported
+        # or disbursed — refuse the whole batch so nothing is paid twice.
+        conflicts = [i for i in ids
+                     if by_id[i][1][idx.get('Status', 11)] != 'Pending']
+        if conflicts:
+            return jsonify({'ok': False, 'error': 'Not pending (already exported or disbursed?)',
+                            'request_ids': conflicts}), 409
+
+        export_rows = []
+        for req_id in ids:
+            item = _request_row_to_item(by_id[req_id][1], idx)
+            amount = _clean_request_amount(item['amount'])
+            export_rows.append({
+                **item,
+                'amount': amount,
+                'mode': 'RTGS' if amount >= RTGS_MIN_AMOUNT else 'NEFT',
+                'debit_account': debit_account,
+                'narration': narration,
+                'value_date': value_date,
+                'bank_name': item['bank'],
+            })
+
+        if template['filetype'] == 'csv':
+            file_bytes = _build_bulk_csv(template, export_rows)
+            mimetype = 'text/csv'
+        else:
+            file_bytes = _build_bulk_xlsx(template, export_rows)
+            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        filename = template['filename'].format(date=datetime.today().strftime('%d-%m-%Y'))
+
+        # Mark AFTER the file is built (a marked-but-unbuilt file is the bad
+        # direction), in ONE batch_update so a partial write can't split the
+        # batch between Exported and Pending.
+        stamp = f"Exported {template['label']} {datetime.today().strftime('%d-%m-%Y %H:%M')}"
+        notes_col = idx.get('Notes', 13)
+        status_letter = chr(ord('A') + idx.get('Status', 11))
+        notes_letter = chr(ord('A') + notes_col)
+        updates = []
+        for req_id in ids:
+            rownum, row = by_id[req_id]
+            old_note = row[notes_col] if len(row) > notes_col else ''
+            note = f"{old_note} | {stamp}" if old_note.strip() else stamp
+            updates.append({'range': f'{status_letter}{rownum}', 'values': [['Exported']]})
+            updates.append({'range': f'{notes_letter}{rownum}', 'values': [[note]]})
+        ws.batch_update(updates)
+
+        return Response(file_bytes, mimetype=mimetype,
+                        headers={'Content-Disposition': f'attachment; filename="{filename}"'})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+# ── WhatsApp DISBURSEMENT REQUEST message parser ─────────────────────────────
+# Label-keyed, for the exact message format the field app generates. The
+# generic extract_disbursement() stays untouched — it serves the disb tab's
+# free-form notes; this one only trusts explicit "Label: value" lines.
+REQUEST_LABELS = [
+    ('customer',    ['customer name', 'name']),
+    ('phone',       ['phone no', 'phone number', 'phone', 'mobile']),
+    ('amount',      ['amount required', 'amount']),
+    ('account_no',  ['account no', 'account number', 'a/c no', 'ac no']),
+    ('ifsc',        ['ifsc code', 'ifsc']),
+    ('bank',        ['bank name', 'bank']),
+    ('cluster',     ['cluster']),
+    ('branch',      ['branch']),
+    ('so_name',     ['so name']),
+    ('gold_weight', ['gold wt (gms)', 'gold wt', 'gold weight']),
+    ('date',        ['date']),
+]
+
+def parse_request_message(text):
+    fields, warnings = {}, []
+    # Longest label first so "Customer Name" wins over "Name" and
+    # "IFSC Code" over "IFSC".
+    label_map = sorted(
+        [(lbl, key) for key, labels in REQUEST_LABELS for lbl in labels],
+        key=lambda x: -len(x[0]))
+    for line in (text or '').splitlines():
+        m = re.match(r'^\s*([^:\-]+?)\s*[:\-]\s*(.+?)\s*$', line)
+        if not m:
+            continue
+        label = re.sub(r'\s+', ' ', m.group(1).strip().lower())
+        value = m.group(2).strip()
+        for lbl, key in label_map:
+            if label == lbl and key not in fields:
+                fields[key] = value
+                break
+    if 'amount' in fields:
+        fields['amount'] = _clean_request_amount(fields['amount'])
+        if not fields['amount']:
+            warnings.append('Amount could not be read as a number')
+    if 'ifsc' in fields:
+        fields['ifsc'] = fields['ifsc'].upper().replace(' ', '')
+        if not re.match(r'^[A-Z]{4}0[A-Z0-9]{6}$', fields['ifsc']):
+            warnings.append(f"IFSC '{fields['ifsc']}' doesn't look valid (AAAA0XXXXXX)")
+    if 'phone' in fields:
+        fields['phone'] = re.sub(r'\D', '', fields['phone'])
+        if len(fields['phone']) != 10:
+            warnings.append(f"Phone '{fields['phone']}' is not 10 digits")
+    if 'account_no' in fields:
+        fields['account_no'] = re.sub(r'\s', '', fields['account_no'])
+    for required in ('customer', 'amount', 'account_no', 'ifsc'):
+        if not fields.get(required):
+            warnings.append(f'Missing: {required}')
+    return fields, warnings
+
+def generate_request_id(ws):
+    # Ported verbatim from disbursement-form-deploy/api/submit-request.py so
+    # widget-added and field-app requests share one REQ-DDMMYY-NNN sequence.
+    today = datetime.now()
+    prefix = f"REQ-{today.strftime('%d%m%y')}-"
+    seq = 1
+    for row in ws.get_all_values()[1:]:
+        if row and row[0].startswith(prefix):
+            try:
+                n = int(row[0].split("-")[-1])
+                if n >= seq:
+                    seq = n + 1
+            except ValueError:
+                pass
+    return f"{prefix}{seq:03d}"
+
+@app.route('/requests/parse', methods=['POST'])
+def api_requests_parse():
+    fields, warnings = parse_request_message((request.json or {}).get('message', ''))
+    return jsonify({'fields': fields, 'warnings': warnings})
+
+@app.route('/requests/add', methods=['POST'])
+def api_requests_add():
+    try:
+        body = request.json or {}
+        if not body.get('customer') or not body.get('account_no'):
+            return jsonify({'ok': False, 'error': 'Customer and account number are required'}), 400
+        _, ws = get_requests_sheet()
+        req_id = generate_request_id(ws)
+        ws.append_row([
+            req_id,
+            datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC"),
+            body.get('customer', ''),
+            body.get('cluster', ''),
+            body.get('branch', ''),
+            str(body.get('amount', '')),
+            body.get('account_no', ''),
+            body.get('ifsc', ''),
+            body.get('phone', ''),
+            body.get('so_name', ''),
+            str(body.get('gold_weight', '')),
+            'Pending',
+            '',
+            'Added via widget paste',
+            body.get('bank', ''),
+        ])
+        return jsonify({'ok': True, 'request_id': req_id})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/save/disbursement', methods=['POST'])
 def api_save_disbursement():
