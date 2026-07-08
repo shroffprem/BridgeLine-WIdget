@@ -4517,6 +4517,22 @@ def api_requests_parse():
     fields, warnings = parse_request_message((request.json or {}).get('message', ''))
     return jsonify({'fields': fields, 'warnings': warnings})
 
+def _find_duplicate_request(all_vals, account_no, amount):
+    """Same beneficiary account + same amount submitted today = duplicate,
+    whatever its status — a request already exported or disbursed today is
+    the worst kind of duplicate. Digits-only compare so '2,00,000' matches."""
+    digits = lambda s: re.sub(r'\D', '', str(s or ''))
+    today = datetime.now(timezone.utc).strftime('%d-%m-%Y')
+    acct, amt = digits(account_no), digits(amount)
+    if not acct or not amt:
+        return None
+    for row in all_vals[1:]:
+        if len(row) < 12 or not row[0] or not row[1].startswith(today):
+            continue
+        if digits(row[6]) == acct and digits(row[5]) == amt:
+            return {'request_id': row[0], 'submitted_at': row[1], 'status': row[11]}
+    return None
+
 @app.route('/requests/add', methods=['POST'])
 def api_requests_add():
     try:
@@ -4524,6 +4540,11 @@ def api_requests_add():
         if not body.get('customer') or not body.get('account_no'):
             return jsonify({'ok': False, 'error': 'Customer and account number are required'}), 400
         _, ws = get_requests_sheet()
+        all_vals = ws.get_all_values()
+        dup = _find_duplicate_request(all_vals, body.get('account_no'), body.get('amount'))
+        if dup:
+            return jsonify({'ok': False, 'duplicate': True,
+                            'error': f"Duplicate of {dup['request_id']} ({dup['status']}, {dup['submitted_at']})"}), 409
         req_id = generate_request_id(ws)
         ws.append_row([
             req_id,
