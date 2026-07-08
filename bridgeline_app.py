@@ -3045,14 +3045,40 @@ async function loadPendingRequests() {
       const badge = r.status === 'Exported'
         ? ' <span style="font-size:11px;background:#fff3cd;color:#856404;border:1px solid #ffeeba;border-radius:4px;padding:1px 6px;font-weight:400;">Exported</span>'
         : '';
-      card.innerHTML = `<div style="font-weight:600;font-size:14px;">${r.customer}${badge}</div>
+      card.innerHTML = `<button class="req-del-btn" title="Delete request" style="float:right;font-size:12px;padding:2px 8px;cursor:pointer;border:1px solid #e0b4b4;border-radius:4px;background:#fff;color:#c0392b;">🗑</button>
+        <div style="font-weight:600;font-size:14px;">${r.customer}${badge}</div>
         <div style="font-size:12px;color:#555;margin-top:3px;">${r.cluster} · ${r.branch} · ${amt}</div>
         <div style="font-size:11px;color:#999;margin-top:2px;">${r.request_id} · ${r.submitted_at}</div>`;
       card.addEventListener('click', () => selectPendingRequest(r));
+      card.querySelector('.req-del-btn').addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        deletePendingRequest(r);
+      });
       list.appendChild(card);
     });
   } catch(e) {
     list.innerHTML = `<span style="color:#c00;font-size:13px;">Error loading requests: ${e.message}</span>`;
+  }
+}
+
+async function deletePendingRequest(r) {
+  const reason = prompt(`Delete ${r.request_id} (${r.customer}, ${r.cluster}/${r.branch}) from the queue?\n\nReason (optional — saved to the sheet):`);
+  if (reason === null) return;
+  if (!confirm(`Confirm: remove ${r.request_id} from the queue? The row stays in the sheet marked Deleted.`)) return;
+  try {
+    const res = await (await fetch('/requests/delete', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({request_ids: [r.request_id], reason: reason.trim()})})).json();
+    if (!res.ok) throw new Error(res.error || 'Failed');
+    // If the deleted request was selected into the form, clear the link so
+    // saving the disbursement doesn't try to mark a Deleted row Disbursed.
+    if (document.getElementById('d-request-id').value === r.request_id) {
+      document.getElementById('d-request-id').value = '';
+      document.getElementById('pending-selected-info').style.display = 'none';
+    }
+    loadPendingRequests();
+  } catch(e) {
+    alert('Delete failed: ' + e.message);
   }
 }
 
