@@ -12,7 +12,7 @@ import threading
 import time
 import os
 from datetime import datetime, date, timedelta, timezone
-from flask import Flask, request, jsonify, render_template_string, Response
+from flask import Flask, request, jsonify, render_template_string, Response, send_from_directory
 
 # ── Google Sheets setup ───────────────────────────────────────────────────────
 import gspread
@@ -801,8 +801,14 @@ def save_disbursement(data):
     row_data[COL['charges']-1]      = charges
     row_data[COL['gst']-1]          = gst
     row_data[COL['total']-1]        = total
-    row_data[COL['balance']-1]      = total
-    row_data[COL['current_date']-1] = datetime.today().strftime('%d-%m-%Y')
+    # Balance and Current Date are left blank here (not COL['tat'] either) so
+    # Google Sheets' native "extend formula from the row above" behavior on
+    # row insert fills them in automatically — exactly how TAT already
+    # works without any code writing to it. Writing a plain value into
+    # either cell would permanently clobber that row's live formula (the
+    # app's own balance figure is always computed fresh from Total/
+    # Collected/Discount in Python — see _parse_case()/_case_detail() — so
+    # nothing here depends on what column O actually contains).
     row_data[COL['status']-1]       = 'Follow Up!'
     row_data[COL['srv_branch']-1]   = data.get('serviced_branch', '')
     row_data[COL['srv_cluster']-1]  = data.get('serviced_cluster', '')
@@ -861,10 +867,13 @@ def save_repayment(data):
         (row, COL['coll_date'],   coll_date),
         (row, COL['coll_amount'], new_coll),
         (row, COL['status'],      new_status),
-        # Balance was previously left stale in the sheet (never written
-        # after creation) — only the in-memory API response had the right
-        # number. Write it back so the raw sheet matches reality too.
-        (row, COL['balance'],     new_bal),
+        # Balance (col O) is intentionally never written here — it's a live
+        # sheet formula (=IF(...,-(Total),Collected-Total)) that recomputes
+        # automatically once Collected Amount changes above. Writing a
+        # static number would permanently destroy that row's formula. The
+        # app's own displayed balance is always computed fresh in Python
+        # from Total/Collected/Discount (_parse_case()/_case_detail()), so
+        # nothing here depends on what column O contains.
     ]
     if discount:
         updates.append((row, COL['discount'], discount))
@@ -1122,12 +1131,13 @@ def update_disbursement(data):
         # case whose corrected amount leaves money owed reopens.
         status = 'Closed' if bal < 1 else (
             'Follow Up!' if info['status'] in ('', 'Closed') else info['status'])
+        # Balance (col O) is never written — see save_repayment()'s comment;
+        # it's a live formula that recomputes from Total/Collected on its own.
         updates += [(row, COL['amount'],  amount),
                     (row, COL['charges'], charges),
                     (row, COL['gst'],     gst),
                     (row, COL['total'],   total),
-                    (row, COL['status'],  status),
-                    (row, COL['balance'], bal)]
+                    (row, COL['status'],  status)]
 
     if updates:
         ws.batch_update([{
@@ -1177,11 +1187,14 @@ def _recompute_case_from_mcoll(disb_id):
     bal      = max(0, total - collected - discount)
     status   = 'Closed' if bal < 1 else 'Follow Up!'
 
+    # Balance (col O) is never written — same reasoning as save_repayment()
+    # and update_disbursement(): it's a live formula that recomputes on its
+    # own once Collected Amount (written below) changes.
     ws.batch_update([{
         'range': gspread.utils.rowcol_to_a1(row, c),
         'values': [[v]]
     } for c, v in [(COL['coll_date'], coll_date), (COL['coll_amount'], collected),
-                   (COL['status'], status), (COL['balance'], bal)]])
+                   (COL['status'], status)]])
     trigger_ledger_rebuild()
 
     return {'sheet': info['sheet'], 'row': row, 'payments': payments}
@@ -2483,6 +2496,27 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB upload limit
 
+ICONS_DIR = os.path.join(os.path.dirname(__file__), 'assets', 'icons')
+
+@app.route('/manifest.json')
+def api_manifest():
+    return jsonify({
+        "name": "BridgeLine Accounts",
+        "short_name": "BridgeLine",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#1a3a5c",
+        "theme_color": "#1a3a5c",
+        "icons": [
+            {"src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+        ],
+    })
+
+@app.route('/icons/<path:filename>')
+def api_icons(filename):
+    return send_from_directory(ICONS_DIR, filename)
+
 SETUP_HTML = """<!DOCTYPE html><html><head><meta charset='UTF-8'>
 <title>BridgeLine — Setup</title>
 <style>body{font-family:Arial;max-width:680px;margin:40px auto;padding:20px;background:#eef2f7}
@@ -2505,6 +2539,14 @@ HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>BridgeLine Accounts</title>
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#1a3a5c">
+<link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32.png">
+<link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192.png">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="BridgeLine">
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:Arial,sans-serif;background:#eef2f7;color:#222}
