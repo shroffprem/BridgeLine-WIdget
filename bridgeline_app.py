@@ -1274,34 +1274,88 @@ DEFAULT_CONFIG = {
     "bulk_narration": "BridgeLine Disbursement",
 }
 
+def _load_config_raw():
+    """Actual Config sheet read, no fallback — raises on any failure. Retries
+    a couple of times first since most failures here are a transient Sheets
+    429/network blip, not a real outage."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(CONFIG_SHEET_NAME)
+            rows = ws.get_all_values()
+            cfg = {}
+            for row in rows[1:] if rows and rows[0] and rows[0][0].strip().lower() == 'key' else rows:
+                if len(row) < 2 or not row[0].strip():
+                    continue
+                key, raw = row[0].strip(), row[1]
+                try:
+                    cfg[key] = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    cfg[key] = raw  # plain strings (report_time, webhook url/token) stay as-is
+            return cfg
+        except Exception as e:
+            last_err = e
+            time.sleep(1.5 * (attempt + 1))
+    raise last_err
+
 def load_config():
+    """Lenient reader for ordinary display/use throughout the app (dashboard,
+    MIS generation, etc.) — a transient Sheets hiccup here should degrade to
+    safe defaults rather than break the page. NEVER use this as the basis
+    for a write-back (see load_config_strict + the save_config() docstring
+    for why: this silently substituting DEFAULT_CONFIG on failure is exactly
+    what turned one transient read error into permanently deleted
+    ledger_webhook_url/token + active_archive_tabs + bank_accounts on
+    2026-07-09 — every key not in that one request's payload and not in
+    DEFAULT_CONFIG's 8 baked-in keys was gone the moment the merged,
+    defaults-only dict got written back over the whole sheet)."""
     try:
-        ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(CONFIG_SHEET_NAME)
-        rows = ws.get_all_values()
-        cfg = {}
-        for row in rows[1:] if rows and rows[0] and rows[0][0].strip().lower() == 'key' else rows:
-            if len(row) < 2 or not row[0].strip():
-                continue
-            key, raw = row[0].strip(), row[1]
-            try:
-                cfg[key] = json.loads(raw)
-            except (json.JSONDecodeError, TypeError):
-                cfg[key] = raw  # plain strings (report_time, webhook url/token) stay as-is
-        for k, v in DEFAULT_CONFIG.items():
-            cfg.setdefault(k, v)
-        return cfg
+        cfg = _load_config_raw()
     except Exception:
         return DEFAULT_CONFIG.copy()
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
+
+def load_config_strict():
+    """For any code path about to save_config() a merged result. Raises
+    instead of silently returning DEFAULT_CONFIG on a failed read — a
+    save built on top of a failed read must never proceed, since
+    save_config() rewrites the ENTIRE Config sheet from exactly the dict
+    it's given. Callers must let this exception abort the save (return an
+    error to the user) rather than falling back to any default dict."""
+    cfg = _load_config_raw()
+    for k, v in DEFAULT_CONFIG.items():
+        cfg.setdefault(k, v)
+    return cfg
 
 def save_config(cfg):
     # Write-then-clear-trailing (not clear-then-write) — see save_contacts()
     # for why: Sheets has no transactions, so this shrinks the failure
     # window to "the write itself fails" (old config intact) instead of
     # "clear succeeded, write failed" (config wiped, unrecoverable).
+    #
+    # Defence in depth for an audit-critical sheet: re-read whatever is
+    # CURRENTLY on the sheet right before writing and merge `cfg` on top of
+    # it, instead of writing `cfg` alone. A key already in Config that isn't
+    # present in `cfg` is preserved rather than deleted — this is what
+    # should have stopped the 2026-07-09 incident (ledger_webhook_url/token,
+    # active_archive_tabs, bank_accounts silently wiped by a save built on
+    # a failed read) even if some future caller ever builds an incomplete
+    # dict again. The only way to actually remove a key now is to delete
+    # its row directly in the sheet.
     ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(CONFIG_SHEET_NAME)
-    prev_row_count = len(ws.get_all_values())
-    rows = [['key', 'value']]
+    current_rows = ws.get_all_values()
+    prev_row_count = len(current_rows)
+    merged = {}
+    for row in current_rows[1:] if current_rows and current_rows[0] and current_rows[0][0].strip().lower() == 'key' else current_rows:
+        if len(row) >= 2 and row[0].strip():
+            merged[row[0].strip()] = row[1]
     for k, v in cfg.items():
+        merged[k] = v
+
+    rows = [['key', 'value']]
+    for k, v in merged.items():
         val = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
         rows.append([k, val])
     ws.update(range_name='A1', values=rows)
@@ -4940,12 +4994,15 @@ def api_get_config():
 @app.route('/config', methods=['POST'])
 def api_save_config():
     try:
-        cfg = load_config()
+        cfg = load_config_strict()
         cfg.update(request.json)
         save_config(cfg)
         return jsonify({'ok': True})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)})
+        # A failed read here must abort the save outright (not fall back to
+        # DEFAULT_CONFIG) — see load_config_strict()'s docstring. The user
+        # sees a failed save and can retry; nothing in Config gets touched.
+        return jsonify({'ok': False, 'error': f'Config save aborted (read failed, nothing was overwritten): {e}'})
 
 @app.route('/reconcile/parse', methods=['POST'])
 def api_reconcile_parse():
