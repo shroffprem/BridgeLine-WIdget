@@ -22,6 +22,7 @@ from google.auth.transport.requests import Request
 SPREADSHEET_ID = "1LKhDNyOd1u48UFgQafbz3oP4Ehgf1hJBt59F9A-8H7U"
 SHEET_NAME     = "Accounts"
 SCOPES         = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+IST            = timezone(timedelta(hours=5, minutes=30))
 
 import requests
 
@@ -686,10 +687,16 @@ def read_contacts():
         raise RuntimeError(f'Contact sheet error: {e}')
 
 def save_contacts(contacts):
-    """Write full contacts list back to Contact sheet."""
+    """Write full contacts list back to Contact sheet.
+
+    Sheets has no transactions, so clear()-then-update() has a window where a
+    failed update leaves the tab wiped with no rollback. Writing the new data
+    first (a plain update() is retriable/idempotent on its own) and only
+    clearing now-unused trailing rows afterward means a failure before the
+    write completes leaves the old data intact instead of blank."""
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws = sh.worksheet('Contact')
-    ws.clear()
+    prev_row_count = len(ws.get_all_values())
     rows = [['Cluster', 'Name', 'Designation', 'Branch', 'Phone', 'Email']]
     prev_cluster = ''
     for c in contacts:
@@ -705,6 +712,8 @@ def save_contacts(contacts):
         if cluster:
             prev_cluster = cluster
     ws.update('A1', rows)
+    if prev_row_count > len(rows):
+        ws.batch_clear([f'A{len(rows) + 1}:Z{prev_row_count}'])
     ws.format('A1:F1', {
         'textFormat': {'bold': True, 'foregroundColor': {'red':1,'green':1,'blue':1}},
         'backgroundColor': {'red': 0.1, 'green': 0.23, 'blue': 0.36}
@@ -880,6 +889,7 @@ def save_repayment(data):
     # closures -- M Coll needs to be the one definitive payment history
     # everywhere it's read (the Customer Ledger, MIS reports, etc.), not
     # just for multi-instalment cases.
+    mcoll_error = None
     try:
         mc = sh.worksheet('M Coll')
         mc_vals = mc.get_all_values()
@@ -888,11 +898,32 @@ def save_repayment(data):
             disb_id, coll_date, amount,
             utr or raw_msg, info.get('customer', ''),
         ], next_mc_row)
-    except Exception:
-        pass
+    except Exception as e:
+        # Previously a bare `except: pass` — Accounts had already been
+        # updated above, so a failure here silently detached this payment
+        # from M Coll (the definitive payment-history log used by the
+        # Customer Ledger and MIS reports), undetected until reconciliation
+        # didn't match. Surface it two ways: durably, in the Accounts row's
+        # own Remarks cell (so anyone auditing this case later sees it even
+        # if nobody was watching the API response at the time), and in the
+        # API response so the officer sees a warning immediately.
+        mcoll_error = str(e)
+        try:
+            existing_rem = (ws.cell(row, COL['remarks']).value or '').strip()
+            warn = f"M Coll log FAILED for {coll_date} payment of Rs.{amount}: {mcoll_error}"
+            combined = f"{existing_rem} | {warn}" if existing_rem else warn
+            ws.update_cell(row, COL['remarks'], combined)
+        except Exception:
+            pass  # best-effort — the warning-write itself must not blow up the request
 
     trigger_ledger_rebuild()
-    return {'new_collected': new_coll, 'new_balance': new_bal, 'status': new_status}
+    result = {'new_collected': new_coll, 'new_balance': new_bal, 'status': new_status}
+    if mcoll_error:
+        result['mcoll_warning'] = (
+            f"Payment recorded on the account but NOT logged to M Coll (payment "
+            f"history): {mcoll_error}. It's noted in Remarks — check manually."
+        )
+    return result
 
 # ── Case editing (fix mistakes in saved disbursements / repayments) ───────────
 
@@ -1250,13 +1281,19 @@ def load_config():
         return DEFAULT_CONFIG.copy()
 
 def save_config(cfg):
+    # Write-then-clear-trailing (not clear-then-write) — see save_contacts()
+    # for why: Sheets has no transactions, so this shrinks the failure
+    # window to "the write itself fails" (old config intact) instead of
+    # "clear succeeded, write failed" (config wiped, unrecoverable).
     ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(CONFIG_SHEET_NAME)
+    prev_row_count = len(ws.get_all_values())
     rows = [['key', 'value']]
     for k, v in cfg.items():
         val = json.dumps(v) if isinstance(v, (dict, list)) else str(v)
         rows.append([k, val])
-    ws.clear()
     ws.update(range_name='A1', values=rows)
+    if prev_row_count > len(rows):
+        ws.batch_clear([f'A{len(rows) + 1}:Z{prev_row_count}'])
 
 # ── Today summary ─────────────────────────────────────────────────────────────
 
@@ -3576,7 +3613,11 @@ async function saveRepa() {
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)})).json();
   btn.disabled = false; btn.textContent = '✅ Save Repayment to Google Sheet';
   if (r.ok) {
-    showStatus('r-status','success',`✅ ₹${fmt(amount)} recorded. New balance: ₹${fmt(r.new_balance)}. Status: ${r.status}`);
+    if (r.mcoll_warning) {
+      showStatus('r-status','error',`⚠️ ₹${fmt(amount)} recorded (balance ₹${fmt(r.new_balance)}) but NOT logged to payment history — ${r.mcoll_warning}`);
+    } else {
+      showStatus('r-status','success',`✅ ₹${fmt(amount)} recorded. New balance: ₹${fmt(r.new_balance)}. Status: ${r.status}`);
+    }
     document.getElementById('r-amount').value = '';
     document.getElementById('r-utr').value = '';
     document.getElementById('r-discount').value = '0';
@@ -4423,7 +4464,7 @@ def api_requests_export_bulk():
         cfg = load_config()
         debit_account = body.get('debit_account') or cfg.get('bulk_debit_account', '')
         narration = body.get('narration') or cfg.get('bulk_narration', '')
-        value_date = body.get('value_date') or datetime.today().strftime('%d/%m/%Y')
+        value_date = body.get('value_date') or datetime.now(IST).strftime('%d/%m/%Y')
 
         _, ws = get_requests_sheet()
         all_vals = ws.get_all_values()
@@ -4465,12 +4506,12 @@ def api_requests_export_bulk():
         else:
             file_bytes = _build_bulk_xlsx(template, export_rows)
             mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        filename = template['filename'].format(date=datetime.today().strftime('%d-%m-%Y'))
+        filename = template['filename'].format(date=datetime.now(IST).strftime('%d-%m-%Y'))
 
         # Mark AFTER the file is built (a marked-but-unbuilt file is the bad
         # direction), in ONE batch_update so a partial write can't split the
         # batch between Exported and Pending.
-        stamp = f"Exported {template['label']} {datetime.today().strftime('%d-%m-%Y %H:%M')}"
+        stamp = f"Exported {template['label']} {datetime.now(IST).strftime('%d-%m-%Y %H:%M')} IST"
         notes_col = idx.get('Notes', 13)
         status_letter = chr(ord('A') + idx.get('Status', 11))
         notes_letter = chr(ord('A') + notes_col)
@@ -4545,7 +4586,9 @@ def parse_request_message(text):
 def generate_request_id(ws):
     # Ported verbatim from disbursement-form-deploy/api/submit-request.py so
     # widget-added and field-app requests share one REQ-DDMMYY-NNN sequence.
-    today = datetime.now()
+    # IST, not server time (Vercel's Python runtime is UTC) — otherwise a
+    # request added after 5:30pm IST gets tomorrow's date-prefix.
+    today = datetime.now(IST)
     prefix = f"REQ-{today.strftime('%d%m%y')}-"
     seq = 1
     for row in ws.get_all_values()[1:]:
@@ -4586,7 +4629,7 @@ def api_requests_delete():
         # The row stays in the sheet as the audit trail of what was removed
         # and why; every queue view filters on Status so it disappears
         # from pending/export/disb-picker immediately.
-        stamp = f"Deleted{': ' + reason if reason else ''} {datetime.today().strftime('%d-%m-%Y %H:%M')}"
+        stamp = f"Deleted{': ' + reason if reason else ''} {datetime.now(IST).strftime('%d-%m-%Y %H:%M')} IST"
         notes_col = idx.get('Notes', 13)
         status_letter = chr(ord('A') + idx.get('Status', 11))
         notes_letter = chr(ord('A') + notes_col)
@@ -4602,12 +4645,39 @@ def api_requests_delete():
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
+def _flag_id_collision(ws, req_id):
+    """Best-effort detection (not prevention) of the ID-generation race: two
+    concurrent submissions can compute the same REQ-DDMMYY-NNN before either
+    has appended its row. Re-scanning right after our own append can catch
+    it — not airtight (both racers may read a self-consistent but stale
+    view), but turns a silent duplicate ID into a flagged one a human will
+    notice instead of nothing. Mirrors disbursement-form-deploy/api/
+    submit-request.py so both writers behave the same way. Never blocks the
+    submission itself."""
+    try:
+        all_vals = ws.get_all_values()
+        header = all_vals[0]
+        notes_col = header.index('Notes') if 'Notes' in header else 13
+        matches = [i for i, row in enumerate(all_vals[1:], start=2) if row and row[0] == req_id]
+        if len(matches) <= 1:
+            return
+        marker = f"ID COLLISION: {len(matches)} requests share {req_id} - verify manually"
+        for rownum in matches:
+            row = all_vals[rownum - 1]
+            old_note = row[notes_col] if len(row) > notes_col else ''
+            if 'ID COLLISION' in old_note:
+                continue
+            note = f"{old_note} | {marker}" if old_note.strip() else marker
+            ws.update_cell(rownum, notes_col + 1, note)
+    except Exception:
+        pass  # auxiliary safety net — a failure here must never surface as a submit failure
+
 def _find_duplicate_request(all_vals, account_no, amount):
     """Same beneficiary account + same amount submitted today = duplicate,
     whatever its status — a request already exported or disbursed today is
     the worst kind of duplicate. Digits-only compare so '2,00,000' matches."""
     digits = lambda s: re.sub(r'\D', '', str(s or ''))
-    today = datetime.now(timezone.utc).strftime('%d-%m-%Y')
+    today = datetime.now(IST).strftime('%d-%m-%Y')
     acct, amt = digits(account_no), digits(amount)
     if not acct or not amt:
         return None
@@ -4635,7 +4705,7 @@ def api_requests_add():
         req_id = generate_request_id(ws)
         ws.append_row([
             req_id,
-            datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC"),
+            datetime.now(IST).strftime("%d-%m-%Y %H:%M IST"),
             body.get('customer', ''),
             body.get('cluster', ''),
             body.get('branch', ''),
@@ -4650,6 +4720,7 @@ def api_requests_add():
             'Added via widget paste',
             body.get('bank', ''),
         ])
+        _flag_id_collision(ws, req_id)
         return jsonify({'ok': True, 'request_id': req_id})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
