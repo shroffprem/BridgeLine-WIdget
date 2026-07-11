@@ -1557,7 +1557,9 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
 
     # --- Signatures ---
     sig_w = (pwi - 10) / 2
-    recv_label = 'PAID IN FULL — RECEIVED BY' if paid_in_full else 'RECEIVED BY'
+    # \x96 = cp1252 en dash — a literal '—' (U+2014) crashes the deployed
+    # fpdf's latin-1 Helvetica, same issue as the ledger table's Dr/Cr dash.
+    recv_label = 'PAID IN FULL \x96 RECEIVED BY' if paid_in_full else 'RECEIVED BY'
     for i, (label, name) in enumerate([('AUTHORISED BY', 'Prem / Harsha'), (recv_label, case['customer'])]):
         sx = x0 + i * (sig_w + 10)
         if i == 0 and os.path.exists(SIGNATURE_PATH) and os.path.getsize(SIGNATURE_PATH) > 0:
