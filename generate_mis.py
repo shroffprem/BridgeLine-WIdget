@@ -1574,8 +1574,11 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
 
     pdf.set_text_color(*C_TEXT_DARK)
 
-    # --- UPI panel (open cases only, same threshold logic as before) ---
-    if not paid_in_full and (case['amount'] < COLLECTION_CARD_THRESHOLD or case['balance'] < COLLECTION_CARD_THRESHOLD):
+    # --- UPI panel: every OPEN case's invoice carries the QR / Tap-to-Pay,
+    # regardless of amount. (It used to inherit the Collection Card's
+    # sub-1L threshold, which silently hid it on most invoices.) Paid-in-
+    # full documents still omit it — nothing left to pay.
+    if not paid_in_full:
         y += 33
         panel_w = 55
         px0 = x0 + (pwi - panel_w) / 2
