@@ -27,20 +27,27 @@ IST            = timezone(timedelta(hours=5, minutes=30))
 import requests
 
 def trigger_ledger_rebuild():
-    """Synchronous call to the Apps Script webhook so the Customer Ledger
-    tab rebuilds immediately after this widget writes to Accounts/M Coll.
-    Configure ledger_webhook_url / ledger_webhook_token in the Config sheet
-    tab. If either is blank, this is a silent no-op. A failure here must
-    never break a disbursement/collection save, so all errors are swallowed.
-
-    Runs synchronously (not in a background thread) because Vercel serverless
-    functions don't guarantee background threads survive after the HTTP
-    response is sent — unlike the old Mac-only version, this call must
-    complete (or time out) before the request returns.
-    """
-    global _accounts_cache
+    """Marks caches dirty only — does NOT call the ledger webhook itself.
+    The actual webhook call (rebuild_ledger_now()) reliably takes 10-15s on
+    the Apps Script side (it reformats the whole sheet's borders/column
+    widths every time), so it must never run inline inside a save request —
+    it used to, and that's why every disbursement/repayment save visibly
+    took 10-15+ seconds. Save routes call this (cheap, in-process only);
+    the frontend separately fires a non-blocking POST /rebuild-ledger right
+    after showing save success, so the ledger still catches up within a
+    few seconds without the user waiting on it."""
+    global _accounts_cache, _config_cache
     _recent_activity_cache.clear()
     _accounts_cache = None
+    _config_cache = None
+
+def rebuild_ledger_now():
+    """The actual synchronous webhook call, factored out of
+    trigger_ledger_rebuild() so it can be invoked from its own independent
+    request (POST /rebuild-ledger) instead of inline during a save. Configure
+    ledger_webhook_url / ledger_webhook_token in the Config sheet tab; if
+    either is blank, this is a silent no-op. A failure here must never break
+    anything else, so all errors are swallowed."""
     cfg = load_config()
     url = (cfg.get("ledger_webhook_url") or "").strip()
     token = (cfg.get("ledger_webhook_token") or "").strip()
@@ -51,18 +58,25 @@ def trigger_ledger_rebuild():
         # URL, and that redirect drops a POST body (gets converted to GET
         # by both curl and requests, per standard 301/302 behavior). Using
         # GET with the token in the query string avoids that entirely.
-        # rebuildLedger() reformats the whole sheet (borders, column
-        # widths) every time and reliably takes 10-15s on the Apps Script
-        # side, so the save request itself will visibly take that long.
         requests.get(url, params={"token": token}, timeout=15)
     except Exception as e:
         print(f"[ledger webhook] call failed: {e}")
+
+_gspread_client_cache = None  # (timestamp, client)
+_GSPREAD_CLIENT_TTL = 45 * 60  # seconds — Google access tokens last ~60 min
 
 def get_gspread_client():
     """Auth via a long-lived Google OAuth refresh token stored as Vercel env
     vars — no local token.pickle / browser consent flow, since this runs as
     a stateless serverless function with no persistent disk and no display.
-    """
+
+    Cached on a warm serverless instance: without this, a single save could
+    trigger 2-5 completely independent OAuth token-refresh round trips
+    (one per helper function that needed a client), each an extra network
+    hop before any actual Sheets read/write even happened."""
+    global _gspread_client_cache
+    if _gspread_client_cache and (time.time() - _gspread_client_cache[0]) < _GSPREAD_CLIENT_TTL:
+        return _gspread_client_cache[1]
     creds = Credentials(
         None,
         refresh_token=os.environ["GOOGLE_REFRESH_TOKEN"],
@@ -75,7 +89,9 @@ def get_gspread_client():
     # BackOffHTTPClient retries 429 quota errors with exponential backoff —
     # without it a burst of reads (multi-step edits, recon rebuilds) can die
     # mid-operation and leave Accounts/M Coll half-updated.
-    return gspread.authorize(creds, http_client=gspread.BackOffHTTPClient)
+    client = gspread.authorize(creds, http_client=gspread.BackOffHTTPClient)
+    _gspread_client_cache = (time.time(), client)
+    return client
 
 def get_sheet():
     gc = get_gspread_client()
@@ -554,6 +570,7 @@ def get_archive_tab_names():
 
 _accounts_cache = None  # (timestamp, rows)
 _ACCOUNTS_CACHE_TTL = 15  # seconds
+_config_cache = None  # (timestamp, cfg dict) — load_config()'s lenient-path cache
 
 def read_accounts_from_gsheet():
     """Cached: this is the shared hot path for lookup_case(), get_open_cases(),
@@ -762,8 +779,9 @@ def lookup_case(disb_id):
             }
     return {'found': False}
 
-def get_next_seq():
-    records = read_accounts_from_gsheet()
+def get_next_seq(records=None):
+    if records is None:
+        records = read_accounts_from_gsheet()
     max_seq = 0
     for r in records:
         m = re.search(r'-(\d{3})$', r.get('Disbursement ID', ''))
@@ -773,7 +791,13 @@ def get_next_seq():
 
 def save_disbursement(data):
     ws  = get_sheet()
-    seq = get_next_seq()
+    # One read serves both the sequence number AND the insert row — the
+    # latter used to cost a second, separate ws.get_all_values() call on
+    # top of the read read_accounts_from_gsheet() already just did.
+    records  = read_accounts_from_gsheet()
+    seq      = get_next_seq(records)
+    accounts_rows = [r['_row'] for r in records if r.get('_sheet', SHEET_NAME) == SHEET_NAME]
+    next_row = max(accounts_rows, default=3) + 1
     try:
         d = datetime.strptime(data['date'], '%d-%m-%Y')
     except Exception:
@@ -785,9 +809,6 @@ def save_disbursement(data):
     charges = round(amount * 0.005, 2)
     gst     = round(charges * 0.18, 2)
     total   = round(amount + charges + gst, 2)
-
-    all_vals = ws.get_all_values()
-    next_row = len(all_vals) + 1
 
     row_data = [''] * 24
     row_data[COL['disb_id']-1]      = disb_id
@@ -854,8 +875,23 @@ def save_repayment(data):
     ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
     row = info['row']
 
-    existing = _cell_num(ws, row, COL['coll_amount'])
-    total    = _cell_num(ws, row, COL['total']) or calc_total(_cell_num(ws, row, COL['amount']))
+    # One row read instead of up to 4 separate single-cell round trips
+    # (coll_amount, total, amount, credit_note, remarks each used to be
+    # their own ws.cell() call).
+    row_vals = ws.row_values(row)
+    def _rownum(col_key):
+        i = COL[col_key] - 1
+        v = row_vals[i] if i < len(row_vals) else ''
+        try:
+            return float(str(v).replace(',', '').replace('₹', '').strip() or 0)
+        except Exception:
+            return 0.0
+    def _rowstr(col_key):
+        i = COL[col_key] - 1
+        return (row_vals[i] if i < len(row_vals) else '') or ''
+
+    existing = _rownum('coll_amount')
+    total    = _rownum('total') or calc_total(_rownum('amount'))
     new_coll = existing + amount
     new_bal  = max(0, total - new_coll - discount)
     # Sub-rupee residue (rounding leftovers from discount/instalment math)
@@ -879,13 +915,13 @@ def save_repayment(data):
         updates.append((row, COL['discount'], discount))
 
     if utr:
-        existing_utr = (ws.cell(row, COL['credit_note']).value or '').strip()
+        existing_utr = _rowstr('credit_note').strip()
         combined_utr = f"{existing_utr}, {utr}" if existing_utr else utr
         updates.append((row, COL['credit_note'], combined_utr))
 
     remarks = data.get('remarks', '').strip()
     if remarks:
-        existing_rem = (ws.cell(row, COL['remarks']).value or '').strip()
+        existing_rem = _rowstr('remarks').strip()
         combined_rem = f"{existing_rem} | {remarks}" if existing_rem else remarks
         updates.append((row, COL['remarks'], combined_rem))
 
@@ -1308,13 +1344,22 @@ def load_config():
     ledger_webhook_url/token + active_archive_tabs + bank_accounts on
     2026-07-09 — every key not in that one request's payload and not in
     DEFAULT_CONFIG's 8 baked-in keys was gone the moment the merged,
-    defaults-only dict got written back over the whole sheet)."""
+    defaults-only dict got written back over the whole sheet).
+
+    Cached briefly (15s) — this gets called multiple times within a single
+    save (e.g. once via get_archive_tab_names() for the Accounts read),
+    each of which used to cost its own fresh Sheets read. Cleared by
+    trigger_ledger_rebuild()/save_config() same as _accounts_cache."""
+    global _config_cache
+    if _config_cache and (time.time() - _config_cache[0]) < _ACCOUNTS_CACHE_TTL:
+        return _config_cache[1]
     try:
         cfg = _load_config_raw()
     except Exception:
         return DEFAULT_CONFIG.copy()
     for k, v in DEFAULT_CONFIG.items():
         cfg.setdefault(k, v)
+    _config_cache = (time.time(), cfg)
     return cfg
 
 def load_config_strict():
@@ -1344,6 +1389,8 @@ def save_config(cfg):
     # a failed read) even if some future caller ever builds an incomplete
     # dict again. The only way to actually remove a key now is to delete
     # its row directly in the sheet.
+    global _config_cache
+    _config_cache = None
     ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(CONFIG_SHEET_NAME)
     current_rows = ws.get_all_values()
     prev_row_count = len(current_rows)
@@ -3368,6 +3415,14 @@ async function _fetchJsonWithTimeout(url, opts, ms) {
   }
 }
 
+// Fire-and-forget — deliberately not awaited. The ledger rebuild takes
+// 10-15s on the Apps Script side; blocking the save's own "Saved!" status
+// on it is what made every save visibly slow. This call runs independently
+// in the background while the user already sees success.
+function kickLedgerRebuild() {
+  fetch('/rebuild-ledger', {method: 'POST'}).catch(() => {});
+}
+
 async function savePayRow(i) {
   const p = _editCase.payments[i];
   const body = {
@@ -3381,7 +3436,7 @@ async function savePayRow(i) {
   try {
     const r = await _fetchJsonWithTimeout('/case/update-repayment', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
+    if (r.ok) { renderEditCase(r.case); loadRecentCases(); kickLedgerRebuild(); showStatus('e-pay-status','success','✅ Payment updated — balance & status recomputed.'); }
     else showStatus('e-pay-status','error','❌ ' + r.error);
   } catch (e) {
     showStatus('e-pay-status','error','❌ ' + e.message);
@@ -3396,7 +3451,7 @@ async function delPayRow(i) {
     const r = await _fetchJsonWithTimeout('/case/delete-repayment', {method:'POST',
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({disb_id: _editCase.disb_id, mc_row: p.mc_row})});
-    if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
+    if (r.ok) { renderEditCase(r.case); loadRecentCases(); kickLedgerRebuild(); showStatus('e-pay-status','success','✅ Payment deleted — balance & status recomputed.'); }
     else showStatus('e-pay-status','error','❌ ' + r.error);
   } catch (e) {
     showStatus('e-pay-status','error','❌ ' + e.message);
@@ -3417,7 +3472,7 @@ async function addPayRow() {
     const r = await _fetchJsonWithTimeout('/case/add-repayment', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     if (r.ok) {
-      renderEditCase(r.case); loadRecentCases();
+      renderEditCase(r.case); loadRecentCases(); kickLedgerRebuild();
       document.getElementById('e-new-pay-amount').value = '';
       document.getElementById('e-new-pay-utr').value = '';
       showStatus('e-pay-status','success','✅ Payment added — balance & status recomputed.');
@@ -3442,7 +3497,7 @@ async function saveEditDisb() {
   try {
     const r = await _fetchJsonWithTimeout('/case/update-disbursement', {method:'POST',
       headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    if (r.ok) { renderEditCase(r.case); loadRecentCases(); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
+    if (r.ok) { renderEditCase(r.case); loadRecentCases(); kickLedgerRebuild(); showStatus('e-disb-status','success','✅ Saved — derived values recomputed.'); }
     else showStatus('e-disb-status','error','❌ ' + r.error);
   } catch (e) {
     showStatus('e-disb-status','error','❌ ' + e.message);
@@ -3686,7 +3741,7 @@ async function saveDisb() {
   const r = await (await fetch('/save/disbursement', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)})).json();
   btn.disabled = false; btn.textContent = '✅ Save Disbursement to Google Sheet';
-  if (r.ok) { showStatus('d-status','success',`✅ Saved! ID: ${r.disb_id}`); clearDisb(); loadPendingRequests(); }
+  if (r.ok) { showStatus('d-status','success',`✅ Saved! ID: ${r.disb_id}`); clearDisb(); loadPendingRequests(); kickLedgerRebuild(); }
   else       showStatus('d-status','error','❌ ' + r.error);
 }
 
@@ -3720,6 +3775,7 @@ async function saveRepa() {
     document.getElementById('r-msg').value = '';
     document.getElementById('r-remarks').value = '';
     loadOpenCases();
+    kickLedgerRebuild();
   } else showStatus('r-status','error','❌ ' + r.error);
 }
 
@@ -4820,6 +4876,20 @@ def api_requests_add():
         return jsonify({'ok': True, 'request_id': req_id})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/rebuild-ledger', methods=['POST'])
+def api_rebuild_ledger():
+    """Fired by the frontend as a non-blocking (not-awaited) call right
+    after a save shows success, instead of running inline during the save
+    itself — see rebuild_ledger_now()'s docstring for why. This is a
+    genuinely independent request, so Vercel's normal guarantee (a function
+    completes once it returns a response) applies; the response body isn't
+    meant to be consulted by the caller."""
+    try:
+        rebuild_ledger_now()
+    except Exception:
+        pass
+    return jsonify({'ok': True})
 
 @app.route('/save/disbursement', methods=['POST'])
 def api_save_disbursement():
