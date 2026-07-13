@@ -4486,6 +4486,27 @@ window.onload = async () => {
     document.getElementById('bulk-narration').value = cfg.bulk_narration || '';
   } catch(e) {}
 };
+
+// ── Auto-refresh pending requests ─────────────────────────────────────────────
+// New field-app submissions should appear without a manual page refresh.
+// True server push isn't available on this serverless host, so poll every
+// 45s while the page is visible, plus immediately on returning to the tab.
+// The Bank File list shares the same data but is only auto-refreshed when
+// that tab is active AND nothing is ticked — silently replacing rows under
+// a half-built selection would be worse than a slightly stale list.
+function _autoRefreshRequests() {
+  if (document.visibilityState !== 'visible') return;
+  loadPendingRequests();
+  const bulkTab = document.getElementById('bulk');
+  if (bulkTab && bulkTab.classList.contains('active') &&
+      document.querySelectorAll('.bulk-check:checked').length === 0) {
+    loadBulkRequests();
+  }
+}
+setInterval(_autoRefreshRequests, 45000);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') _autoRefreshRequests();
+});
 </script>
 </body></html>"""
 
