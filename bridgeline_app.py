@@ -146,36 +146,37 @@ BANK_TEMPLATES = {
             ('Beneficiary Mobile', 'phone'),
         ],
     },
+    # Column order/names match IDFC's own downloaded bulk-pay template
+    # EXACTLY (BLKPAY_YYYYMMDD-idfc.xlsx) — the portal validates this
+    # literally, so never reorder/rename without diffing against a fresh
+    # download from IDFC first. 'Transaction Type', 'ifsc'/blank-IFSC
+    # handling, and the debit-account/email defaults are IFT-rule-specific
+    # (see _resolve_idfc_row()), not generic across templates.
     'idfc': {
         'label': 'IDFC FIRST Bank',
         'filetype': 'xlsx',
-        'filename': 'IDFC_Bulk_{date}.xlsx',
+        'filename': None,  # computed per-export via _next_idfc_batch_filename()
         'columns': [
             ('Beneficiary Name', 'customer'),
             ('Beneficiary Account Number', 'account_no'),
             ('IFSC', 'ifsc'),
-            ('Amount', 'amount'),
-            ('Payment Mode', 'mode'),
+            ('Transaction Type', 'txn_type'),
             ('Debit Account Number', 'debit_account'),
-            ('Value Date', 'value_date'),
-            ('Narration', 'narration'),
-            ('Beneficiary Mobile', 'phone'),
-            ('Beneficiary Email', ('const', '')),
-        ],
-    },
-    'saraswat': {
-        'label': 'Saraswat Bank',
-        'filetype': 'csv',
-        'filename': 'Saraswat_Bulk_{date}.csv',
-        'columns': [
-            ('Beneficiary Name', 'customer'),
-            ('Beneficiary Account Number', 'account_no'),
-            ('IFSC Code', 'ifsc'),
+            ('Transaction Date', 'value_date'),
             ('Amount', 'amount'),
-            ('Payment Mode', 'mode'),
-            ('Narration', 'narration'),
-            ('Debit Account Number', 'debit_account'),
-            ('Value Date', 'value_date'),
+            ('Currency', ('const', 'INR')),
+            ('Beneficiary Email ID', ('const', 'principal@bridgelinepartners.in')),
+            ('Remarks', 'narration'),
+            ('Request ID', 'request_id'),
+            # Company (HDB/ICICI) isn't captured on the field-app request —
+            # it's chosen later when the disbursement is actually entered
+            # into Accounts, which happens AFTER this export. Left blank;
+            # fill it in manually in the exported file if needed before
+            # upload.
+            ('Company', ('const', '')),
+            ('Cluster', 'cluster'),
+            ('Branch', 'branch'),
+            ('Customer Phone No', 'phone'),
         ],
     },
     'razorpayx': {
@@ -201,12 +202,17 @@ BANK_TEMPLATES = {
 
 RTGS_MIN_AMOUNT = 200000
 
+# BridgeLine Partners' own IDFC FIRST account, used as the fixed debit
+# account on every IDFC bulk-pay export (Mysuru Branch; IFSC IDFB0080571 /
+# SWIFT IDFBINBBMUM aren't needed in the bulk file itself, only for record).
+IDFC_DEBIT_ACCOUNT = '52202388167'
+
 # ── Config ────────────────────────────────────────────────────────────────────
 COMPANIES = ["HDB", "ICICI"]
 CLUSTERS  = ["Bellary", "Hassan", "Hubli", "Mandya", "Mangalore", "Mysore", "Other"]
 BRANCHES  = sorted([
     "Adyar", "Beejadi", "Bellary", "Chitradurga", "Chitrapady", "Davangere",
-    "Hassan", "Hospet", "JP Nagar", "Kedinje", "Kollegala", "Kuvempu Nagar",
+    "Gulbarga", "Hassan", "Hospet", "JP Nagar", "Kedinje", "Kollegala", "Kuvempu Nagar",
     "Mandya", "Mysore", "Other", "Puttur", "Saligrama", "Santhekatte",
     "Shankarpura", "Shikaripura", "Shimoga", "Thokoot", "Tumkur", "Udupi",
     "Vadarasse", "Valencia", "Vijay Nagar"
@@ -837,6 +843,31 @@ def save_disbursement(data):
     row_data[COL['remarks']-1]      = data.get('remarks', '')
 
     ws.insert_row(row_data, next_row)
+    # Columns O/P/Q (Balance, TAT, Current Date) are live formulas on every
+    # existing row. Sheets' native "extend formula from the row above" is
+    # unreliable for API-inserted rows, so copy them down explicitly —
+    # copyPaste with PASTE_FORMULA adjusts the relative references (O15's
+    # =IF(B15...) becomes =IF(B16...) on row 16) exactly like a manual
+    # copy-down would. Best-effort: a failure here must not lose the
+    # disbursement row itself.
+    try:
+        ws.spreadsheet.batch_update({
+            'requests': [{
+                'copyPaste': {
+                    'source': {'sheetId': ws.id,
+                               'startRowIndex': next_row - 2, 'endRowIndex': next_row - 1,
+                               'startColumnIndex': COL['balance'] - 1,
+                               'endColumnIndex': COL['current_date']},
+                    'destination': {'sheetId': ws.id,
+                                    'startRowIndex': next_row - 1, 'endRowIndex': next_row,
+                                    'startColumnIndex': COL['balance'] - 1,
+                                    'endColumnIndex': COL['current_date']},
+                    'pasteType': 'PASTE_FORMULA',
+                }
+            }]
+        })
+    except Exception as e:
+        print(f'WARNING: could not copy O/P/Q formulas to row {next_row}: {e}')
     trigger_ledger_rebuild()
 
     request_id = data.get('request_id', '').strip()
@@ -4622,6 +4653,27 @@ def _clean_request_amount(raw):
     val = float(m.group(0).replace(',', ''))
     return int(val) if val == int(val) else val
 
+def _next_idfc_batch_filename(all_vals):
+    """IDFC requires the filename itself under 14 characters, no spaces:
+    Batch{N}-ddmmyy.xlsx (e.g. 'Batch1-110726.xlsx' = 19 chars total, but
+    the STEM 'Batch1-110726' the portal actually validates is 13). N
+    increments per day across every IDFC export today, scanned from the
+    'Exported ...' stamps already written into Requests' Notes column
+    (same scan-based sequencing pattern as Request ID generation — no
+    separate counter to keep in sync)."""
+    today = datetime.now(IST).strftime('%d%m%y')
+    seq = 1
+    pattern = re.compile(rf'Batch(\d+)-{today}\.xlsx')
+    for row in all_vals[1:] if all_vals else []:
+        if not row:
+            continue
+        notes = row[13] if len(row) > 13 else ''
+        for m in pattern.finditer(notes or ''):
+            n = int(m.group(1))
+            if n >= seq:
+                seq = n + 1
+    return f'Batch{seq}-{today}.xlsx'
+
 @app.route('/requests/export-bulk', methods=['POST'])
 def api_requests_export_bulk():
     try:
@@ -4635,7 +4687,12 @@ def api_requests_export_bulk():
             return jsonify({'ok': False, 'error': 'No requests selected'}), 400
 
         cfg = load_config()
-        debit_account = body.get('debit_account') or cfg.get('bulk_debit_account', '')
+        # IDFC's own bulk-pay debit account is BridgeLine's fixed IDFC
+        # account — always this value for that template regardless of
+        # Config, since it's not really a "which account to debit" choice
+        # like the other templates have.
+        default_debit = IDFC_DEBIT_ACCOUNT if bank_key == 'idfc' else cfg.get('bulk_debit_account', '')
+        debit_account = body.get('debit_account') or default_debit
         narration = body.get('narration') or cfg.get('bulk_narration', '')
         value_date = body.get('value_date') or datetime.now(IST).strftime('%d/%m/%Y')
 
@@ -4663,15 +4720,24 @@ def api_requests_export_bulk():
         for req_id in ids:
             item = _request_row_to_item(by_id[req_id][1], idx)
             amount = _clean_request_amount(item['amount'])
-            export_rows.append({
-                **item,
+            row_extra = {
                 'amount': amount,
                 'mode': 'RTGS' if amount >= RTGS_MIN_AMOUNT else 'NEFT',
                 'debit_account': debit_account,
                 'narration': narration,
                 'value_date': value_date,
                 'bank_name': item['bank'],
-            })
+            }
+            if bank_key == 'idfc':
+                # Beneficiary already holds an IDFC FIRST account = an
+                # in-bank transfer: IFT, no IFSC needed. Anything else is
+                # inter-bank: NEFT, IFSC required.
+                if 'idfc' in (item.get('bank') or '').lower():
+                    row_extra['txn_type'] = 'IFT'
+                    row_extra['ifsc'] = ''
+                else:
+                    row_extra['txn_type'] = 'NEFT'
+            export_rows.append({**item, **row_extra})
 
         if template['filetype'] == 'csv':
             file_bytes = _build_bulk_csv(template, export_rows)
@@ -4679,12 +4745,15 @@ def api_requests_export_bulk():
         else:
             file_bytes = _build_bulk_xlsx(template, export_rows)
             mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        filename = template['filename'].format(date=datetime.now(IST).strftime('%d-%m-%Y'))
+        filename = (_next_idfc_batch_filename(all_vals) if bank_key == 'idfc'
+                    else template['filename'].format(date=datetime.now(IST).strftime('%d-%m-%Y')))
 
         # Mark AFTER the file is built (a marked-but-unbuilt file is the bad
         # direction), in ONE batch_update so a partial write can't split the
         # batch between Exported and Pending.
-        stamp = f"Exported {template['label']} {datetime.now(IST).strftime('%d-%m-%Y %H:%M')} IST"
+        # Filename included in the stamp so _next_idfc_batch_filename() can
+        # scan prior batches' Notes to find the next number to use.
+        stamp = f"Exported {template['label']} ({filename}) {datetime.now(IST).strftime('%d-%m-%Y %H:%M')} IST"
         notes_col = idx.get('Notes', 13)
         status_letter = chr(ord('A') + idx.get('Status', 11))
         notes_letter = chr(ord('A') + notes_col)
