@@ -156,6 +156,11 @@ BANK_TEMPLATES = {
         'label': 'IDFC FIRST Bank',
         'filetype': 'xlsx',
         'filename': None,  # computed per-export via _next_idfc_batch_filename()
+        # Matches the real template's stored cell formats exactly (checked
+        # via openpyxl against BLKPAY_YYYYMMDD-idfc.xlsx) — everything else
+        # in the template is left 'General'.
+        'text_columns': {'Beneficiary Name', 'Beneficiary Account Number',
+                          'IFSC', 'Transaction Type', 'Currency'},
         'columns': [
             ('Beneficiary Name', 'customer'),
             ('Beneficiary Account Number', 'account_no'),
@@ -4630,9 +4635,21 @@ def _build_bulk_csv(template, rows):
 def _build_bulk_xlsx(template, rows):
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append([h for h, _ in template['columns']])
+    headers = [h for h, _ in template['columns']]
+    ws.append(headers)
     for r in rows:
         ws.append([_resolve_bulk_field(f, r) for _, f in template['columns']])
+    # Some portals (IDFC especially) validate a cell's stored FORMAT, not
+    # just its value — the real downloaded template has Beneficiary Name/
+    # Account Number/IFSC/Transaction Type/Currency stored as explicit text
+    # ('@'), and openpyxl's default 'General' format was silently causing
+    # rejections even though the values themselves looked right.
+    text_cols = template.get('text_columns')
+    if text_cols:
+        col_idxs = [i for i, h in enumerate(headers, start=1) if h in text_cols]
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            for i in col_idxs:
+                row[i - 1].number_format = '@'
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -4731,12 +4748,16 @@ def api_requests_export_bulk():
             if bank_key == 'idfc':
                 # Beneficiary already holds an IDFC FIRST account = an
                 # in-bank transfer: IFT, no IFSC needed. Anything else is
-                # inter-bank: NEFT, IFSC required.
+                # inter-bank: NEFT or RTGS by amount, IFSC required. IMPS
+                # is NOT a valid value here — the template's own Transaction
+                # Type instructions (cell D2) explicitly list only
+                # IFT/NEFT/RTGS as accepted; picking IMPS would just trade
+                # one rejection for another.
                 if 'idfc' in (item.get('bank') or '').lower():
                     row_extra['txn_type'] = 'IFT'
                     row_extra['ifsc'] = ''
                 else:
-                    row_extra['txn_type'] = 'NEFT'
+                    row_extra['txn_type'] = 'RTGS' if amount >= RTGS_MIN_AMOUNT else 'NEFT'
             export_rows.append({**item, **row_extra})
 
         if template['filetype'] == 'csv':
