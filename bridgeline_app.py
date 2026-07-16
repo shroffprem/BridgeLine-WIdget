@@ -2630,7 +2630,12 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
     except Exception as e:
         print(f"[Recon Log] append failed: {e}")
 
-    filename = f"Daily Reconciliation - {account or 'All Accounts'}.xlsx"
+    # Named by month, not by account — the workbook already combines every
+    # account's periods into one file (the rebuild loop above has no account
+    # filter), so an account-based filename was purely cosmetic and made two
+    # accounts' reconciliations look like two separate files when they were
+    # never actually split apart.
+    filename = f"Daily Reconciliation - {period_label}.xlsx"
 
     return {
         'total_debit':  total_dr,
