@@ -4667,30 +4667,36 @@ IDFC_TEMPLATE_PATH = os.path.join(ASSETS_DIR, 'templates', 'idfc_bulkpay_templat
 def _build_idfc_bulk_xlsx(template, rows):
     """Starts from IDFC's own downloaded template file byte-for-byte instead
     of building a fresh workbook from scratch — a from-scratch rebuild
-    matched every column name, order, and even the sample rows' text/
-    General cell formats, and IDFC's portal still rejected it. Reusing the
-    actual file (its exact styles, column widths, any workbook-level
-    metadata a stricter validator might check) is the only way left to
-    guarantee fidelity. Only the data rows change; the header row (1) is
-    untouched, and each new row's per-column format is cloned from the
-    template's own row 3 sample — not reset to openpyxl's 'General'
-    default — so formatting stays identical even for rows the template
-    itself never sampled."""
+    matched every column name, order, and even the cell text/General
+    formats, and IDFC's portal still rejected it. Reusing the actual file
+    (its exact styles, column widths, any workbook-level metadata a
+    stricter validator might check) is the only way left to guarantee
+    fidelity. IDFC's portal requires row 1 (header) and row 2 (their own
+    instructions) to stay untouched exactly as downloaded — real data
+    must start at row 3; a prior version of this function deleted row 2
+    and started data there, which the portal silently rejected even
+    though every column/value looked correct."""
     wb = openpyxl.load_workbook(IDFC_TEMPLATE_PATH)
     ws = wb.active
 
     ncols = len(template['columns'])
-    sample_formats = [ws.cell(3, c).number_format for c in range(1, ncols + 1)]
+    # Verified against a real IDFC batch that the portal actually accepted:
+    # text ('@') for Name/Account/IFSC/Transaction Type/Currency, General
+    # for everything else. Hardcoded rather than sampled from a template
+    # row, since nothing but the header+instructions rows should ever be
+    # trusted as present in the bundled template file.
+    text_cols = {1, 2, 3, 4, 8}
+    formats = ['@' if (c in text_cols) else 'General' for c in range(1, ncols + 1)]
 
-    # Strip everything below the header (instructions row 2 + the 4 sample
-    # beneficiary rows) — real data replaces them entirely.
-    if ws.max_row > 1:
-        ws.delete_rows(2, ws.max_row - 1)
+    # Strip everything from row 3 down (leftover data rows) — rows 1-2
+    # (header + IDFC's own instructions) are never touched.
+    if ws.max_row > 2:
+        ws.delete_rows(3, ws.max_row - 2)
 
-    for r_idx, r in enumerate(rows, start=2):
+    for r_idx, r in enumerate(rows, start=3):
         for c_idx, (_, field) in enumerate(template['columns'], start=1):
             cell = ws.cell(r_idx, c_idx, _resolve_bulk_field(field, r))
-            cell.number_format = sample_formats[c_idx - 1]
+            cell.number_format = formats[c_idx - 1]
 
     buf = io.BytesIO()
     wb.save(buf)
