@@ -4426,9 +4426,18 @@ function updateBulkFooter() {
 async function exportBulk() {
   const ids = _selectedBulkIds();
   if (!ids.length) { showStatus('bulk-status', 'error', '❌ Select at least one request'); return; }
+  const bankSel = document.getElementById('bulk-bank');
+  const bankLabel = bankSel.options[bankSel.selectedIndex].text;
+  // A file built for the wrong bank's template will parse as garbage on
+  // the actual portal (each bank's column order/meaning differs) — this
+  // has caused real rejected uploads before. Force an explicit look at
+  // which bank format is selected, every time, right before download.
+  if (!confirm(`Export ${ids.length} request(s) as ${bankLabel} format?\n\nMake sure this matches the bank you will actually upload to — a file built for the wrong bank's template will be rejected or misread.`)) {
+    return;
+  }
   const body = {
     request_ids: ids,
-    bank: document.getElementById('bulk-bank').value,
+    bank: bankSel.value,
     debit_account: document.getElementById('bulk-debit').value.trim(),
     narration: document.getElementById('bulk-narration').value.trim(),
     value_date: document.getElementById('bulk-value-date').value.trim(),
