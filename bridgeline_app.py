@@ -422,6 +422,14 @@ def extract_utr(text):
         if not re.match(r'^[A-Z]{4}0[A-Z0-9]{6}$', val):
             return val
 
+    # IDFC's NEFT UTR format breaks the digit run with a single checksum
+    # letter partway through (e.g. IDFB6196M1199949 = IDFB + 6196 + M +
+    # 1199949) — the pattern above requires one unbroken 8-16 digit block
+    # right after the bank code, so it never matches these.
+    m = re.search(r'\b([A-Z]{3,6}\d{3,6}[A-Z]\d{6,12})\b', t, re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+
     # IMPS: IMPS-REFNUM-... or IMPS Ref No: REFNUM
     m = re.search(r'IMPS[\s\-](\d{10,15})\b', t, re.IGNORECASE)
     if m:
@@ -1679,8 +1687,13 @@ def parse_bank_statement(filepath, filename):
         desc_l = desc.lower()
         if any(kw in desc_l or kw in date_val.lower() or kw in row_text for kw in SKIP_KEYWORDS):
             continue
-        # Skip rows that look like count/summary lines (no real date format)
-        if not re.search(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', date_val):
+        # Skip rows that look like count/summary lines (no real date format).
+        # Middle group accepts either a numeric month (15-07-2026, 15/07/2026)
+        # or a 3+ letter abbreviation (15-Jul-2026, the format IDFC's newer
+        # statement download uses) — the numeric-only version silently
+        # discarded every transaction row from any statement using the
+        # letter-month format, with no error surfaced (0 transactions parsed).
+        if not re.search(r'\d{1,2}[/\-](?:\d{1,2}|[A-Za-z]{3,9})[/\-]\d{2,4}', date_val):
             continue
         if debit == 0 and credit == 0:
             continue
