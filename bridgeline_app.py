@@ -398,14 +398,18 @@ def extract_utr(text):
     t = text.strip()
 
     # Explicit UTR/Ref label in SMS-style messages
-    m = re.search(r'(?:UTR|Ref(?:erence)?)\s*(?:No|Number|#|ID)?\.?\s*[:\-]?\s*([A-Z0-9]{8,22})', t, re.IGNORECASE)
+    # (?:No|Number|#) only — a bare "ID" alternative here would greedily
+    # swallow the first two characters of any UTR that itself starts with
+    # "ID" (e.g. IDFC's own "IDFBR..." RTGS codes), truncating the capture.
+    m = re.search(r'(?:UTR|Ref(?:erence)?)\s*(?:No|Number|#)?\.?\s*[:\-]?\s*([A-Z0-9]{8,22})', t, re.IGNORECASE)
     if m:
         val = m.group(1).upper()
         if not re.match(r'^\d{1,6}$', val):
             return val
 
-    # Transaction ID label
-    m = re.search(r'(?:Transaction|Txn|Trans)[\s_]?(?:ID|No|Ref)?\s*[:\-]?\s*([A-Z0-9]{8,22})', t, re.IGNORECASE)
+    # Transaction ID label (same truncation risk as above — "ID" dropped
+    # from the optional suffix so codes starting with "ID" aren't clipped)
+    m = re.search(r'(?:Transaction|Txn|Trans)[\s_]?(?:No|Ref)?\s*[:\-]?\s*([A-Z0-9]{8,22})', t, re.IGNORECASE)
     if m:
         val = m.group(1).upper()
         if not re.match(r'^\d{1,6}$', val):
