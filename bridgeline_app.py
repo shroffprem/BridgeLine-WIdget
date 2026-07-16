@@ -156,11 +156,10 @@ BANK_TEMPLATES = {
         'label': 'IDFC FIRST Bank',
         'filetype': 'xlsx',
         'filename': None,  # computed per-export via _next_idfc_batch_filename()
-        # Matches the real template's stored cell formats exactly (checked
-        # via openpyxl against BLKPAY_YYYYMMDD-idfc.xlsx) — everything else
-        # in the template is left 'General'.
-        'text_columns': {'Beneficiary Name', 'Beneficiary Account Number',
-                          'IFSC', 'Transaction Type', 'Currency'},
+        # Built via _build_idfc_bulk_xlsx() (see below), which starts from
+        # IDFC's actual template file byte-for-byte rather than rebuilding
+        # a workbook from scratch — cell formats come from the template's
+        # own sample row, not a manually-maintained set here.
         'columns': [
             ('Beneficiary Name', 'customer'),
             ('Beneficiary Account Number', 'account_no'),
@@ -4650,6 +4649,40 @@ def _build_bulk_csv(template, rows):
         w.writerow([_resolve_bulk_field(f, r) for _, f in template['columns']])
     return buf.getvalue().encode('utf-8')
 
+IDFC_TEMPLATE_PATH = os.path.join(ASSETS_DIR, 'templates', 'idfc_bulkpay_template.xlsx')
+
+def _build_idfc_bulk_xlsx(template, rows):
+    """Starts from IDFC's own downloaded template file byte-for-byte instead
+    of building a fresh workbook from scratch — a from-scratch rebuild
+    matched every column name, order, and even the sample rows' text/
+    General cell formats, and IDFC's portal still rejected it. Reusing the
+    actual file (its exact styles, column widths, any workbook-level
+    metadata a stricter validator might check) is the only way left to
+    guarantee fidelity. Only the data rows change; the header row (1) is
+    untouched, and each new row's per-column format is cloned from the
+    template's own row 3 sample — not reset to openpyxl's 'General'
+    default — so formatting stays identical even for rows the template
+    itself never sampled."""
+    wb = openpyxl.load_workbook(IDFC_TEMPLATE_PATH)
+    ws = wb.active
+
+    ncols = len(template['columns'])
+    sample_formats = [ws.cell(3, c).number_format for c in range(1, ncols + 1)]
+
+    # Strip everything below the header (instructions row 2 + the 4 sample
+    # beneficiary rows) — real data replaces them entirely.
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    for r_idx, r in enumerate(rows, start=2):
+        for c_idx, (_, field) in enumerate(template['columns'], start=1):
+            cell = ws.cell(r_idx, c_idx, _resolve_bulk_field(field, r))
+            cell.number_format = sample_formats[c_idx - 1]
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
 def _build_bulk_xlsx(template, rows):
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -4781,6 +4814,9 @@ def api_requests_export_bulk():
         if template['filetype'] == 'csv':
             file_bytes = _build_bulk_csv(template, export_rows)
             mimetype = 'text/csv'
+        elif bank_key == 'idfc':
+            file_bytes = _build_idfc_bulk_xlsx(template, export_rows)
+            mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         else:
             file_bytes = _build_bulk_xlsx(template, export_rows)
             mimetype = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
