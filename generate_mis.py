@@ -100,6 +100,36 @@ def build_upi_link(amount, note, case_id=''):
         params += f'&tn={quote(note, safe="")}'
     return f'upi://pay?{params}'
 
+def build_dynamic_qr_payload(amount):
+    """QR payload with the amount prefilled -- the exact formula real-device
+    testing proved on 13-Jul-2026: the bank's own static QR fields plus am/cu
+    ONLY. No tr/tn: adding tr (a merchant-transaction field per the NPCI spec)
+    to this mc=0000 payload made the bank decline after the amount prefilled.
+    Scanned (not tapped) is the trusted origination path."""
+    pn = quote(PAYEE_NAME, safe='')
+    try:
+        amt = f'{float(amount):.2f}'
+    except (TypeError, ValueError):
+        amt = ''
+    base = f'upi://pay?ver=01&mode=01&purpose=00&mc=0000&qrMedium=02&pa={UPI_ID}&pn={pn}'
+    return base + (f'&am={amt}&cu=INR' if amt else '')
+
+def make_case_qr_png(case):
+    """Per-case QR PNG with the outstanding balance prefilled, so scanning the
+    card's QR opens the payer's UPI app with the amount already filled in.
+    Falls back to the static bank QR image if the qrcode lib is unavailable."""
+    try:
+        import qrcode
+    except ImportError:
+        return QR_PATH if os.path.exists(QR_PATH) and os.path.getsize(QR_PATH) > 0 else None
+    amount = case.get('balance') or case.get('total') or ''
+    safe_id = str(case.get('id', 'x')).replace('/', '_').replace(' ', '_')
+    path = os.path.join(tempfile.gettempdir(), f'bl_qr_{safe_id}.png')
+    # .convert('RGB'): qrcode emits a 1-bit PNG, which fpdf renders as a
+    # corrupted smear inside the PDF (seen on real cards 14-Jul-2026).
+    qrcode.make(build_dynamic_qr_payload(amount)).get_image().convert('RGB').save(path)
+    return path
+
 PAY_PAGE_BASE_URL = 'https://bridgeline-pay.vercel.app'
 
 def build_pay_page_url(case_id):
@@ -256,15 +286,23 @@ def load_contacts(wb):
     new_format = len(header) >= 2 and header[0] == 'CLUSTER' and header[1] == 'NAME'
 
     if new_format:
-        # New layout: Cluster | Name | Designation | Branch | Phone | Email
+        # New layout: Cluster | Name | Designation | Branch | Phone | Email.
+        # The sheet only fills Cluster on each block's first row (the
+        # cluster manager) and leaves it blank for every branch row
+        # underneath — forward-fill it, or every branch manager gets
+        # silently dropped here (empty cluster_raw) and find_branch_contact()
+        # ends up falling back to the cluster manager for every single case.
+        current_cluster = ''
         for row in rows[1:]:
             cluster_raw = str(_cell(row, 0)).strip() if _cell(row, 0) else ''
             name   = str(_cell(row, 1)).strip() if _cell(row, 1) else ''
             desig  = str(_cell(row, 2)).strip() if _cell(row, 2) else ''
             branch = str(_cell(row, 3)).strip() if _cell(row, 3) else ''
             phone  = _cell(row, 4)
-            if not cluster_raw or not name or not phone: continue
-            cluster = CLUSTER_ALIASES.get(cluster_raw.upper(), cluster_raw)
+            if cluster_raw:
+                current_cluster = cluster_raw
+            if not current_cluster or not name or not phone: continue
+            cluster = CLUSTER_ALIASES.get(current_cluster.upper(), current_cluster)
             ph = _fmt_phone(phone)
             if 'CLUSTER MANAGER' in desig.upper():
                 cluster_mgrs[cluster] = {'name': name.title(), 'phone': ph}
@@ -1598,8 +1636,9 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
         qx = px0 + 4
         qy = body_y + 3
         pay_page_url = build_pay_page_url(case['id'])
-        if os.path.exists(QR_PATH) and os.path.getsize(QR_PATH) > 0:
-            pdf.image(QR_PATH, x=qx, y=qy, w=qr_size, h=qr_size)
+        case_qr = make_case_qr_png(case)
+        if case_qr:
+            pdf.image(case_qr, x=qx, y=qy, w=qr_size, h=qr_size)
         else:
             pdf.set_draw_color(*C_RULE)
             pdf.rect(qx, qy, qr_size, qr_size, 'D')
@@ -1770,8 +1809,9 @@ def generate_collection_card(case, branch_contacts, cluster_mgrs):
     qx = rx + 4
     qy = body_y + 3
     pay_page_url = build_pay_page_url(case['id'])
-    if os.path.exists(QR_PATH) and os.path.getsize(QR_PATH) > 0:
-        pdf.image(QR_PATH, x=qx, y=qy, w=qr_size, h=qr_size)
+    case_qr = make_case_qr_png(case)
+    if case_qr:
+        pdf.image(case_qr, x=qx, y=qy, w=qr_size, h=qr_size)
     else:
         pdf.set_draw_color(*C_RULE)
         pdf.rect(qx, qy, qr_size, qr_size, 'D')
