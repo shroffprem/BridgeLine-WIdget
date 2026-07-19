@@ -330,6 +330,106 @@ def load_contacts(wb):
                 branch_contacts[(current_cluster, branch.upper())] = {'name': name.title(), 'phone': ph}
     return cluster_mgrs, branch_contacts
 
+# --- CAPITAL LOG LOADING ------------------------------------------------------
+# TYPE -> sign for computing net capital from signed entries. RECYCLE is
+# capital-neutral (money already inside the business — a repayment
+# redeployed as a fresh disbursement — not new partner capital) but still
+# tracked in the entry list for audit purposes. ADJUSTMENT uses the
+# entered amount's own sign as-is, since a correction can go either way.
+CAPITAL_LOG_TYPE_SIGNS = {
+    'OPENING BALANCE': 1, 'INFLOW': 1, 'WITHDRAWAL': -1,
+    'RECYCLE': 0, 'ADJUSTMENT': 'as-entered',
+}
+CAPITAL_LOG_KNOWN_TYPES = set(CAPITAL_LOG_TYPE_SIGNS.keys())
+
+def clean_capital_amount(v):
+    """'Rs 35,00,000' -> 3500000.0. _clean_amount()-style helpers elsewhere
+    strip ',' / '₹' / spaces but not a 'Rs' prefix, which would silently
+    parse this sheet's own formatting to 0.0."""
+    s = str(v or '').strip()
+    if not s:
+        return 0.0
+    neg = s.startswith('-')
+    if neg:
+        s = s[1:].strip()
+    if s[:2].lower() == 'rs':
+        s = s[2:].lstrip('.').strip()
+    s = s.replace(',', '').replace('₹', '').replace(' ', '').strip()
+    try:
+        val = float(s) if s else 0.0
+    except ValueError:
+        return 0.0
+    return -val if neg else val
+
+def capital_log_signed_delta(type_, amount):
+    sign = CAPITAL_LOG_TYPE_SIGNS.get(str(type_).strip().upper())
+    if sign == 'as-entered':
+        return amount
+    if sign is None:
+        return 0.0
+    return sign * abs(amount)
+
+def load_capital_log(wb):
+    """Parse the 'Capital Log' sheet -> {'available', 'entries', 'net_capital'}
+    or None if the tab doesn't exist in this workbook (caller falls back to
+    a hardcoded default rather than crashing).
+
+    Net capital is recomputed by summing signed entries, not by reading the
+    sheet's own manually-maintained 'Running Balance' column — that column
+    is blank on every row except a one-off TOTAL rollup today, and trusting
+    it would silently break the moment a new row is appended without a
+    hand-typed balance. Recomputing from entries is self-healing, matching
+    this module's existing philosophy of never trusting hand-maintained
+    sheet formulas (see compute_dashboard_metrics()'s own docstring).
+
+    Any row whose TYPE isn't one of the 5 known values is skipped — this
+    silently excludes the sheet's title row, blank rows, and its trailing
+    multi-line 'HOW TO USE THIS SHEET' instructions row with no special-
+    casing needed. Rows where PARTNER == 'TOTAL' are explicitly excluded
+    (a rollup row whose AMOUNT happens to be 0 today, but that must not be
+    relied upon as new schema evolves).
+    """
+    if 'Capital Log' not in wb.sheetnames:
+        return None
+    ws = wb['Capital Log']
+    rows = list(ws.iter_rows(min_row=1, values_only=True))
+
+    header_idx = None
+    for i, r in enumerate(rows):
+        c0 = str(r[0]).strip().upper() if len(r) > 0 and r[0] else ''
+        c1 = str(r[1]).strip().upper() if len(r) > 1 and r[1] else ''
+        if c0 == 'DATE' and c1 == 'TYPE':
+            header_idx = i
+            break
+    if header_idx is None:
+        return {'available': False, 'error': "DATE|TYPE header row not found", 'entries': [], 'net_capital': 0.0}
+
+    entries, net_capital = [], 0.0
+    for r in rows[header_idx + 1:]:
+        if not r or len(r) < 2:
+            continue
+        type_raw = str(r[1]).strip().upper() if r[1] else ''
+        if type_raw not in CAPITAL_LOG_KNOWN_TYPES:
+            continue
+        d = parse_date(r[0])
+        if not isinstance(d, (datetime.date, datetime.datetime)):
+            continue
+        partner = str(r[2]).strip() if len(r) > 2 and r[2] else ''
+        if partner.upper() == 'TOTAL':
+            continue
+        amount = clean_capital_amount(r[3] if len(r) > 3 else '')
+        delta = capital_log_signed_delta(type_raw, amount)
+        net_capital += delta
+        entries.append({
+            'date': d, 'date_str': fmt_date(d), 'type': type_raw, 'partner': partner,
+            'amount': amount, 'delta': delta,
+            'reference': str(r[5]).strip() if len(r) > 5 and r[5] else '',
+            'remarks':   str(r[6]).strip() if len(r) > 6 and r[6] else '',
+        })
+
+    entries.sort(key=lambda e: e['date'])
+    return {'available': True, 'entries': entries, 'net_capital': round(net_capital, 2)}
+
 def find_branch_contact(cluster, branch, branch_contacts, cluster_mgrs):
     """Match branch name; fall back to cluster manager (returns info, is_fallback).
 
@@ -393,10 +493,11 @@ def load_data(path):
             label = raw[0] if len(raw) > 0 else None
             val   = raw[1] if len(raw) > 1 else None
             if label: db_raw[str(label).strip()] = val
-    mcoll    = load_mcoll(wb)
-    contacts = load_contacts(wb)
+    mcoll       = load_mcoll(wb)
+    contacts    = load_contacts(wb)
+    capital_log = load_capital_log(wb)
     wb.close()
-    return rows, db_raw, mcoll, contacts
+    return rows, db_raw, mcoll, contacts, capital_log
 
 def parse_cases(rows, mcoll=None):
     all_cases = []
@@ -464,13 +565,21 @@ def parse_cases(rows, mcoll=None):
     return open_cases, all_cases, all_cases_full
 
 # --- CORRECT METRICS COMPUTATION ---------------------------------------------
-def compute_dashboard_metrics(all_cases_full, db_raw):
+def compute_dashboard_metrics(all_cases_full, db_raw, capital_log=None):
     """
     Compute correct dashboard metrics directly from raw case data (ALL clusters incl. Mandya).
     DashBoard sheet formulas are incorrect — do NOT rely on them.
-    The only value trusted from DashBoard is Total Invested (hardcoded there).
+
+    Total Invested is the live net capital computed from the 'Capital Log'
+    sheet (sum of signed INFLOW/WITHDRAWAL/OPENING BALANCE/ADJUSTMENT
+    entries — see load_capital_log()) when available, falling back to a
+    hardcoded snapshot only if that tab is missing from this workbook (e.g.
+    an old cached Excel export that predates this feature).
     """
-    total_invested = 8500000  # 82.5L base + 2.5L Harsha (07-May-2026) = 85L
+    if capital_log and capital_log.get('available') and capital_log.get('entries'):
+        total_invested = capital_log['net_capital']
+    else:
+        total_invested = 8500000  # fallback only: 82.5L base + 2.5L Harsha (07-May-2026) = 85L
 
     total_disbursed = sum(c['amount']   for c in all_cases_full)
     total_charges   = sum(c['charges']  for c in all_cases_full)
@@ -2277,7 +2386,7 @@ def main():
     else:
         print(f'WARNING: Logo not in /tmp — header renders without logo (run setup_logo.py to cache it)')
 
-    rows, db_raw, mcoll, (cluster_mgrs, branch_contacts) = load_data(excel_path)
+    rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log = load_data(excel_path)
     open_cases, all_cases, all_cases_full = parse_cases(rows, mcoll)
 
     print(f'Open cases: {len(open_cases)}')
@@ -2285,7 +2394,7 @@ def main():
         print(f'  {c["id"]} | {c["customer"]} | {c["cluster"]} | Bal: Rs {inr(c["balance"])} | {c["status"]}')
 
     # Compute corrected metrics from raw data
-    metrics = compute_dashboard_metrics(all_cases_full, db_raw)
+    metrics = compute_dashboard_metrics(all_cases_full, db_raw, capital_log)
     print(f'\n--- Corrected Dashboard Metrics ---')
     print(f'  Total Invested:          Rs {inr(metrics["Total Invested"])}')
     print(f'  Total Disbursed:         Rs {inr(metrics["Total Disbursed"])}')

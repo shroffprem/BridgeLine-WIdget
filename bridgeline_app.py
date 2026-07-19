@@ -315,9 +315,9 @@ def _clean_numeric_cell(v):
 
 def load_data_from_sheet(sh):
     """Live-Sheets equivalent of generate_mis.load_data(): same return shape
-    (rows, db_raw, mcoll, (cluster_mgrs, branch_contacts)), sourced from the
-    same spreadsheet the widget already reads/writes, instead of a manually
-    downloaded Excel snapshot."""
+    (rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log),
+    sourced from the same spreadsheet the widget already reads/writes,
+    instead of a manually downloaded Excel snapshot."""
     acc_vals = sh.worksheet(SHEET_NAME).get_all_values()
     # Find header row dynamically — it's the row containing "Disbursement ID"
     # (same approach as read_accounts_from_gsheet()). A row inserted/removed
@@ -364,10 +364,15 @@ def load_data_from_sheet(sh):
         sheets['Contact'] = _SheetShim(sh.worksheet('Contact').get_all_values())
     except gspread.exceptions.WorksheetNotFound:
         pass
+    try:
+        sheets['Capital Log'] = _SheetShim(sh.worksheet('Capital Log').get_all_values())
+    except gspread.exceptions.WorksheetNotFound:
+        pass
     wb_shim = _WorkbookShim(sheets)
 
     mcoll = mis.load_mcoll(wb_shim)
     cluster_mgrs, branch_contacts = mis.load_contacts(wb_shim)
+    capital_log = mis.load_capital_log(wb_shim)
 
     db_raw = {}
     try:
@@ -380,7 +385,7 @@ def load_data_from_sheet(sh):
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    return rows, db_raw, mcoll, (cluster_mgrs, branch_contacts)
+    return rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log
 
 # ── Extraction helpers ────────────────────────────────────────────────────────
 
@@ -2722,6 +2727,62 @@ def get_recon_txns_sheet(sh):
         ws.append_row(RECON_TXNS_HEADERS)
         return ws
 
+# ── Capital Log (company solvency check) ─────────────────────────────────────
+
+CAPITAL_LOG_SHEET_NAME = "Capital Log"
+CAPITAL_LOG_HEADERS = ["DATE", "TYPE", "PARTNER", "AMOUNT", "RUNNING BALANCE", "REFERENCE", "REMARKS"]
+
+def get_capital_log_sheet(sh):
+    """The real tab already exists with a title row + blank row + header at
+    row 3 (manually created) — this create-branch only fires defensively if
+    the tab is ever deleted, and deliberately doesn't try to reproduce that
+    formatting, just a plain header row."""
+    try:
+        return sh.worksheet(CAPITAL_LOG_SHEET_NAME)
+    except Exception:
+        ws = sh.add_worksheet(title=CAPITAL_LOG_SHEET_NAME, rows=1000, cols=len(CAPITAL_LOG_HEADERS))
+        ws.append_row(CAPITAL_LOG_HEADERS)
+        return ws
+
+def read_capital_log(sh):
+    """Live-Sheets wrapper around generate_mis.load_capital_log() — same
+    single-sheet shim pattern used elsewhere to reuse a wb-agnostic parser
+    against gspread data instead of an openpyxl Workbook."""
+    try:
+        vals = sh.worksheet(CAPITAL_LOG_SHEET_NAME).get_all_values()
+    except gspread.exceptions.WorksheetNotFound:
+        return None
+    wb_shim = _WorkbookShim({'Capital Log': _SheetShim(vals)})
+    return mis.load_capital_log(wb_shim)
+
+def append_capital_log_entry(data):
+    """Single-row append — mirrors save_reconciliation()'s Recon Log
+    log_ws.append_row([...]) pattern (not the Contacts full-sheet-rewrite
+    pattern), since Capital Log is meant to be an append-only audit trail
+    (the sheet's own note: 'NOT overwritten by refreshAllDashboards() —
+    safe to edit')."""
+    sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    ws = get_capital_log_sheet(sh)
+    before = read_capital_log(sh)
+    net_before = before['net_capital'] if before and before.get('available') else 0.0
+
+    type_ = data['type'].strip().upper()
+    partner = data.get('partner', '').strip()
+    amount = mis.clean_capital_amount(data.get('amount', 0))
+    delta = mis.capital_log_signed_delta(type_, amount)
+    new_balance = round(net_before + delta, 2)
+
+    try:
+        d = datetime.strptime(data['date'], '%d-%m-%Y')
+    except Exception:
+        d = datetime.today()
+    ws.append_row([
+        d.strftime('%d-%b-%Y'), type_, partner,
+        f"Rs {mis.inr(amount)}", f"Rs {mis.inr(new_balance)}",
+        data.get('reference', '').strip(), data.get('remarks', '').strip(),
+    ])
+    return new_balance
+
 def _recon_num(v):
     try:
         return float(str(v).replace(',', '').strip() or 0)
@@ -2769,6 +2830,142 @@ def _load_recon_periods(ws):
         except Exception:
             return datetime.min
     return sorted(batches.values(), key=_period_sort_key)
+
+def _all_time_recon_totals(periods=None):
+    """All-time Expense/FD totals across every saved reconciliation period
+    and account. No new sheet-scan needed — _load_recon_periods() already
+    reads the ENTIRE Recon Txns sheet with latest-Batch-ID de-duplication
+    built in; periods=None triggers a fresh load for standalone use,
+    otherwise reuses an already-loaded list to avoid a second Sheets
+    round-trip within one request (see _solvency_check())."""
+    if periods is None:
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+        periods = _load_recon_periods(get_recon_txns_sheet(sh))
+    expense_total = fd_total = 0.0
+    periods_seen = []
+    for p in periods:
+        periods_seen.append((p['recon_date'], p['account']))
+        for tx in p['txns']:
+            if tx['type'] == 'Expense':
+                expense_total += tx['debit']
+            elif tx['type'] == 'FD Booking':
+                fd_total += tx['debit']
+    return {'expense_total': round(expense_total, 2), 'fd_total': round(fd_total, 2),
+            'periods_seen': periods_seen}
+
+def _recon_coverage_gaps(periods):
+    """Mirrors _account_tieout()'s 'incomplete' degradation pattern, but at
+    the period-coverage level: for each registered bank account, is there a
+    saved period for every calendar month between that account's OWN
+    earliest reconciliation and today? Scoped per-account (not a single
+    company-wide start date) since accounts open at different times."""
+    registered = [a.get('name', '').strip() for a in (load_config().get('bank_accounts') or [])
+                  if a.get('name', '').strip()]
+    today = datetime.today()
+    gaps = {}
+    for acct in registered:
+        dates = []
+        for p in periods:
+            if p['account'] != acct:
+                continue
+            try:
+                dates.append(datetime.strptime(p['recon_date'], '%d-%m-%Y'))
+            except Exception:
+                continue
+        if not dates:
+            gaps[acct] = {'status': 'no_periods', 'missing_months': []}
+            continue
+        covered = {(d.year, d.month) for d in dates}
+        earliest = min(dates)
+        missing, y, m = [], earliest.year, earliest.month
+        while (y, m) <= (today.year, today.month):
+            if (y, m) not in covered:
+                missing.append(f"{y:04d}-{m:02d}")
+            m += 1
+            if m > 12:
+                m = 1; y += 1
+        gaps[acct] = {'status': 'complete' if not missing else 'incomplete',
+                      'earliest_month': f"{earliest.year:04d}-{earliest.month:02d}",
+                      'missing_months': missing}
+    return gaps
+
+def _solvency_check():
+    """The actual "is money missing" check: does Net Capital (Capital Log,
+    all-time) plus net cash generated by lending (all-time Collected minus
+    all-time Disbursed) minus Expenses (all-time, from reconciliation
+    history) equal the real bank balance?
+
+    Deliberately NOT "Net Capital − Outstanding − Expenses": Outstanding
+    (for open cases) includes charges/GST accrued but not yet collected —
+    future income, not cash that has left the bank — so subtracting it
+    understates expected cash, and separately never adds back charges that
+    HAVE already been collected (on both open and closed cases). Verified
+    with a worked example (₹100 principal + ₹10 charge, disbursed then
+    fully repaid): Net Capital − Outstanding − Expenses gives the wrong
+    answer at both the mid-loan and fully-repaid checkpoints; Net Capital +
+    (Collected_all − Disbursed_all) − Expenses gives the right answer at
+    both. Total Disbursed/Collected are summed across EVERY case (open and
+    closed), not just open ones — closed cases' fully-collected charges are
+    exactly the margin this business exists to earn, and must be reflected
+    in the expected cash position.
+
+    FD money is deliberately NOT subtracted here — it's surfaced as its own
+    explained line ('₹X currently in FDs') rather than folded into the main
+    variance, so parking money in a Fixed Deposit never reads as unexplained
+    missing money. Same reasoning _account_tieout() already uses for this
+    statement's own Expense/Capital totals: context, not part of the formula.
+
+    Degrades to 'incomplete' (not a confident-looking wrong number) whenever
+    reconciliation coverage has gaps, since Expenses sourced from that
+    history are then undercounted for the missing months.
+    """
+    sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    capital_log = read_capital_log(sh)
+    if not capital_log or not capital_log.get('available'):
+        return {'status': 'no_capital_log_data',
+                'message': (capital_log or {}).get('error', 'Capital Log tab not found or unreadable.')}
+
+    net_capital = capital_log['net_capital']
+    records = read_accounts_from_gsheet()
+    total_disbursed_all = round(sum(_parse_case(r)[0] for r in records), 2)
+    total_collected_all = round(sum(_parse_case(r)[2] for r in records), 2)
+    total_outstanding = get_today_summary()['total_outstanding']  # display context only, not in the formula
+
+    periods = _load_recon_periods(get_recon_txns_sheet(sh))
+    recon_totals = _all_time_recon_totals(periods)
+    total_expenses = recon_totals['expense_total']
+    fd_total = recon_totals['fd_total']
+
+    bank_balance, bank_date = get_latest_bank_balance()
+    coverage_gaps = _recon_coverage_gaps(periods)
+    incomplete_accounts = [a for a, g in coverage_gaps.items() if g['status'] != 'complete']
+
+    expected_bank_balance = variance = None
+    if bank_balance is not None:
+        net_lending_cash = total_collected_all - total_disbursed_all
+        expected_bank_balance = round(net_capital + net_lending_cash - total_expenses, 2)
+        variance = round(bank_balance - expected_bank_balance, 2)
+
+    status, reasons = 'ok', []
+    if incomplete_accounts:
+        status = 'incomplete'
+        reasons.append(f"Reconciliation coverage gaps for: {', '.join(incomplete_accounts)}")
+    if bank_balance is None:
+        status = 'incomplete'
+        reasons.append('No bank reconciliation history yet — cannot compare against a real bank balance.')
+
+    return {
+        'status': status, 'reasons': reasons,
+        'net_capital': net_capital,
+        'total_disbursed_all': total_disbursed_all, 'total_collected_all': total_collected_all,
+        'total_outstanding': total_outstanding,  # display context only — money currently with customers
+        'total_expenses': total_expenses, 'fd_total': fd_total,
+        'bank_balance': bank_balance,
+        'bank_balance_date': bank_date.strftime('%d-%m-%Y') if bank_date else None,
+        'expected_bank_balance': expected_bank_balance, 'variance': variance,
+        'ok': (variance is not None and abs(variance) <= 1.0),
+        'coverage_gaps': coverage_gaps,
+    }
 
 def save_reconciliation(recon_date, opening_balance, closing_balance, transactions,
                          remarks='', remarks_map=None, account=''):
@@ -3419,6 +3616,50 @@ HTML = """<!DOCTYPE html>
     <div class="section">
       <h3>Reconciliation &amp; MIS Reports</h3>
       <p style="font-size:.85rem;color:#555">The Daily Reconciliation Excel and the MIS PDF package are generated fresh on each run and download directly to your browser — keep your own copy if you want a running archive.</p>
+    </div>
+
+    <div class="section" id="solvency-section">
+      <h3>🧮 Company Solvency Check <span id="solvency-badge" style="font-weight:400;color:#888"></span></h3>
+      <p style="font-size:.8rem;color:#666;margin:0 0 10px">Does Net Capital plus net cash from lending minus Expenses actually equal what's really in the bank?</p>
+      <div id="solvency-body" style="font-size:.85rem;line-height:1.7"></div>
+    </div>
+
+    <div class="section" id="capital-log-section">
+      <h3>💰 Capital Log <span id="capital-log-badge" style="font-weight:400;color:#888"></span></h3>
+      <p style="font-size:.8rem;color:#666;margin:0 0 10px">Record a partner capital contribution, withdrawal, or correction — appended to the "Capital Log" sheet tab.</p>
+      <div class="grid">
+        <div class="field"><label>Date (DD-MM-YYYY) *</label>
+          <div class="date-wrap">
+            <input type="text" id="cl-date">
+            <input type="date" class="date-native" id="cl-date-native" onchange="_pickDate('cl-date', this.value)">
+            <button type="button" class="date-cal-btn" onclick="_openDatePicker('cl-date-native')">📅</button>
+          </div>
+        </div>
+        <div class="field"><label>Type *</label>
+          <select id="cl-type" style="width:100%;padding:9px;border:1px solid #ccc;border-radius:6px;font-size:.9rem;">
+            <option value="INFLOW">INFLOW</option>
+            <option value="WITHDRAWAL">WITHDRAWAL</option>
+            <option value="RECYCLE">RECYCLE</option>
+            <option value="ADJUSTMENT">ADJUSTMENT</option>
+          </select>
+        </div>
+        <div class="field"><label>Partner</label>
+          <input type="text" id="cl-partner" placeholder="e.g. Harsha, Shivu, Prem"></div>
+        <div class="field"><label>Amount (₹) *</label>
+          <input type="number" id="cl-amount" step="0.01"></div>
+        <div class="field"><label>Reference</label>
+          <input type="text" id="cl-reference" placeholder="e.g. bank UTR, cheque no."></div>
+        <div class="field" style="grid-column:1/-1"><label>Remarks</label>
+          <input type="text" id="cl-remarks"></div>
+      </div>
+      <button class="btn btn-save" onclick="saveCapitalLogEntry()" style="width:auto;padding:10px 24px">💾 Add Capital Log Entry</button>
+      <div id="capital-log-status" class="status"></div>
+      <div style="overflow-x:auto;margin-top:14px">
+        <table class="recon-table">
+          <thead><tr><th>Date</th><th>Type</th><th>Partner</th><th style="text-align:right">Amount</th><th>Reference</th><th>Remarks</th></tr></thead>
+          <tbody id="capital-log-tbody"></tbody>
+        </table>
+      </div>
     </div>
   </div>
 
@@ -4724,6 +4965,9 @@ async function loadSettings() {
   document.getElementById('report-time').value = cfg.report_time || '09:00';
   document.getElementById('set-bulk-debit').value = cfg.bulk_debit_account || '';
   document.getElementById('set-bulk-narration').value = cfg.bulk_narration || '';
+  document.getElementById('cl-date').value = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
+  loadSolvencyCheck();
+  loadCapitalLog();
 }
 
 async function saveSettings() {
@@ -4735,6 +4979,104 @@ async function saveSettings() {
   const r = await (await fetch('/config', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})).json();
   showStatus('settings-status', r.ok ? 'success' : 'error', r.ok ? '✅ Settings saved!' : '❌ '+r.error);
+}
+
+async function loadSolvencyCheck() {
+  const badge = document.getElementById('solvency-badge');
+  const body = document.getElementById('solvency-body');
+  badge.textContent = '— loading…';
+  body.innerHTML = '';
+  try {
+    const r = await (await fetch('/solvency-check')).json();
+    if (r.status === 'no_capital_log_data' || r.status === 'error') {
+      badge.textContent = '';
+      body.innerHTML = `<p style="color:#c00">⚠️ ${r.message || r.error || 'Could not load solvency check.'}</p>`;
+      return;
+    }
+    if (r.status === 'incomplete') {
+      badge.textContent = '— Incomplete';
+      badge.style.color = '#b8860b';
+    } else {
+      badge.textContent = r.ok ? '— ✓ Matches' : '— ✗ Mismatch';
+      badge.style.color = r.ok ? '#1a5c3a' : '#c00';
+    }
+    const reasonsHtml = (r.reasons || []).length
+      ? `<div style="color:#b8860b;margin-bottom:10px">⚠️ ${(r.reasons||[]).join('<br>⚠️ ')}</div>` : '';
+    const varHtml = (r.expected_bank_balance != null) ? `
+        <div>Net Capital: <b>₹${fmtDec(r.net_capital)}</b></div>
+        <div>+ Collected all-time: <b>₹${fmtDec(r.total_collected_all)}</b></div>
+        <div>− Disbursed all-time: <b>₹${fmtDec(r.total_disbursed_all)}</b></div>
+        <div>− Expenses all-time: <b>₹${fmtDec(r.total_expenses)}</b></div>
+        <div>= Expected Bank Balance: <b>₹${fmtDec(r.expected_bank_balance)}</b></div>
+        <div>Actual Bank Balance (${r.bank_balance_date||'—'}): <b>₹${fmtDec(r.bank_balance)}</b></div>
+        <div style="color:${r.ok?'#1a5c3a':'#c00'};font-weight:700">Variance: ${r.variance<0?'-':''}₹${fmtDec(Math.abs(r.variance))}</div>
+        <div style="margin-top:6px;color:#555">₹${fmtDec(r.fd_total)} currently in FDs — not counted in bank balance above.</div>
+        <div style="font-size:.78rem;color:#888">Outstanding receivables (money currently with customers, context only): ₹${fmtDec(r.total_outstanding)}</div>`
+      : '<p style="color:#666">No bank reconciliation history yet.</p>';
+    body.innerHTML = reasonsHtml + varHtml;
+  } catch (e) {
+    badge.textContent = '';
+    body.innerHTML = `<p style="color:#c00">⚠️ ${e.message}</p>`;
+  }
+}
+
+async function loadCapitalLog() {
+  const badge = document.getElementById('capital-log-badge');
+  const tbody = document.getElementById('capital-log-tbody');
+  try {
+    const r = await (await fetch('/capital-log')).json();
+    if (!r.ok || !r.available) {
+      badge.textContent = '';
+      tbody.innerHTML = `<tr><td colspan="6" style="color:#c00">${r.error || 'Capital Log unavailable'}</td></tr>`;
+      return;
+    }
+    badge.textContent = `— Net Capital: ₹${fmtDec(r.net_capital)}`;
+    tbody.innerHTML = (r.entries || []).slice().reverse().map(e => `
+      <tr>
+        <td style="white-space:nowrap;font-size:.82rem">${e.date_str}</td>
+        <td style="font-size:.82rem">${e.type}</td>
+        <td style="font-size:.82rem">${e.partner || '—'}</td>
+        <td style="text-align:right;font-size:.82rem;font-weight:600">₹${fmtDec(e.amount)}</td>
+        <td style="font-size:.78rem;color:#666">${e.reference || '—'}</td>
+        <td style="font-size:.78rem;color:#666">${e.remarks || '—'}</td>
+      </tr>`).join('') || '<tr><td colspan="6" style="color:#888">No entries yet.</td></tr>';
+  } catch (e) {
+    badge.textContent = '';
+    tbody.innerHTML = `<tr><td colspan="6" style="color:#c00">${e.message}</td></tr>`;
+  }
+}
+
+async function saveCapitalLogEntry() {
+  const data = {
+    date:      document.getElementById('cl-date').value.trim(),
+    type:      document.getElementById('cl-type').value,
+    partner:   document.getElementById('cl-partner').value.trim(),
+    amount:    document.getElementById('cl-amount').value,
+    reference: document.getElementById('cl-reference').value.trim(),
+    remarks:   document.getElementById('cl-remarks').value.trim(),
+  };
+  if (!data.date || !data.amount)
+    return showStatus('capital-log-status', 'error', 'Date and Amount are required.');
+  const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
+  try {
+    const r = await (await fetch('/capital-log', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)})).json();
+    if (r.ok) {
+      showStatus('capital-log-status', 'success', `✅ Saved — new net capital: ₹${fmtDec(r.new_running_balance)}`);
+      document.getElementById('cl-partner').value = '';
+      document.getElementById('cl-amount').value = '';
+      document.getElementById('cl-reference').value = '';
+      document.getElementById('cl-remarks').value = '';
+      loadCapitalLog();
+      loadSolvencyCheck();
+    } else {
+      showStatus('capital-log-status', 'error', '❌ ' + r.error);
+    }
+  } catch (e) {
+    showStatus('capital-log-status', 'error', '❌ ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '💾 Add Capital Log Entry';
+  }
 }
 
 // ── Bank File tab ─────────────────────────────────────────────────────────────
@@ -5631,9 +5973,9 @@ def api_generate_mis():
         ensure_mis_assets_cached()
 
         sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
-        rows, db_raw, mcoll, (cluster_mgrs, branch_contacts) = load_data_from_sheet(sh)
+        rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log = load_data_from_sheet(sh)
         open_cases, all_cases, all_cases_full = mis.parse_cases(rows, mcoll)
-        metrics = mis.compute_dashboard_metrics(all_cases_full, db_raw)
+        metrics = mis.compute_dashboard_metrics(all_cases_full, db_raw, capital_log)
 
         try:
             mis.write_claude_dashboard_to_sheet(sh, metrics)
@@ -5781,6 +6123,42 @@ def api_reconcile_records():
         return jsonify({'ok': True, 'records': out})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e), 'records': []})
+
+@app.route('/capital-log', methods=['GET'])
+def api_capital_log_get():
+    try:
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+        cl = read_capital_log(sh)
+        if not cl or not cl.get('available'):
+            return jsonify({'ok': False, 'available': False,
+                             'error': (cl or {}).get('error', 'Capital Log tab not found')})
+        entries = [{**e, 'date_str': e['date_str']} for e in cl['entries']]
+        for e in entries:
+            e.pop('date', None)  # datetime.date isn't JSON-serializable; date_str already has it
+        return jsonify({'ok': True, 'available': True, 'entries': entries, 'net_capital': cl['net_capital']})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/capital-log', methods=['POST'])
+def api_capital_log_post():
+    try:
+        data = request.json or {}
+        missing = [k for k in ('date', 'type', 'amount') if not str(data.get(k, '')).strip()]
+        if missing:
+            return jsonify({'ok': False, 'error': f"Missing required field(s): {', '.join(missing)}"})
+        if data['type'].strip().upper() not in mis.CAPITAL_LOG_KNOWN_TYPES:
+            return jsonify({'ok': False, 'error': f"Unknown TYPE — must be one of {sorted(mis.CAPITAL_LOG_KNOWN_TYPES)}"})
+        new_balance = append_capital_log_entry(data)
+        return jsonify({'ok': True, 'new_running_balance': new_balance})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/solvency-check', methods=['GET'])
+def api_solvency_check():
+    try:
+        return jsonify(_solvency_check())
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
 
 @app.route('/reconcile/save', methods=['POST'])
 def api_reconcile_save():
