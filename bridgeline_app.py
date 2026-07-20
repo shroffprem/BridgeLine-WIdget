@@ -5163,10 +5163,15 @@ async function loadBulkRequests() {
   const table = document.getElementById('bulk-table');
   empty.style.display = ''; empty.textContent = 'Loading...';
   try {
-    const items = await (await fetch('/requests/pending')).json();
+    // include=exported so already-exported requests stay visible and can be
+    // re-exported (file rejected by bank, details corrected, etc.) — they
+    // get an amber "Exported" badge and a double-disbursement warning at
+    // export time instead of being hidden entirely.
+    const items = await (await fetch('/requests/pending?include=exported')).json();
     if (items.error) throw new Error(items.error);
     bulkRequests = items;
-    document.getElementById('bulk-count').textContent = items.length ? `(${items.length})` : '';
+    const pendingCount = items.filter(r => r.status === 'Pending').length;
+    document.getElementById('bulk-count').textContent = items.length ? `(${pendingCount} pending)` : '';
     if (!items.length) {
       table.style.display = 'none';
       empty.textContent = 'No pending requests';
@@ -5177,9 +5182,14 @@ async function loadBulkRequests() {
     items.forEach(r => {
       const tr = document.createElement('tr');
       tr.style.borderBottom = '1px solid #eef3f9';
+      const exported = r.status === 'Exported';
+      if (exported) tr.style.background = '#fffbf0';
+      const badge = exported
+        ? `<span style="background:#fff3cd;color:#8a6d1a;font-size:10px;font-weight:700;padding:1px 6px;border-radius:3px;margin-left:6px;">EXPORTED</span>`
+        : '';
       tr.innerHTML = `
         <td style="padding:6px 8px;"><input type="checkbox" class="bulk-check" value="${r.request_id}" onchange="updateBulkFooter()"></td>
-        <td style="padding:6px 8px;white-space:nowrap;color:#2a7ae2;">${r.request_id}</td>
+        <td style="padding:6px 8px;white-space:nowrap;color:#2a7ae2;">${r.request_id}${badge}</td>
         <td style="padding:6px 8px;white-space:nowrap;font-size:12px;color:#888;">${r.submitted_at}</td>
         <td style="padding:6px 8px;font-weight:600;">${r.customer}</td>
         <td style="padding:6px 8px;">${r.cluster} / ${r.branch}</td>
@@ -5233,12 +5243,24 @@ async function exportBulk() {
   if (!confirm(`Export ${ids.length} request(s) as ${bankLabel} format?\n\nMake sure this matches the bank you will actually upload to — a file built for the wrong bank's template will be rejected or misread.`)) {
     return;
   }
+  // Regeneration path: already-exported requests CAN be re-exported (bank
+  // rejected the file, details changed, etc.) but only after an explicit
+  // second confirmation naming the risk — if the earlier file was (or still
+  // gets) uploaded too, the customer is paid TWICE.
+  const reexports = bulkRequests.filter(r => ids.includes(r.request_id) && r.status === 'Exported');
+  if (reexports.length) {
+    const names = reexports.map(r => `${r.request_id} (${r.customer})`).join('\n');
+    if (!confirm(`⚠️ REGENERATING ${reexports.length} ALREADY-EXPORTED request(s):\n\n${names}\n\nBE CAREFUL OF DOUBLE DISBURSEMENT — make sure the earlier file was NOT uploaded to the bank (or was rejected). If both files get uploaded, these customers will be PAID TWICE.\n\nContinue with regeneration?`)) {
+      return;
+    }
+  }
   const body = {
     request_ids: ids,
     bank: bankSel.value,
     debit_account: document.getElementById('bulk-debit').value.trim(),
     narration: document.getElementById('bulk-narration').value.trim(),
     value_date: document.getElementById('bulk-value-date').value.trim(),
+    allow_reexport: reexports.length > 0,
   };
   showStatus('bulk-status', 'success', '⏳ Generating...');
   try {
@@ -5631,8 +5653,16 @@ def api_requests_export_bulk():
                             'request_ids': missing}), 404
         # Double-export guard: anything not Pending has already been exported
         # or disbursed — refuse the whole batch so nothing is paid twice.
+        # With allow_reexport (the widget sends it only after an explicit
+        # double-disbursement warning the user confirmed), 'Exported'
+        # requests may be regenerated — a rejected/incorrect file is a
+        # legitimate reason to need the same request in a fresh file.
+        # 'Disbursed' stays refused unconditionally: money already left the
+        # bank, so regenerating that file IS the double payment.
+        allow_reexport = bool(body.get('allow_reexport'))
+        allowed_statuses = {'Pending', 'Exported'} if allow_reexport else {'Pending'}
         conflicts = [i for i in ids
-                     if by_id[i][1][idx.get('Status', 11)] != 'Pending']
+                     if by_id[i][1][idx.get('Status', 11)] not in allowed_statuses]
         if conflicts:
             return jsonify({'ok': False, 'error': 'Not pending (already exported or disbursed?)',
                             'request_ids': conflicts}), 409
@@ -5681,7 +5711,12 @@ def api_requests_export_bulk():
         # batch between Exported and Pending.
         # Filename included in the stamp so _next_idfc_batch_filename() can
         # scan prior batches' Notes to find the next number to use.
-        stamp = f"Exported {template['label']} ({filename}) {datetime.now(IST).strftime('%d-%m-%Y %H:%M')} IST"
+        ts = datetime.now(IST).strftime('%d-%m-%Y %H:%M')
+        stamp = f"Exported {template['label']} ({filename}) {ts} IST"
+        # Re-exports get a louder, distinct stamp — the Notes column is the
+        # audit trail, and a regeneration must be visually unmistakable when
+        # someone later asks why one request appears in two bank files.
+        restamp = f"RE-EXPORTED {template['label']} ({filename}) {ts} IST — verify earlier file was not also uploaded (double disbursement risk)"
         notes_col = idx.get('Notes', 13)
         status_letter = chr(ord('A') + idx.get('Status', 11))
         notes_letter = chr(ord('A') + notes_col)
@@ -5694,8 +5729,10 @@ def api_requests_export_bulk():
         updates = []
         for req_id in ids:
             rownum, row = by_id[req_id]
+            was_exported = (row[idx.get('Status', 11)] == 'Exported')
+            this_stamp = restamp if was_exported else stamp
             old_note = row[notes_col] if len(row) > notes_col else ''
-            note = f"{old_note} | {stamp}" if old_note.strip() else stamp
+            note = f"{old_note} | {this_stamp}" if old_note.strip() else this_stamp
             updates.append({'range': f'{status_letter}{rownum}', 'values': [['Exported']]})
             updates.append({'range': f'{notes_letter}{rownum}', 'values': [[note]]})
             updates.append({'range': f'{debit_letter}{rownum}', 'values': [[debit_account]]})
