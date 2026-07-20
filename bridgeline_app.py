@@ -2136,7 +2136,7 @@ def _match_transactions(txns, records, mc_rows):
 
         if dr > 0:
             if own_acct_m:
-                tx_type = 'Capital Out'; tx_notes = f'Internal transfer to own account {own_acct_m}'
+                tx_type = 'Contra'; tx_notes = f'Internal transfer to own account {own_acct_m}'
             # Own-name contra: a debit whose BENEFICIARY is BridgeLine itself
             # is money moving between our own accounts, never a customer
             # disbursement. Without this, the amount-matcher would grab the
@@ -2192,7 +2192,7 @@ def _match_transactions(txns, records, mc_rows):
 
         elif cr > 0:
             if own_acct_m:
-                tx_type = 'Capital In'; tx_notes = f'Internal transfer from own account {own_acct_m}'
+                tx_type = 'Contra'; tx_notes = f'Internal transfer from own account {own_acct_m}'
 
             # ₹1 test credits — banks/borrowers send ₹1 to verify account before full payment
             elif cr == 1.0:
@@ -2211,10 +2211,16 @@ def _match_transactions(txns, records, mc_rows):
                   or re.search(r'(?:RTGS|NEFT|IMPS)/[A-Z0-9]+/BRIDGELINE PARTNERS/', desc, re.IGNORECASE)):
                 tx_type = 'Contra'; tx_notes = 'Own-account transfer (sender is BridgeLine)'
 
-            # Pradaan routing = collection routed via Pradaan account
+            # Bank-paid interest (savings/FD interest credits) — income the
+            # lending books never see, so it needs its own type to be added
+            # back into the solvency check's expected balance.
+            elif re.search(r'credit\s*int(?:erest)?|int(?:erest)?\s*(?:pd|paid|credit)|\bint\.?\s*pd\b|\bsb\s*int\b|fd\s*int', desc, re.IGNORECASE):
+                tx_type = 'Interest Income'; tx_notes = 'Bank interest credit'
+
+            # Pradaan routing = repayment routed via Pradaan account
             elif re.search(r'pradaan|pradan', desc, re.IGNORECASE):
                 cands = amt_to_coll.get(round(cr), [])
-                tx_type = 'Collection (via Pradaan)'
+                tx_type = 'Repayment'
                 tx_ref  = cands[0] if cands else ''
                 tx_basis= 'Amount' if cands else '—'
                 tx_notes= 'Pradaan Routing'
@@ -2244,34 +2250,34 @@ def _match_transactions(txns, records, mc_rows):
                                     break
 
                 if matched:
-                    tx_type = 'Collection'; tx_ref = matched
+                    tx_type = 'Repayment'; tx_ref = matched
                     tx_basis = 'UTR'; tx_notes = 'Matched Collections'
                 else:
                     coll_cands = amt_to_coll.get(round(cr), [])
                     name_did, name_score = _fuzzy_name_match(desc)
                     # Amount + name
                     if coll_cands and name_did and name_did in coll_cands:
-                        tx_type = 'Collection'; tx_ref = name_did
+                        tx_type = 'Repayment'; tx_ref = name_did
                         tx_basis = 'Amount+Name'; tx_notes = 'M Coll + name'
                     # Amount only (M Coll)
                     elif coll_cands:
-                        tx_type = 'Collection'; tx_ref = coll_cands[0]
+                        tx_type = 'Repayment'; tx_ref = coll_cands[0]
                         tx_basis = 'Amount'; tx_notes = 'Fuzzy — confirm'
                     # Amount match against Accounts disbursement amounts (repayment of full loan)
                     elif name_did and name_score >= 2:
                         # Check if amount also matches for higher confidence
                         disb_cands = amt_to_disb_id.get(round(cr), [])
                         if disb_cands and name_did in disb_cands:
-                            tx_type = 'Collection'; tx_ref = name_did
+                            tx_type = 'Repayment'; tx_ref = name_did
                             tx_basis = 'Amount+Name'; tx_notes = 'Name+amount match'
                         else:
-                            tx_type = 'Collection'; tx_ref = name_did
+                            tx_type = 'Repayment'; tx_ref = name_did
                             tx_basis = 'Name'; tx_notes = 'Fuzzy name — confirm'
                     else:
                         if cr < 5000 or re.search(r'ft\s+-\s+cr|capital|transfer from', desc, re.IGNORECASE):
-                            tx_type = 'Capital In'; tx_notes = '—'
+                            tx_type = 'Other Income'; tx_notes = 'Unmatched credit — confirm source'
                         else:
-                            tx_type = 'Collection'; tx_ref = ''
+                            tx_type = 'Repayment'; tx_ref = ''
                             tx_basis = '—'; tx_notes = 'Review — no match found'
 
         # Honour manual override from widget
@@ -2383,13 +2389,18 @@ def _sheet_statement(wb, period_label, remarks, opening, closing, classified_txn
 
     type_fill = {
         'Disbursement':           s['amb_fill'],
+        'Repayment':              s['grn_fill'],
+        'Other Income':           s['grn_fill'],
+        'Interest Income':        s['grn_fill'],
+        'Expense':                s['red_fill'],
+        'Contra':                 s['blu_fill'],
+        'FD Booking':             s['blu_fill'],
+        # Legacy labels — older stored periods still carry these type
+        # strings and get rebuilt into every downloaded workbook.
         'Collection':             s['grn_fill'],
         'Collection (via Pradaan)':s['grn_fill'],
-        'Expense':                s['red_fill'],
         'Capital In':             s['blu_fill'],
         'Capital Out':            s['blu_fill'],
-        'FD Booking':             s['blu_fill'],
-        'Contra':                 s['blu_fill'],
     }
     total_dr = total_cr = 0.0
     for tx in classified_txns:
@@ -2865,7 +2876,7 @@ def _all_time_recon_totals(periods=None):
     if periods is None:
         sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
         periods = _load_recon_periods(get_recon_txns_sheet(sh))
-    expense_total = fd_total = 0.0
+    expense_total = fd_total = income_total = 0.0
     periods_seen = []
     for p in periods:
         periods_seen.append((p['recon_date'], p['account']))
@@ -2874,7 +2885,14 @@ def _all_time_recon_totals(periods=None):
                 expense_total += tx['debit']
             elif tx['type'] == 'FD Booking':
                 fd_total += tx['debit']
+            # Non-lending income arriving in the bank (interest credits,
+            # misc receipts) — cash the lending books never see, so it must
+            # be added back into the expected balance or it reads as an
+            # unexplained surplus.
+            elif tx['type'] in ('Interest Income', 'Other Income'):
+                income_total += tx['credit']
     return {'expense_total': round(expense_total, 2), 'fd_total': round(fd_total, 2),
+            'income_total': round(income_total, 2),
             'periods_seen': periods_seen}
 
 def _recon_coverage_gaps(periods):
@@ -2959,6 +2977,7 @@ def _solvency_check():
     recon_totals = _all_time_recon_totals(periods)
     total_expenses = recon_totals['expense_total']
     fd_total = recon_totals['fd_total']
+    other_income_total = recon_totals['income_total']
 
     bank_balance, bank_date = get_latest_bank_balance()
     coverage_gaps = _recon_coverage_gaps(periods)
@@ -2967,7 +2986,8 @@ def _solvency_check():
     expected_bank_balance = variance = None
     if bank_balance is not None:
         net_lending_cash = total_collected_all - total_disbursed_all
-        expected_bank_balance = round(net_capital + net_lending_cash - total_expenses, 2)
+        expected_bank_balance = round(net_capital + net_lending_cash - total_expenses
+                                       + other_income_total, 2)
         variance = round(bank_balance - expected_bank_balance, 2)
 
     status, reasons = 'ok', []
@@ -2984,6 +3004,7 @@ def _solvency_check():
         'total_disbursed_all': total_disbursed_all, 'total_collected_all': total_collected_all,
         'total_outstanding': total_outstanding,  # display context only — money currently with customers
         'total_expenses': total_expenses, 'fd_total': fd_total,
+        'other_income_total': other_income_total,
         'bank_balance': bank_balance,
         'bank_balance_date': bank_date.strftime('%d-%m-%Y') if bank_date else None,
         'expected_bank_balance': expected_bank_balance, 'variance': variance,
@@ -4549,10 +4570,12 @@ async function parseStatement() {
   }
 }
 
-const BASE_TYPES = ['Disbursement','Collection','Collection (via Pradaan)','Expense','Capital In','Capital Out','Contra','Skip'];
+const BASE_TYPES = ['Disbursement','Repayment','Other Income','Expense','Contra','Interest Income','Skip'];
 const TYPE_COLOR = {
-  'Disbursement':'#fff8e1','Collection':'#e8f5e9','Collection (via Pradaan)':'#e8f5e9',
-  'Expense':'#fce4ec','Capital In':'#e3f2fd','Capital Out':'#e3f2fd','Contra':'#e3f2fd','Skip':'#eeeeee'
+  'Disbursement':'#fff8e1','Repayment':'#e8f5e9','Other Income':'#e8f5e9','Interest Income':'#e8f5e9',
+  'Expense':'#fce4ec','Contra':'#e3f2fd','Skip':'#eeeeee',
+  // legacy labels still present on older stored rows
+  'Collection':'#e8f5e9','Collection (via Pradaan)':'#e8f5e9','Capital In':'#e3f2fd','Capital Out':'#e3f2fd'
 };
 
 let _customTypes = [];
@@ -4602,17 +4625,38 @@ function allTypeOpts() {
   return ['', ...BASE_TYPES, ..._customTypes];
 }
 function buildTypeSelect(i, val='') {
-  const opts = allTypeOpts().map(t =>
-    `<option value="${t}" ${t===val?'selected':''}>${t||'— auto —'}</option>`).join('');
+  // The stored value may be a legacy/auto-only label (Collection, Capital
+  // In, FD Booking, ...) no longer offered in the list — keep it selectable
+  // for THIS row so re-saving doesn't silently change it.
+  const opts = allTypeOpts();
+  if (val && !opts.includes(val)) opts.push(val);
+  const optHtml = opts.map(t =>
+    `<option value="${t}" ${t===val?'selected':''}>${t||'— auto —'}</option>`).join('')
+    + `<option value="__add__">＋ Add new type…</option>`;
   return `<select data-row="${i}" onchange="onTypeChange(this)"
-    style="width:100%;font-size:.82rem;padding:4px 6px;border:1px solid #b0c4d8;border-radius:5px;background:white">${opts}</select>`;
+    style="width:100%;font-size:.82rem;padding:4px 6px;border:1px solid #b0c4d8;border-radius:5px;background:white">${optHtml}</select>`;
 }
 function rowBg(type) { return TYPE_COLOR[type] || 'white'; }
 
-function onTypeChange(sel) {
-  const i   = sel.dataset.row;
-  const val = sel.value;
-  document.getElementById('txrow-'+i).style.background = rowBg(val);
+async function onTypeChange(sel) {
+  const i = sel.dataset.row;
+  if (sel.value === '__add__') {
+    const t = (prompt('New transaction type name:') || '').trim();
+    if (t && !BASE_TYPES.includes(t) && !_customTypes.includes(t)) {
+      await saveCustomType(t);
+    }
+    // Rebuild every type select so the new type shows up everywhere,
+    // preserving each row's current selection.
+    document.querySelectorAll('#review-tbody select[data-row]').forEach(s => {
+      const cur = (s === sel) ? (t || '') : s.value;
+      s.outerHTML = buildTypeSelect(s.dataset.row, cur === '__add__' ? '' : cur);
+    });
+    const mine = document.querySelector(`#review-tbody select[data-row="${i}"]`);
+    if (mine) mine.value = t || '';
+  }
+  const val = (document.querySelector(`#review-tbody select[data-row="${i}"]`) || sel).value;
+  const rowEl = document.getElementById('txrow-'+i);
+  if (rowEl) rowEl.style.background = rowBg(val);
 }
 
 function _fmtSigned(n) {
@@ -4742,7 +4786,8 @@ function renderReconResult(r) {
       const amt  = tx.debit ? "\u20b9"+fmtDec(tx.debit) : "\u20b9"+fmtDec(tx.credit);
       const drCr = tx.debit ? `<span style="color:#c00;font-weight:600">Dr</span>`
                             : `<span style="color:#1a5c3a;font-weight:600">Cr</span>`;
-      const autoColor = ({Disbursement:"#b8860b",Collection:"#1a5c3a",Expense:"#c00",
+      const autoColor = ({Disbursement:"#b8860b",Repayment:"#1a5c3a",Collection:"#1a5c3a",
+        "Other Income":"#1a5c3a","Interest Income":"#1a5c3a",Expense:"#c00",
         "FD Booking":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
       return `<tr style="background:${i%2?"#f8fbff":"white"}">
         <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
@@ -4770,20 +4815,20 @@ async function saveRecon() {
   if (!account) return alert('Please select or enter the bank account this statement belongs to.');
   await registerAccountIfNew(account);
 
-  // Collect corrections from the review queue and apply back to full transaction list
+  // Collect corrections from the review queue and apply back to full
+  // transaction list. Remarks are remarks ONLY — they used to also get
+  // saved as new dropdown "types", which is how the type list filled up
+  // with raw SMS text, case IDs, and one-off notes. New types are now
+  // added exclusively via the explicit "+ Add new type…" dropdown option.
   const reviewCorrections = {};
-  const newTypes = [];
   (window._reviewTxns || []).forEach((tx, i) => {
     const sel = document.querySelector(`#review-tbody select[data-row="${i}"]`);
     const inp = document.querySelector(`input[data-review-row="${i}"]`);
-    const type_override = sel ? sel.value.trim() : '';
+    const type_override = sel && sel.value !== '__add__' ? sel.value.trim() : '';
     const row_remarks   = inp ? inp.value.trim() : '';
-    if (row_remarks && !BASE_TYPES.includes(row_remarks) && !_customTypes.includes(row_remarks) && !newTypes.includes(row_remarks))
-      newTypes.push(row_remarks);
     // Match back to full list by date+description+amount
     reviewCorrections[`${tx.date}|${tx.description}|${tx.debit}|${tx.credit}`] = {type_override, row_remarks};
   });
-  for (const t of newTypes) await saveCustomType(t);
 
   const txns = reconTxns.map(tx => {
     const key = `${tx.date}|${tx.description}|${tx.debit}|${tx.credit}`;
@@ -5031,6 +5076,7 @@ async function loadSolvencyCheck() {
         <div>+ Collected all-time: <b>₹${fmtDec(r.total_collected_all)}</b></div>
         <div>− Disbursed all-time: <b>₹${fmtDec(r.total_disbursed_all)}</b></div>
         <div>− Expenses all-time: <b>₹${fmtDec(r.total_expenses)}</b></div>
+        <div>+ Interest / Other income all-time: <b>₹${fmtDec(r.other_income_total||0)}</b></div>
         <div>= Expected Bank Balance: <b>₹${fmtDec(r.expected_bank_balance)}</b></div>
         <div>Actual Bank Balance (${r.bank_balance_date||'—'}): <b>₹${fmtDec(r.bank_balance)}</b></div>
         <div style="color:${r.ok?'#1a5c3a':'#c00'};font-weight:700">Variance: ${r.variance<0?'-':''}₹${fmtDec(Math.abs(r.variance))}</div>
