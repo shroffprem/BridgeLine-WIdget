@@ -1678,8 +1678,8 @@ def _account_tieout(records, mc_rows, account, period_month, classified_txns, st
     # movement (bank charges, FD booking, inter-account transfer) doesn't
     # read as an unexplained discrepancy.
     expense_total = sum(t['debit'] for t in classified_txns if t['type'] == 'Expense')
-    capital_net = (sum(t['credit'] for t in classified_txns if t['type'] == 'Capital In')
-                   - sum(t['debit'] for t in classified_txns if t['type'] in ('Capital Out', 'FD Booking')))
+    capital_net = (sum(t['credit'] for t in classified_txns if t['type'] in ('Capital In', 'Contra'))
+                   - sum(t['debit'] for t in classified_txns if t['type'] in ('Capital Out', 'FD Booking', 'Contra')))
 
     return {
         'status': 'ok',
@@ -2137,6 +2137,16 @@ def _match_transactions(txns, records, mc_rows):
         if dr > 0:
             if own_acct_m:
                 tx_type = 'Capital Out'; tx_notes = f'Internal transfer to own account {own_acct_m}'
+            # Own-name contra: a debit whose BENEFICIARY is BridgeLine itself
+            # is money moving between our own accounts, never a customer
+            # disbursement. Without this, the amount-matcher would grab the
+            # nearest same-amount customer case and falsely mark it
+            # bank-confirmed (happened with real Saraswat and HDFC→IDFC
+            # transfers). Pattern anchored to the DR-IFSC-<beneficiary>
+            # narration shape so customer names can never trigger it; still
+            # lands in the review queue (basis '') for a human once-over.
+            elif re.search(r'\bDR[-/][A-Z]{4}0[A-Z0-9]{6}[-/]\s*BRIDGELINE PARTNERS\b', desc, re.IGNORECASE):
+                tx_type = 'Contra'; tx_notes = 'Own-account transfer (beneficiary is BridgeLine)'
             elif _is_fd_booking(desc):
                 tx_type = 'FD Booking'; tx_notes = 'Fixed Deposit — internal capital movement'
             elif _is_expense_debit(desc, dr):
@@ -2187,6 +2197,19 @@ def _match_transactions(txns, records, mc_rows):
             # ₹1 test credits — banks/borrowers send ₹1 to verify account before full payment
             elif cr == 1.0:
                 tx_type = 'Test Credit'; tx_notes = 'Penny verification — ignore'
+
+            # Own-name contra (credit side): a credit whose SENDER is
+            # BridgeLine itself is our own money arriving from another of
+            # our accounts, never a customer collection. Two narration
+            # shapes, both with our name in the sender slot: HDFC's
+            # 'RTGS CR-<IFSC>-BRIDGELINE PARTNERS-...' and IDFC's
+            # 'RTGS/<UTR>/BRIDGELINE PARTNERS/...'. The FT collection format
+            # ('FT -BRIDGELINE PARTNERS CR - ...') deliberately doesn't
+            # match either pattern — there our name is the RECEIVING account
+            # holder on a genuine customer payment.
+            elif (re.search(r'\bCR[-/][A-Z]{4}0[A-Z0-9]{6}[-/]\s*BRIDGELINE PARTNERS\b', desc, re.IGNORECASE)
+                  or re.search(r'(?:RTGS|NEFT|IMPS)/[A-Z0-9]+/BRIDGELINE PARTNERS/', desc, re.IGNORECASE)):
+                tx_type = 'Contra'; tx_notes = 'Own-account transfer (sender is BridgeLine)'
 
             # Pradaan routing = collection routed via Pradaan account
             elif re.search(r'pradaan|pradan', desc, re.IGNORECASE):
@@ -2366,6 +2389,7 @@ def _sheet_statement(wb, period_label, remarks, opening, closing, classified_txn
         'Capital In':             s['blu_fill'],
         'Capital Out':            s['blu_fill'],
         'FD Booking':             s['blu_fill'],
+        'Contra':                 s['blu_fill'],
     }
     total_dr = total_cr = 0.0
     for tx in classified_txns:
@@ -4525,10 +4549,10 @@ async function parseStatement() {
   }
 }
 
-const BASE_TYPES = ['Disbursement','Collection','Collection (via Pradaan)','Expense','Capital In','Capital Out','Skip'];
+const BASE_TYPES = ['Disbursement','Collection','Collection (via Pradaan)','Expense','Capital In','Capital Out','Contra','Skip'];
 const TYPE_COLOR = {
   'Disbursement':'#fff8e1','Collection':'#e8f5e9','Collection (via Pradaan)':'#e8f5e9',
-  'Expense':'#fce4ec','Capital In':'#e3f2fd','Capital Out':'#e3f2fd','Skip':'#eeeeee'
+  'Expense':'#fce4ec','Capital In':'#e3f2fd','Capital Out':'#e3f2fd','Contra':'#e3f2fd','Skip':'#eeeeee'
 };
 
 let _customTypes = [];
@@ -4719,7 +4743,7 @@ function renderReconResult(r) {
       const drCr = tx.debit ? `<span style="color:#c00;font-weight:600">Dr</span>`
                             : `<span style="color:#1a5c3a;font-weight:600">Cr</span>`;
       const autoColor = ({Disbursement:"#b8860b",Collection:"#1a5c3a",Expense:"#c00",
-        "FD Booking":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0"})[tx.type] || "#555";
+        "FD Booking":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
       return `<tr style="background:${i%2?"#f8fbff":"white"}">
         <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
         <td style="font-size:.8rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${desc}">${desc}</td>
