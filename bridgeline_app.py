@@ -5612,9 +5612,18 @@ def api_requests_export_bulk():
         all_vals = ws.get_all_values()
         idx = {h: i for i, h in enumerate(all_vals[0])} if all_vals else {}
         by_id = {}
+        status_i = idx.get('Status', 11)
         for rownum, row in enumerate(all_vals[1:], start=2):
             if row and row[0] in ids:
-                by_id[row[0]] = (rownum, row)
+                # Duplicate Request IDs happen (double submissions leave an
+                # 'ID COLLISION' pair, one Pending + one Deleted). Last-row-
+                # wins used to let a Deleted duplicate shadow the live
+                # Pending row and 409 the whole export — prefer the Pending
+                # row whenever an ID appears more than once.
+                prev = by_id.get(row[0])
+                prev_status = prev[1][status_i] if prev and len(prev[1]) > status_i else ''
+                if prev is None or prev_status != 'Pending':
+                    by_id[row[0]] = (rownum, row)
 
         missing = [i for i in ids if i not in by_id]
         if missing:
