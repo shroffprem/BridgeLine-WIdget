@@ -5249,7 +5249,7 @@ async function exportBulk() {
   // gets) uploaded too, the customer is paid TWICE.
   const reexports = bulkRequests.filter(r => ids.includes(r.request_id) && r.status === 'Exported');
   if (reexports.length) {
-    const names = reexports.map(r => `${r.request_id} (${r.customer})`).join('\n');
+    const names = reexports.map(r => `${r.request_id} (${r.customer})`).join('\\n');
     if (!confirm(`⚠️ REGENERATING ${reexports.length} ALREADY-EXPORTED request(s):\n\n${names}\n\nBE CAREFUL OF DOUBLE DISBURSEMENT — make sure the earlier file was NOT uploaded to the bank (or was rejected). If both files get uploaded, these customers will be PAID TWICE.\n\nContinue with regeneration?`)) {
       return;
     }
