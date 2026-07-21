@@ -844,6 +844,12 @@ def get_next_seq(records=None):
     return max_seq + 1
 
 def save_disbursement(data):
+    # Server-side backstop — the widget's own form already requires this,
+    # but a request hitting this route directly (API call, retry script)
+    # must be blocked too, or a disbursement with no proof of transfer can
+    # still land in the books.
+    if not (data.get('utr') or '').strip():
+        raise ValueError('UTR / Reference number is required — a disbursement cannot be recorded without proof of transfer.')
     ws  = get_sheet()
     _ensure_accounts_bank_account_column(ws)
     # One read serves both the sequence number AND the insert row — the
@@ -954,6 +960,13 @@ def save_repayment(data):
     if not info['found']:
         raise ValueError(f"Disbursement ID '{disb_id}' not found.")
 
+    utr = (data.get('utr') or '').strip()
+    # Server-side backstop, same reasoning as save_disbursement(): the
+    # widget's form already requires this, but a direct call to this route
+    # must be blocked too.
+    if not utr:
+        raise ValueError('UTR / Reference number is required — a repayment cannot be recorded without proof of payment.')
+
     try:
         coll_date = datetime.strptime(data['date'], '%d-%m-%Y').strftime('%d-%m-%Y')
     except Exception:
@@ -961,7 +974,6 @@ def save_repayment(data):
 
     amount   = float(data['amount'])
     discount = float(data.get('discount', 0) or 0)
-    utr      = data.get('utr', '').strip()
     raw_msg  = data.get('raw_msg', '')
 
     sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
@@ -4368,6 +4380,8 @@ async function saveDisb() {
   };
   if (!data.customer || !data.amount || !data.company || !data.cluster || !data.branch)
     return showStatus('d-status','error','Please fill all required (*) fields.');
+  if (!data.utr)
+    return showStatus('d-status','error','❌ UTR / Reference number is required — a disbursement cannot be recorded without proof of transfer.');
   const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
   const r = await (await fetch('/save/disbursement', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)})).json();
@@ -4381,11 +4395,13 @@ async function saveRepa() {
   if (!disb_id) return showStatus('r-status','error','Please select an open case.');
   const amount = document.getElementById('r-amount').value;
   if (!amount)  return showStatus('r-status','error','Amount is required.');
+  const utr = document.getElementById('r-utr').value.trim();
+  if (!utr) return showStatus('r-status','error','❌ UTR / Reference number is required — a repayment cannot be recorded without proof of payment.');
   const data = {
     disb_id,
     date:     document.getElementById('r-date').value.trim(),
     amount,
-    utr:      document.getElementById('r-utr').value.trim(),
+    utr,
     discount: document.getElementById('r-discount').value || 0,
     raw_msg:  document.getElementById('r-msg').value.trim(),
     remarks:  document.getElementById('r-remarks').value.trim(),
