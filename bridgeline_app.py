@@ -1741,14 +1741,26 @@ def get_today_summary():
         if bank_date and ev_date > bank_date.date():
             collected_since_bank += ev['amount']
 
+    # Money currently parked in a sweep-in FD is still disbursable — it
+    # sweeps back automatically the moment the account needs it — so it
+    # must not read as unavailable just because it isn't sitting as raw
+    # balance. fd_total from _all_time_recon_totals() is already NET
+    # (booked minus matured/swept-back), so a matured FD stops counting
+    # here the moment it's reconciled back into the account.
+    try:
+        fd_outstanding = _all_time_recon_totals()['fd_total']
+    except Exception:
+        fd_outstanding = 0.0
+
     available = None
     if bank_balance is not None:
-        available = bank_balance - disbursed_since_bank + collected_since_bank
+        available = bank_balance - disbursed_since_bank + collected_since_bank + fd_outstanding
     return {
         'disbursed_today':   disbursed_today,
         'collected_today':   collected_today,
         'total_outstanding': total_outstanding,
         'available_for_disbursement': available,
+        'fd_outstanding': fd_outstanding,
         'bank_balance': bank_balance,
         'bank_balance_date': bank_date.strftime('%d %b %Y') if bank_date else None,
         'disbursed_since_bank': disbursed_since_bank,
@@ -2216,6 +2228,14 @@ def _match_transactions(txns, records, mc_rows):
             # back into the solvency check's expected balance.
             elif re.search(r'credit\s*int(?:erest)?|int(?:erest)?\s*(?:pd|paid|credit)|\bint\.?\s*pd\b|\bsb\s*int\b|fd\s*int', desc, re.IGNORECASE):
                 tx_type = 'Interest Income'; tx_notes = 'Bank interest credit'
+
+            # FD principal sweeping/maturing back into the account — typed
+            # 'FD Booking' same as the outgoing booking so the net FD figure
+            # (_all_time_recon_totals) self-corrects: these are sweep-in FDs
+            # counted as available-to-disburse while parked, and must stop
+            # being counted the moment the money is back in the account.
+            elif re.search(r'\bfd\b.*(?:clos|matur|premat|redeem|sweep|liquidat)|(?:sweep|swp).*(?:trf|transfer|cr)|prin\s*\+\s*int', desc, re.IGNORECASE):
+                tx_type = 'FD Booking'; tx_notes = 'FD maturity / sweep-in credit'
 
             # Pradaan routing = repayment routed via Pradaan account
             elif re.search(r'pradaan|pradan', desc, re.IGNORECASE):
@@ -2883,8 +2903,13 @@ def _all_time_recon_totals(periods=None):
         for tx in p['txns']:
             if tx['type'] == 'Expense':
                 expense_total += tx['debit']
+            # 'FD Booking' is a NET figure: debits are money parked into an
+            # FD, credits are the FD sweeping/maturing back into the account
+            # — so fd_total is always the amount CURRENTLY sitting in FDs,
+            # and a matured FD can't be double-counted (once in the bank
+            # balance and again as a parked FD).
             elif tx['type'] == 'FD Booking':
-                fd_total += tx['debit']
+                fd_total += tx['debit'] - tx['credit']
             # Non-lending income arriving in the bank (interest credits,
             # misc receipts) — cash the lending books never see, so it must
             # be added back into the expected balance or it reads as an
@@ -4443,6 +4468,7 @@ function openSumModal(kind) {
           <tr><td style="padding:6px 0;color:#555">Bank Closing Balance (${d.bank_balance_date||''})</td><td style="padding:6px 0;text-align:right;font-weight:600">₹${fmt(d.bank_balance||0)}</td></tr>
           <tr><td style="padding:6px 0;color:#555">Plus: Collected since then</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#1a5c3a">+₹${fmt(d.collected_since_bank||0)}</td></tr>
           <tr><td style="padding:6px 0;color:#555">Less: Disbursed since then</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#c00">−₹${fmt(d.disbursed_since_bank||0)}</td></tr>
+          <tr><td style="padding:6px 0;color:#555">Plus: Parked in sweep-in FDs</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#1a5c3a">+₹${fmt(d.fd_outstanding||0)}</td></tr>
           <tr style="border-top:2px solid #1a3a5c"><td style="padding:8px 0;font-weight:700">Available to Disburse</td><td style="padding:8px 0;text-align:right;font-weight:700;color:#1a5c3a">₹${fmt(d.available_for_disbursement||0)}</td></tr>
         </table></div>`;
     }
