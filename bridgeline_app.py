@@ -1907,17 +1907,29 @@ def parse_bank_statement(filepath, filename):
             if not utr and chq_clean and not re.match(r'^0+\d{0,6}$', chq_clean):
                 utr = chq_clean
 
-        if balance:
-            last_balance = balance
+        # Unconditional, not "if balance:" — a real transaction row's balance
+        # can legitimately BE zero (an account fully drained/closed, as
+        # happened with Saraswat), and treating 0 as falsy here silently
+        # left last_balance stuck at the previous nonzero value, reporting
+        # the wrong closing balance for exactly the accounts most likely to
+        # actually reach zero. By this point in the loop the row has already
+        # passed the debit-and-credit-both-zero skip check above, so it's a
+        # genuine transaction and its balance cell should always be trusted.
+        last_balance = balance
 
         rows.append({'date': date_val, 'description': desc, 'utr': utr,
                      'debit': debit, 'credit': credit, 'balance': balance})
 
     if rows:
-        if opening_balance is None and rows[0]['balance']:
+        # Not "and rows[0]['balance']"/"and last_balance" — same zero-is-
+        # not-falsy fix as above. _clean_amount() always returns a float
+        # (0.0 for both "genuinely zero" and "blank/unparseable"), so there
+        # was never a way to tell those apart via truthiness anyway; trust
+        # the parsed value once we know real rows exist.
+        if opening_balance is None:
             first = rows[0]
             opening_balance = round(first['balance'] + first['debit'] - first['credit'], 2)
-        if closing_balance is None and last_balance:
+        if closing_balance is None:
             closing_balance = last_balance
 
     return {'transactions': rows,
@@ -2158,9 +2170,23 @@ def _match_transactions(txns, records, mc_rows):
                     own_acct_m = num
                     break
 
+        # Some banks label their own inter/intra-account transfers as
+        # "CONTRA" directly in the narration (seen verbatim on a real
+        # Saraswat statement: ".../CONTRA"). This is bank-provided ground
+        # truth — more reliable than reconstructing "is this our own
+        # transfer" from account numbers or narration shape, and it works
+        # for any bank's own formatting without per-bank pattern-matching,
+        # unlike the DR/CR-IFSC-BRIDGELINE-PARTNERS patterns below (those
+        # are anchored to HDFC/IDFC's specific narration shapes and don't
+        # generalize — a genuinely new bank's own truncation/format could
+        # miss them entirely, as happened here).
+        bank_says_contra = bool(re.search(r'\bcontra\b', desc, re.IGNORECASE))
+
         if dr > 0:
             if own_acct_m:
                 tx_type = 'Contra'; tx_notes = f'Internal transfer to own account {own_acct_m}'
+            elif bank_says_contra:
+                tx_type = 'Contra'; tx_notes = 'Bank narration explicitly labels this Contra'
             # Own-name contra: a debit whose BENEFICIARY is BridgeLine itself
             # is money moving between our own accounts, never a customer
             # disbursement. Without this, the amount-matcher would grab the
@@ -2217,6 +2243,9 @@ def _match_transactions(txns, records, mc_rows):
         elif cr > 0:
             if own_acct_m:
                 tx_type = 'Contra'; tx_notes = f'Internal transfer from own account {own_acct_m}'
+
+            elif bank_says_contra:
+                tx_type = 'Contra'; tx_notes = 'Bank narration explicitly labels this Contra'
 
             # ₹1 test credits — banks/borrowers send ₹1 to verify account before full payment
             elif cr == 1.0:
