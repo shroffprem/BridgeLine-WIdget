@@ -2012,7 +2012,7 @@ def _expense_category(desc):
     return 'Miscellaneous'
 
 def _is_fd_booking(desc):
-    return 'fd booked' in desc.lower() or 'fd - booked' in desc.lower()
+    return bool(re.search(r'\bfd\b.*\bbooked\b', desc, re.IGNORECASE))
 
 def _is_expense_debit(desc, amt):
     """Return True if this debit is an operating expense (not a loan disbursement)."""
@@ -2275,7 +2275,7 @@ def _match_transactions(txns, records, mc_rows):
             # (_all_time_recon_totals) self-corrects: these are sweep-in FDs
             # counted as available-to-disburse while parked, and must stop
             # being counted the moment the money is back in the account.
-            elif re.search(r'\bfd\b.*(?:clos|matur|premat|redeem|sweep|liquidat)|(?:sweep|swp).*(?:trf|transfer|cr)|prin\s*\+\s*int', desc, re.IGNORECASE):
+            elif re.search(r'\bfd\b.*(?:clos|matur|premat|redeem|sweep|liquidat)|(?:sweep|swp).*(?:trf|transfer|cr)|prin\s*\+\s*int|sweep\s*in\s*from', desc, re.IGNORECASE):
                 tx_type = 'FD Booking'; tx_notes = 'FD maturity / sweep-in credit'
 
             # Pradaan routing = repayment routed via Pradaan account
