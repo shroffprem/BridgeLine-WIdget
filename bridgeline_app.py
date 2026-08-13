@@ -840,19 +840,102 @@ def _to_plain_date(v):
     parsed = _parse_any_date(v)
     return parsed.date() if parsed else None
 
-def _resolve_bib_hdb_methodology(cluster, disbursement_date):
-    """Only ever called from save_disbursement() at the moment a new row is
-    created, when no charge_plan marker yet exists to read. Every other
-    caller must pass methodology='OLD'/'NEW' sourced from that stamped
-    marker instead of calling this — see calc_charges()'s docstring."""
-    if not _is_bib_hdb_cluster(cluster):
-        return None
+# ── Charge-plan registry ─────────────────────────────────────────────────────
+# Onboarding a counterparty with its own rate must be a CONFIG change, not a
+# code change. Each plan declares what it matches on, when it starts, and the
+# formula — so a new company needs one entry here, and every code path
+# (disbursement, edit, closing, invoice, integrity check) picks it up at once.
+#
+# Matching is on company AND/OR cluster because the two real arrangements are
+# shaped differently: ICICI is a whole company, while "BIB HDB Karnataka" is
+# one programme inside HDB (394 of 404 cases are company HDB; only 3 of those
+# are that cluster). Keying on either field alone cannot express both.
+#
+# 'id' is what gets stamped into COL['charge_plan'] and is thereafter
+# authoritative for that row — the row's OWN plan, never re-derived from
+# today's config. The legacy id 'NEW' is kept for BIB HDB so the ~3 rows
+# already stamped need no migration; blank still means the flat default.
+DEFAULT_CHARGE_PLANS = [
+    {
+        'id': 'NEW',                       # legacy id, do not rename
+        'label': 'BIB HDB Karnataka day-based',
+        'match': {'cluster': BIB_HDB_CLUSTER_NAME},
+        'from': '2026-07-23',
+        'formula': {'type': 'day_based_inclusive', 'base_pct': 0.4, 'per_day_pct': 0.2,
+                    'gst_pct': 18, 'free_days': 1},
+    },
+]
+
+FLAT_DEFAULT_FORMULA = {'type': 'flat_exclusive', 'pct': 0.5, 'gst_pct': 18}
+
+def get_charge_plans():
+    """Registered plans, Config-overridable. A malformed Config value must
+    never silently disable a counterparty's rate — fall back to the built-in
+    list rather than to 'no plans', which would quietly charge everyone the
+    flat default (the exact failure this whole system exists to prevent)."""
+    try:
+        plans = load_config().get('charge_plans')
+    except Exception:
+        plans = None
+    if not isinstance(plans, list) or not plans:
+        return DEFAULT_CHARGE_PLANS
+    good = [p for p in plans if isinstance(p, dict) and p.get('id') and p.get('formula')]
+    return good or DEFAULT_CHARGE_PLANS
+
+def _plan_matches(plan, company, cluster):
+    """Every key present in the plan's 'match' must match. An empty match
+    would apply to everything, so it never matches at all."""
+    m = plan.get('match') or {}
+    if not m:
+        return False
+    if 'cluster' in m and _norm_cluster(m['cluster']) != _norm_cluster(cluster or ''):
+        return False
+    if 'company' in m and _norm_cluster(m['company']) != _norm_cluster(company or ''):
+        return False
+    return True
+
+def resolve_charge_plan(company, cluster, disbursement_date):
+    """The plan id for a NEW row, or None for the flat default. Only ever
+    called where no stamped marker yet exists (save_disbursement, and an edit
+    that changes company/cluster/date). Every other caller must pass the
+    row's already-stamped id — see calc_charges()'s docstring.
+
+    More specific plans win: a rule naming both company and cluster beats one
+    naming only a company, so a programme inside a company can override that
+    company's own default rate."""
     d = _to_plain_date(disbursement_date)
     if d is None:
         return None
-    return 'NEW' if d >= BIB_HDB_TAT_CUTOVER_DATE else 'OLD'
+    best, best_specificity = None, -1
+    for plan in get_charge_plans():
+        if not _plan_matches(plan, company, cluster):
+            continue
+        start = _to_plain_date(plan.get('from')) if plan.get('from') else None
+        if start and d < start:
+            continue            # pre-cutover rows keep the flat default, forever
+        until = _to_plain_date(plan.get('until')) if plan.get('until') else None
+        if until and d > until:
+            continue
+        spec = len(plan.get('match') or {})
+        if spec > best_specificity:
+            best, best_specificity = plan.get('id'), spec
+    return best
 
-def calc_charges(amount, cluster=None, disbursement_date=None, collection_date=None, methodology=None):
+def get_plan_by_id(plan_id):
+    if not plan_id:
+        return None
+    for plan in get_charge_plans():
+        if str(plan.get('id')) == str(plan_id):
+            return plan
+    return None
+
+def _resolve_bib_hdb_methodology(cluster, disbursement_date, company=None):
+    """Back-compat shim over resolve_charge_plan(). Kept because several call
+    sites and the 'OLD'/'NEW'/None vocabulary predate the registry."""
+    return resolve_charge_plan(company, cluster, disbursement_date)
+
+def calc_charges(amount, cluster=None, disbursement_date=None, collection_date=None,
+                 methodology=None, company=None):
     """Single source of truth for Charges/GST/Total math — replaces the
     flat 0.5%/18%-on-top formula that used to be duplicated across
     calc_total(), save_disbursement(), and update_disbursement().
@@ -887,27 +970,43 @@ def calc_charges(amount, cluster=None, disbursement_date=None, collection_date=N
     amt = float(amount or 0)
 
     if methodology is None:
-        methodology = _resolve_bib_hdb_methodology(cluster, disbursement_date)
+        methodology = resolve_charge_plan(company, cluster, disbursement_date)
 
-    if methodology != 'NEW':
-        charges = round(amt * 0.005, 2)
-        gst     = round(charges * 0.18, 2)
+    plan = get_plan_by_id(methodology)
+    # 'OLD', a stale id, or None all mean the flat default. Resolving an
+    # unknown id to flat rather than raising is deliberate: a plan deleted
+    # from Config must not break historical rows that reference it.
+    formula = (plan or {}).get('formula') or FLAT_DEFAULT_FORMULA
+    gst_pct = float(formula.get('gst_pct', 18))
+
+    if formula.get('type') != 'day_based_inclusive':
+        pct     = float(formula.get('pct', 0.5))
+        charges = round(amt * pct / 100, 2)
+        gst     = round(charges * gst_pct / 100, 2)
         total   = round(amt + charges + gst, 2)
         return {'charges': charges, 'gst': gst, 'total': total,
-                'methodology': methodology, 'rate_pct': 0.5, 'days_late': None}
+                'methodology': methodology if plan else None,
+                'plan_label': (plan or {}).get('label', 'Flat default'),
+                'rate_pct': pct, 'days_late': None, 'gst_inclusive': False}
 
     d_date = _to_plain_date(disbursement_date)
     c_date = _to_plain_date(collection_date)
-    days_late = 0 if c_date is None or d_date is None else max(0, (c_date - d_date).days - 1)
-    rate_pct  = 0.4 + 0.2 * days_late
+    free_days = int(formula.get('free_days', 1))
+    days_late = 0 if c_date is None or d_date is None else max(0, (c_date - d_date).days - free_days)
+    rate_pct  = float(formula.get('base_pct', 0.4)) + float(formula.get('per_day_pct', 0.2)) * days_late
 
+    # Inclusive total rounded FIRST, GST then taken as the exact remainder —
+    # never independently rounded — so charges+gst always reconstructs the
+    # inclusive total to the paisa (the invoice's single combined line
+    # depends on this).
     incl_total = round(amt * rate_pct / 100, 2)
-    charges    = round(incl_total / 1.18, 2)
-    gst        = round(incl_total - charges, 2)   # remainder, not independently rounded
+    charges    = round(incl_total / (1 + gst_pct / 100), 2)
+    gst        = round(incl_total - charges, 2)
     total      = round(amt + incl_total, 2)
 
     return {'charges': charges, 'gst': gst, 'total': total,
-            'methodology': 'NEW', 'rate_pct': rate_pct, 'days_late': days_late}
+            'methodology': methodology, 'plan_label': plan.get('label', methodology),
+            'rate_pct': rate_pct, 'days_late': days_late, 'gst_inclusive': True}
 
 def calc_total(amount, charges=None, gst=None):
     if charges is not None or gst is not None:
@@ -1190,11 +1289,12 @@ def save_disbursement(data):
 
     amount = float(data['amount'])
     cluster_for_charges = data.get('cluster', '')
-    charge_calc = calc_charges(amount, cluster=cluster_for_charges, disbursement_date=d.date())
+    charge_calc = calc_charges(amount, cluster=cluster_for_charges, disbursement_date=d.date(),
+                               company=data.get('company', ''))
     charges = charge_calc['charges']
     gst     = charge_calc['gst']
     total   = charge_calc['total']
-    charge_methodology = charge_calc['methodology']  # None / 'OLD' / 'NEW'
+    charge_methodology = charge_calc['methodology']  # None, or a charge-plan id
 
     # Manual selection always wins; auto-resolve from the source Request's
     # export-time debit account only when the form field was left blank —
@@ -1247,9 +1347,9 @@ def save_disbursement(data):
     # calc_charges() already resolved above, so the stamp and the number
     # charged can never disagree with each other.
     remarks_in = data.get('remarks', '')
-    if charge_methodology == 'NEW':
-        row_data[COL['charge_plan']-1] = 'NEW'
-        note = 'Day-based TAT charge schedule applied (BIB HDB Karnataka)'
+    if charge_methodology:
+        row_data[COL['charge_plan']-1] = charge_methodology
+        note = f"Charge plan applied: {charge_calc.get('plan_label', charge_methodology)}"
         remarks_in = f"{remarks_in} | {note}" if remarks_in.strip() else note
     row_data[COL['remarks']-1]      = remarks_in
     row_data[COL['bank_account']-1] = bank_account
@@ -1335,9 +1435,18 @@ def _cell_num(ws, row, col):
     except Exception:
         return 0.0
 
+def _plan_is_provisional(plan_id):
+    """True when a plan's rate depends on the collection date, so the figure
+    booked at disbursement is only an estimate until the case closes. Driven
+    off the formula type, not a hardcoded id, so a new day-based counterparty
+    finalizes at closing automatically."""
+    plan = get_plan_by_id(plan_id)
+    return bool(plan) and (plan.get('formula') or {}).get('type') == 'day_based_inclusive'
+
 def _maybe_finalize_bib_hdb_charges(amount, cluster, disbursement_date_str,
                                      collection_date_str, current_charge_plan,
-                                     was_closed, becomes_closed, new_coll, discount):
+                                     was_closed, becomes_closed, new_coll, discount,
+                                     company=None):
     """Shared by save_repayment() and _recompute_case_from_mcoll() — both
     reach the same 'a case just transitioned to Closed' moment via
     different code paths (main Repayment tab vs. the Edit Case tab's
@@ -1359,12 +1468,13 @@ def _maybe_finalize_bib_hdb_charges(amount, cluster, disbursement_date_str,
     or all-None if no recompute applies here — callers keep whatever
     bal/status they already computed in that case.
     """
-    if was_closed or not becomes_closed or current_charge_plan != 'NEW':
+    if was_closed or not becomes_closed or not _plan_is_provisional(current_charge_plan):
         return None, None, None, None, None
     d_date = _to_plain_date(disbursement_date_str)
     c_date = _to_plain_date(collection_date_str)
     charge_calc = calc_charges(amount, cluster=cluster, disbursement_date=d_date,
-                                collection_date=c_date, methodology='NEW')
+                                collection_date=c_date, methodology=current_charge_plan,
+                                company=company)
     final_charges = charge_calc['charges']
     final_gst     = charge_calc['gst']
     final_total   = charge_calc['total']
@@ -1467,7 +1577,7 @@ def save_repayment(data):
         _maybe_finalize_bib_hdb_charges(
             amount=_rownum('amount'), cluster=_rowstr('cluster'),
             disbursement_date_str=_rowstr('date'), collection_date_str=coll_date,
-            current_charge_plan=_rowstr('charge_plan'),
+            current_charge_plan=_rowstr('charge_plan'), company=_rowstr('company'),
             was_closed=(info['status'] == 'Closed'), becomes_closed=(new_status == 'Closed'),
             new_coll=new_coll, discount=discount)
     if final_charges is not None:
@@ -1756,30 +1866,41 @@ def update_disbursement(data):
         i = COL[col_key] - 1
         return row_vals[i] if i < len(row_vals) else ''
 
-    if cluster_changing or amount_changing:
+    date_changing    = 'date' in data
+    company_changing = 'company' in data
+    # Anything that DETERMINES the charge forces a recompute, not just the
+    # amount. Company, cluster and date all feed resolve_charge_plan(), so a
+    # cluster-only correction used to re-stamp the marker and leave the money
+    # untouched — the row then claimed one charge plan while carrying another
+    # plan's figures, with nothing anywhere to notice. (Real case: the
+    # 12-08-2026 BIB HDB disbursement of Vijaya K.)
+    plan_inputs_changing = cluster_changing or date_changing or company_changing
+    recompute = plan_inputs_changing or amount_changing
+
+    if recompute:
         effective_cluster = str(data['cluster']).strip() if cluster_changing else _current('cluster')
-        effective_date = _to_plain_date(str(data['date']).strip() if 'date' in data else _current('date'))
+        effective_company = str(data['company']).strip() if company_changing else _current('company')
+        effective_date = _to_plain_date(str(data['date']).strip() if date_changing else _current('date'))
 
-    # A mis-entered cluster fixed after the fact shouldn't permanently miss
-    # (or wrongly keep stamped) the day-based schedule just because the
-    # marker was only ever decided once, at original disbursement time.
+    # A mis-entered company/cluster/date fixed after the fact shouldn't
+    # permanently miss (or wrongly keep stamped) a counterparty's schedule
+    # just because the marker was only ever decided once, at disbursement.
     new_marker = None
-    if cluster_changing:
-        new_marker = _resolve_bib_hdb_methodology(effective_cluster, effective_date)
-        # Only stamp 'NEW' — None/'OLD' both mean "flat legacy formula",
-        # same "blank = old" convention save_disbursement() establishes.
-        updates.append((row, COL['charge_plan'], 'NEW' if new_marker == 'NEW' else ''))
+    if plan_inputs_changing:
+        new_marker = resolve_charge_plan(effective_company, effective_cluster, effective_date)
+        # Blank means "flat default" — same convention save_disbursement() uses.
+        updates.append((row, COL['charge_plan'], new_marker or ''))
 
-    if amount_changing:
-        amount = float(data['amount'])
-        # Prefer a methodology just (re-)decided above if cluster changed
-        # this same call; otherwise this row's already-stamped marker is
+    if recompute:
+        amount = float(data['amount']) if amount_changing else _cell_num(ws, row, COL['amount'])
+        # Prefer a plan just (re-)decided above if its inputs changed in this
+        # same call; otherwise this row's already-stamped marker is
         # authoritative and untouched by this specific edit.
-        methodology = new_marker if cluster_changing else (
-            'NEW' if _current('charge_plan') == 'NEW' else None)
+        methodology = new_marker if plan_inputs_changing else (_current('charge_plan') or None)
         charge_calc = calc_charges(amount, cluster=effective_cluster,
                                     disbursement_date=effective_date,
-                                    methodology=methodology)
+                                    methodology=methodology,
+                                    company=effective_company)
         charges = charge_calc['charges']; gst = charge_calc['gst']; total = charge_calc['total']
         collected = _cell_num(ws, row, COL['coll_amount'])
         discount  = _cell_num(ws, row, COL['discount'])
@@ -1803,11 +1924,11 @@ def update_disbursement(data):
         } for r, c, v in updates])
         trigger_ledger_rebuild()
 
-    # Only the amount-changing branch above can transition status here (an
-    # amount correction that leaves bal < 1) -- `status` only exists in that
-    # branch's scope, so gate on the same amount_changing flag rather than
-    # checking `'status' in locals()`.
-    if amount_changing:
+    # Only the recompute branch above can transition status here (a
+    # correction that leaves bal < 1) -- `status` only exists in that
+    # branch's scope, so gate on the same flag rather than checking
+    # `'status' in locals()`.
+    if recompute:
         _maybe_upload_final_invoice(disb_id, was_closed=(info['status'] == 'Closed'),
                                      becomes_closed=(status == 'Closed'))
 
@@ -1872,7 +1993,7 @@ def _recompute_case_from_mcoll(disb_id):
         _maybe_finalize_bib_hdb_charges(
             amount=_rownum('amount'), cluster=_rowstr('cluster'),
             disbursement_date_str=_rowstr('date'), collection_date_str=coll_date,
-            current_charge_plan=_rowstr('charge_plan'),
+            current_charge_plan=_rowstr('charge_plan'), company=_rowstr('company'),
             was_closed=was_closed, becomes_closed=(status == 'Closed'),
             new_coll=collected, discount=discount)
     if final_charges is not None:
@@ -1995,6 +2116,10 @@ DEFAULT_CONFIG = {
     # an internal movement between our own accounts (Capital In/Out), not
     # a real disbursement/expense/collection.
     "bank_accounts": [],
+    # Per-counterparty charge schedules. Empty here means "use the built-in
+    # DEFAULT_CHARGE_PLANS"; set it to override or to onboard a new company
+    # without a code change. See get_charge_plans()/resolve_charge_plan().
+    "charge_plans": [],
     # Defaults for the Bank File tab's bulk-upload exports (overridable per
     # export in the UI).
     "bulk_debit_account": "",
@@ -4723,6 +4848,112 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
         'contra_auto_paired_total': contra_pairing['paired_total'],
     }
 
+# Sub-rupee residue is rounding, not a defect — the same tolerance the rest
+# of this codebase already treats as fully settled.
+CHARGE_MATERIALITY = 1.0
+
+def _charge_integrity_check(records=None):
+    """Every case whose STORED Charges/GST/Total disagree with what its own
+    company/cluster/date imply. Should always be empty.
+
+    This exists because no amount of care inside save_disbursement() or
+    update_disbursement() can protect a row that is edited BY HAND in the
+    Google Sheet — which is exactly how BLP-120826-401 went wrong on
+    12-08-2026: disbursed under an ordinary cluster and charged the flat
+    0.5%, then the Cluster cell was corrected to BIB HDB Karnataka directly
+    in the sheet. The charge plan marker stayed blank, the money stayed flat,
+    and nothing anywhere compared the two. A rule can be bypassed; a detector
+    cannot, so the guarantee has to be a detector.
+
+    Two distinct faults are reported, because they need different fixes:
+      * plan_mismatch  -- the row's stamped plan isn't what its own
+                          company/cluster/date resolve to (a marker never
+                          stamped, or stale after a hand-edit)
+      * amount_mismatch -- stored money doesn't match the row's own stamped
+                          plan (charged wrong, or the amount was edited in
+                          the sheet without recomputing)
+
+    Provisional (day-based) plans are compared at their best-case rate while
+    the case is still open, since the final figure legitimately isn't known
+    until it closes — comparing against the final rate would flag every
+    healthy open case.
+    """
+    if records is None:
+        records = read_accounts_from_gsheet()
+    issues = []
+    for r in records:
+        disb_id = (r.get('Disbursement ID', '') or '').strip()
+        if not disb_id:
+            continue
+        amount = _to_num(r.get('Amount', 0))
+        if amount <= 0:
+            continue
+        cluster = (r.get('Cluster', '') or '').strip()
+        company = (r.get('Company', '') or '').strip()
+        # Only a value that names a REGISTERED plan counts as a stamp. The
+        # older archive tabs don't share the live sheet's column layout, so
+        # column 26 there holds unrelated leftovers ('96', '0', even the
+        # literal header text) — reading those as plan ids reported six
+        # perfectly healthy April rows as mismatched on the first run.
+        stamped = (r.get('Charge Plan', '') or '').strip() or None
+        if stamped and not get_plan_by_id(stamped):
+            stamped = None
+        d = _to_plain_date(r.get('Disbursement Date', ''))
+        if d is None:
+            continue
+        expected_plan = resolve_charge_plan(company, cluster, d)
+
+        stored_charges = _to_num(r.get('Charges', 0))
+        stored_gst     = _gst_of(r)
+        stored_total   = _to_num(r.get('Total', 0))
+
+        status  = (r.get('Overdue Status', '') or '').strip()
+        is_open = status != 'Closed'
+        # A closed provisional case is compared at its ACTUAL collection date;
+        # an open one at the best case, which is all that's knowable yet.
+        coll_date = None if is_open else _to_plain_date(r.get('Collected Date', ''))
+        by_stamped = calc_charges(amount, cluster=cluster, company=company,
+                                  disbursement_date=d, collection_date=coll_date,
+                                  methodology=stamped)
+
+        faults = []
+        if (stamped or None) != (expected_plan or None):
+            faults.append('plan_mismatch')
+        # An amount mismatch is only a DEFECT on a plan-governed row, where
+        # the rate is contractual. On a flat-default row a different figure
+        # is usually a deliberate commercial decision — a negotiated rate or
+        # a discount, which the Edit Case screen exists to allow — and
+        # reporting those forever would bury the real faults. (First live run
+        # flagged 13 such historical rows alongside the one true defect.)
+        on_a_plan = bool(stamped or expected_plan)
+        if on_a_plan and abs(stored_total - by_stamped['total']) >= CHARGE_MATERIALITY:
+            faults.append('amount_mismatch')
+        if not faults:
+            continue
+
+        by_expected = calc_charges(amount, cluster=cluster, company=company,
+                                   disbursement_date=d, collection_date=coll_date,
+                                   methodology=expected_plan)
+        issues.append({
+            'disb_id': disb_id, 'customer': (r.get('Customer Name', '') or '').strip(),
+            'date': (r.get('Disbursement Date', '') or '').strip(),
+            'company': company, 'cluster': cluster, 'branch': (r.get('Branch', '') or '').strip(),
+            'status': status, 'amount': amount, 'faults': faults,
+            'stamped_plan': stamped or '(flat default)',
+            'expected_plan': expected_plan or '(flat default)',
+            'stored':   {'charges': stored_charges, 'gst': stored_gst, 'total': stored_total},
+            'expected': {k: by_expected[k] for k in ('charges', 'gst', 'total')},
+            'expected_label': by_expected.get('plan_label', ''),
+            'difference': round(by_expected['total'] - stored_total, 2),
+        })
+    over  = round(sum(i['difference'] for i in issues if i['difference'] < 0), 2)
+    under = round(sum(i['difference'] for i in issues if i['difference'] > 0), 2)
+    return {'all_clear': not issues, 'count': len(issues), 'issues': issues,
+            'overcharged_total': abs(over), 'undercharged_total': under,
+            'plans': [{'id': p.get('id'), 'label': p.get('label'),
+                       'match': p.get('match'), 'from': p.get('from'),
+                       'formula': p.get('formula')} for p in get_charge_plans()]}
+
 REPORT_GST_RATE = 0.18
 # A debit at or above this with no recognisable expense category is treated as
 # unidentified (held in suspense, excluded from profit, reported by name)
@@ -7387,7 +7618,18 @@ async function loadMoneyIntegrity() {
       ['FD swept in from an untracked deposit', L.fd_orphan_total||0,
        'Deposit booked before bank records begin.'],
     ];
-    const clear = !!r.all_clear;
+    // Charges are the sixth way money can quietly go wrong: a case billed on
+    // the wrong counterparty's rate. Fetched separately so a failure here
+    // can't blank the bank-side lines, which are the older, load-bearing ones.
+    let ci = null;
+    try { ci = await (await fetch('/charge-integrity')).json(); } catch {}
+    const ciAmt = ci ? (ci.overcharged_total||0) + (ci.undercharged_total||0) : 0;
+    if (ci && !ci.error) {
+      rows.push(['Case billed on the wrong charge plan', ciAmt,
+        (ci.count||0) + ' case(s) whose stored charges disagree with their own company/cluster/date.']);
+    }
+
+    const clear = !!r.all_clear && !!(ci && ci.all_clear);
     badge.textContent = clear ? '— ✅ all clear' : '— ⚠️ items to review';
     badge.style.color = clear ? '#1a5c3a' : '#c00';
     const w = r.reconciled_window || {};
@@ -7399,6 +7641,23 @@ async function loadMoneyIntegrity() {
             <div style="white-space:nowrap;font-weight:700;color:${ok?'#1a5c3a':'#c00'}">${ok?'✅ CLEAR':'⚠️ ₹'+fmtDec(Math.abs(amt))}</div>
           </div>`;
       }).join('') +
+      ((ci && ci.count) ? `<div style="margin-top:10px;padding:8px 10px;background:#fff5f5;border:1px solid #e0b0b0;border-radius:6px;font-size:.8rem">
+          <b>Charge-plan mismatches</b>
+          ${ci.issues.map(i => `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #f0dede">
+             <b>${i.disb_id}</b> ${i.customer} &nbsp;<span style="color:#666">${i.company} / ${i.cluster}, ${i.date}</span><br>
+             Stamped <b>${i.stamped_plan}</b>, should be <b>${i.expected_plan}</b>${i.expected_label?' ('+i.expected_label+')':''}<br>
+             Stored ₹${fmtDec(i.stored.total)} vs correct ₹${fmtDec(i.expected.total)} &nbsp;
+             <span style="font-weight:700;color:${i.difference<0?'#c00':'#b8860b'}">
+               ${i.difference<0 ? 'over-charged ₹'+fmtDec(-i.difference) : 'under-charged ₹'+fmtDec(i.difference)}</span><br>
+             <span style="font-size:.75rem;color:#666">Fix: open the case in Edit Case and re-save the Cluster/Company — that recomputes it.</span>
+           </div>`).join('')}
+        </div>` : '') +
+      ((ci && ci.plans) ? `<div style="margin-top:10px;font-size:.76rem;color:#666">
+          <b>Charge plans in force:</b> ${ci.plans.map(p =>
+            `${p.label} (${Object.entries(p.match||{}).map(([k,v])=>k+'='+v).join(', ')}${p.from?', from '+p.from:''})`
+          ).join(' &nbsp;·&nbsp; ') || 'flat 0.5% + GST only'}
+          <br>Everything else: flat 0.5% + 18% GST. Add a counterparty rate in the Config sheet's <code>charge_plans</code> — no code change needed.
+        </div>` : '') +
       `<div style="margin-top:8px;font-size:.78rem;color:#888">Bank data verified ${w.from||'—'} to ${w.to||'—'}. Activity before that date is not covered.</div>
        <button class="btn" style="width:auto;padding:8px 16px;margin-top:10px;background:#2d5986;color:#fff" onclick="viewReport('integrity')">👁 View full report</button>
        <button class="btn btn-save" style="width:auto;padding:8px 16px;margin-top:10px;margin-left:8px" onclick="downloadReport('integrity')">⬇ Download</button>`;
@@ -8993,6 +9252,13 @@ def api_solvency_check():
         return jsonify(_solvency_check())
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.route('/charge-integrity')
+def api_charge_integrity():
+    try:
+        return jsonify({'ok': True, **_charge_integrity_check()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/money-integrity', methods=['GET'])
 def api_money_integrity():
