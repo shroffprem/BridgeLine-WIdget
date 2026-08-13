@@ -31,6 +31,16 @@ CONFIRMED_CLOSED  = []
 EXCLUDED_CLUSTERS = ['Mandya']
 TODAY             = datetime.date.today()
 ROI_TARGET_PCT    = 4.0
+# Prem's explicit standard, 06-08-2026: "TAT should ideally not exceed T+1"
+# -- collected same day or the day after disbursement. Matches the exact
+# days_late=0 boundary calc_charges() already uses for BIB HDB Karnataka's
+# day-based schedule ((collection - disbursement).days - 1, floored at 0)
+# -- same T+1 concept, generalized here as a reporting/quality target across
+# every cluster, not just BIB HDB's charge escalation. Supersedes the old
+# ad-hoc 1.5-day red-flag threshold previously used inconsistently across
+# draw_cluster_analytics()/draw_monthly_dashboard() — now all TAT displays
+# in this file use this one canonical number via _tat_cell() below.
+TAT_TARGET_DAYS   = 1.0
 COLLECTION_CARD_THRESHOLD = 100000   # Collection Card generated if disbursed amount OR outstanding balance is below this
 
 # --- DESIGN TOKENS -----------------------------------------------------------
@@ -202,13 +212,20 @@ def extract_utr(raw):
     m = re.search(r'HDFC[A-Z0-9]+', str(raw))
     return m.group(0) if m else str(raw).strip()[:40]
 
-def charge_rate_label(tat):
-    try: t = float(str(tat).split()[0])
-    except: return '0.50%'
-    if t <= 2:   return '0.50%'
-    elif t == 3: return '1.00%'
-    elif t == 4: return '1.50%'
-    else:        return f'{0.5 * t:.2f}%'
+def charge_rate_display(case):
+    """Replaces the retired TAT-tiered charge_rate_label(tat) — the TAT
+    schedule never actually applied for any cluster (real charges have
+    always just been flat 0.5%+GST). BIB HDB Karnataka cases on the new
+    day-based schedule (charge_plan=='NEW') show their actual computed rate
+    instead, since it varies with collection timing — derived straight from
+    the stored Charges/GST/Amount (never recalculated here), tagged
+    provisional until the case actually closes."""
+    if case.get('charge_plan') == 'NEW':
+        amount = case.get('amount') or 0
+        rate = (case['charges'] + case['gst']) / amount * 100 if amount else 0.0
+        tag = '(Final)' if case.get('status') == 'Closed' else '(Prov.)'
+        return f'{rate:.2f}% {tag}'
+    return '0.50% + GST'
 
 def status_color(status):
     if status == 'Closed':     return C_GREEN
@@ -258,18 +275,35 @@ def load_mcoll(wb):
 # --- CONTACT LOADING ---------------------------------------------------------
 def load_contacts(wb):
     """
-    Parse Contact sheet -> (cluster_mgrs, branch_contacts).
-    cluster_mgrs    = { 'Mysore': {'name': '...', 'phone': '...'}, ... }
-    branch_contacts = { ('Mysore', 'KUVEMPU NAGAR'): {'name': '...', 'phone': '...'}, ... }
+    Parse Contact sheet -> (cluster_mgrs, branch_contacts, area_mgrs, territory_to_area).
+    cluster_mgrs      = { 'Mysore': {'name': '...', 'phone': '...'}, ... }
+    branch_contacts   = { ('Mysore', 'KUVEMPU NAGAR'): {'name': '...', 'phone': '...'}, ... }
+    area_mgrs         = { ('BIB HDB Karnataka', 'BENGALURU-1'): {'name': '...', 'phone': '...'}, ... }
+    territory_to_area = { ('BIB HDB Karnataka', 'MANDYA'): 'Bengaluru-1', ... }
+
+    area_mgrs/territory_to_area are only ever non-empty for clusters that
+    actually carry "Area Manager"/"Territory Manager" designations in the
+    Contact sheet (currently just BIB HDB Karnataka) — every other cluster
+    keeps today's plain branch_contacts/cluster_mgrs 2-tier resolution
+    untouched, since find_branch_contact() only ever consults the two new
+    dicts once it's already matched a Territory Manager entry.
     """
     import re as _re
     if 'Contact' not in wb.sheetnames:
-        return {}, {}
+        return {}, {}, {}, {}
     ws = wb['Contact']
     CLUSTER_ALIASES = {
         'MYSORE': 'Mysore', 'MANAGLORE': 'Mangalore', 'MANGALORE': 'Mangalore',
         'HASSAN': 'Hassan', 'BELLARY': 'Bellary', 'HUBLI': 'Hubli',
         'MANGALORE SAL': 'Mangalore Sal',
+        # The Contact sheet's rows for this cluster were entered in
+        # ALL-CAPS, but every real disbursement's Cluster value comes from
+        # the widget's own CLUSTERS dropdown, spelled "BIB HDB Karnataka" —
+        # without this alias, cluster_mgrs/branch_contacts/area_mgrs would
+        # silently never match a single real case (dict keys are
+        # case-sensitive), the same gap this alias table already exists to
+        # paper over for every other cluster's spelling variants.
+        'BIB HDB KARNATAKA': 'BIB HDB Karnataka',
     }
     def _fmt_phone(p):
         s = str(int(p)) if isinstance(p, float) else str(p)
@@ -279,8 +313,10 @@ def load_contacts(wb):
     def _cell(row, i):
         return row[i] if i < len(row) else None
 
-    cluster_mgrs    = {}
-    branch_contacts = {}
+    cluster_mgrs      = {}
+    branch_contacts   = {}
+    area_mgrs         = {}
+    territory_to_area = {}
     rows = list(ws.iter_rows(min_row=1, values_only=True))
     header = [str(c).strip().upper() if c else '' for c in (rows[0] if rows else [])]
     new_format = len(header) >= 2 and header[0] == 'CLUSTER' and header[1] == 'NAME'
@@ -299,13 +335,29 @@ def load_contacts(wb):
             desig  = str(_cell(row, 2)).strip() if _cell(row, 2) else ''
             branch = str(_cell(row, 3)).strip() if _cell(row, 3) else ''
             phone  = _cell(row, 4)
+            extra  = str(_cell(row, 5)).strip() if _cell(row, 5) else ''
             if cluster_raw:
                 current_cluster = cluster_raw
             if not current_cluster or not name or not phone: continue
             cluster = CLUSTER_ALIASES.get(current_cluster.upper(), current_cluster)
             ph = _fmt_phone(phone)
-            if 'CLUSTER MANAGER' in desig.upper():
+            desig_up = desig.upper()
+            if 'CLUSTER MANAGER' in desig_up:
                 cluster_mgrs[cluster] = {'name': name.title(), 'phone': ph}
+            elif 'AREA MANAGER' in desig_up and branch:
+                # Branch holds the AREA name here (e.g. "Bengaluru-1"), not a
+                # real branch/territory — kept in its own dict so it's never
+                # mistaken for a normal branch_contacts entry (an Area
+                # Manager isn't who to call about one specific case).
+                area_mgrs[(cluster, branch.upper())] = {'name': name.title(), 'phone': ph}
+            elif 'TERRITORY MANAGER' in desig_up and branch:
+                branch_contacts[(cluster, branch.upper())] = {'name': name.title(), 'phone': ph}
+                # The 6th column carries which Area this territory reports
+                # to. There's no dedicated header for it — the sheet reuses
+                # the Email column's position, since these rows never have a
+                # real email. Only meaningful for Territory Manager rows.
+                if extra:
+                    territory_to_area[(cluster, branch.upper())] = extra
             elif branch:
                 branch_contacts[(cluster, branch.upper())] = {'name': name.title(), 'phone': ph}
     else:
@@ -328,7 +380,7 @@ def load_contacts(wb):
                 cluster_mgrs[current_cluster] = {'name': name.title(), 'phone': ph}
             elif branch:
                 branch_contacts[(current_cluster, branch.upper())] = {'name': name.title(), 'phone': ph}
-    return cluster_mgrs, branch_contacts
+    return cluster_mgrs, branch_contacts, area_mgrs, territory_to_area
 
 # --- CAPITAL LOG LOADING ------------------------------------------------------
 # TYPE -> sign for computing net capital from signed entries. RECYCLE is
@@ -430,36 +482,71 @@ def load_capital_log(wb):
     entries.sort(key=lambda e: e['date'])
     return {'available': True, 'entries': entries, 'net_capital': round(net_capital, 2)}
 
-def find_branch_contact(cluster, branch, branch_contacts, cluster_mgrs):
-    """Match branch name; fall back to cluster manager (returns info, is_fallback).
+def find_branch_contact(cluster, branch, branch_contacts, cluster_mgrs,
+                         area_mgrs=None, territory_to_area=None):
+    """Match branch/territory name; fall back to cluster manager if
+    unmatched. Returns (info, is_fallback, escalation) where escalation is a
+    list of (label, info) backup contacts to try if the primary doesn't pick
+    up — e.g. [('Area Mgr', {...}), ('Cluster Mgr', {...})].
 
-    Match order: (1) exact, (2) word-overlap, (3) fuzzy spelling match
-    (handles Contact-sheet typos like 'Valancia'/'Valencia', 'Shimogga'/'Shimoga'
-    that would otherwise silently fall back to the cluster manager), (4) cluster
-    manager fallback.
+    Match order for the primary contact: (1) exact, (2) word-overlap, (3)
+    fuzzy spelling match (handles Contact-sheet typos like
+    'Valancia'/'Valencia', 'Shimogga'/'Shimoga' that would otherwise silently
+    fall back to the cluster manager), (4) cluster manager fallback.
+
+    escalation is only ever non-empty when a real match was found (tier 1-3)
+    AND this cluster has Area Managers on file — driven entirely by whether
+    area_mgrs/territory_to_area have entries for this cluster, never
+    hardcoded to a specific cluster name, so it extends automatically if
+    another cluster ever gets the same Area-Manager structure. Every other
+    cluster gets exactly today's behavior: a single resolved contact, empty
+    escalation list. When no real match is found at all, there's nothing to
+    escalate from, so escalation stays empty even for this cluster.
     """
+    area_mgrs = area_mgrs or {}
+    territory_to_area = territory_to_area or {}
+
+    def _escalation(matched_key):
+        # Gated entirely on this matched territory having a real Area
+        # mapping -- NOT on cluster_mgrs.get(cluster) alone, which every
+        # cluster has. Without this gate, every cluster with a Cluster
+        # Manager on file (i.e. all of them) would suddenly grow a new
+        # "Cluster Mgr" fallback line, breaking the byte-for-byte-unchanged
+        # guarantee for clusters that never had an Area-Manager tier.
+        area_name = territory_to_area.get(matched_key)
+        if not area_name:
+            return []
+        chain = []
+        mgr = area_mgrs.get((cluster, area_name.upper()))
+        if mgr:
+            chain.append(('Area Mgr', mgr))
+        cmgr = cluster_mgrs.get(cluster)
+        if cmgr:
+            chain.append(('Cluster Mgr', cmgr))
+        return chain
+
     branch_up = branch.upper()
     key = (cluster, branch_up)
     if key in branch_contacts:
-        return branch_contacts[key], False
+        return branch_contacts[key], False, _escalation(key)
     branch_words = set(branch_up.split())
     for (cl, br), info in branch_contacts.items():
         if cl != cluster: continue
         if branch_words & set(br.split()):
-            return info, False
+            return info, False, _escalation((cl, br))
     # Fuzzy fallback: catch near-identical spellings within the same cluster
     # before giving up to the cluster manager.
-    best_ratio, best_info = 0.0, None
+    best_ratio, best_info, best_key = 0.0, None, None
     for (cl, br), info in branch_contacts.items():
         if cl != cluster: continue
         ratio = difflib.SequenceMatcher(None, branch_up, br).ratio()
         if ratio > best_ratio:
-            best_ratio, best_info = ratio, info
+            best_ratio, best_info, best_key = ratio, info, (cl, br)
     if best_info is not None and best_ratio >= 0.8:
-        return best_info, False
+        return best_info, False, _escalation(best_key)
     mgr = cluster_mgrs.get(cluster)
-    if mgr: return mgr, True
-    return {'name': '-', 'phone': '-'}, True
+    if mgr: return mgr, True, []
+    return {'name': '-', 'phone': '-'}, True, []
 
 # --- DATA LOADING ------------------------------------------------------------
 def find_accounts_header_row(ws):
@@ -480,9 +567,9 @@ def load_data(path):
     header_row = find_accounts_header_row(ws)
     rows = []
     for raw in ws.iter_rows(min_row=header_row + 1, values_only=True):
-        # Read 22 cols — col A(0) through col V(21) to capture debit note
-        row = list(raw[:22])
-        row += [None] * (22 - len(row))
+        # Read 26 cols — col A(0) through col Z(25) to capture bank_account/charge_plan
+        row = list(raw[:26])
+        row += [None] * (26 - len(row))
         if not row[0] or str(row[0]).strip() == '': continue
         rows.append(row)
     # Read DashBoard for Total Invested only — all other metrics computed from raw data
@@ -519,7 +606,14 @@ def parse_cases(rows, mcoll=None):
         balance_raw = float(row[14]) if row[14] not in (None, '') else 0  # col O — mixed sign convention
         tat_raw    = row[15]
         status     = str(row[18]).strip() if row[18] else ''
-        debit_note = extract_utr(row[21])  # col V — len guaranteed 22 by load_data
+        debit_note = extract_utr(row[21])  # col V — len guaranteed 26 by load_data
+        charge_plan = str(row[25]).strip() if row[25] else ''  # col Z — 'NEW' or blank (blank = old flat 0.5%+GST)
+        # cols AA/AB — only present when rows come from _load_for_invoice()
+        # (28 cols wide); the other loaders (load_data/load_data_from_sheet)
+        # still pad to 26, so these stay blank there rather than raising
+        # IndexError.
+        kyc_folder = str(row[26]).strip() if len(row) > 26 and row[26] else ''
+        request_id = str(row[27]).strip() if len(row) > 27 and row[27] else ''
 
         # Balance: M Coll cases use total(col K) − total_collected (exact, can be negative).
         # Non-M Coll cases use abs(col O) per existing mixed-sign convention.
@@ -551,7 +645,8 @@ def parse_cases(rows, mcoll=None):
             'coll_amt': coll_amt, 'discount': discount,
             'balance': balance_display, 'balance_raw': balance_raw,
             'tat': tat_num, 'tat_raw': tat_raw, 'days_out': days_out,
-            'status': status, 'debit_note': debit_note,
+            'status': status, 'debit_note': debit_note, 'charge_plan': charge_plan,
+            'request_id': request_id, 'kyc_folder': kyc_folder,
         })
 
     # all_cases_full: every cluster including Mandya — used ONLY for consolidated dashboard totals
@@ -883,7 +978,7 @@ def draw_open_cases_table(pdf, open_cases, cluster_filter=None):
         row_vals = [
             str(idx + 1), fmt_date(c['date']), c['customer'], c['cluster'], c['branch'],
             'Rs ' + inr(c['amount']), 'Rs ' + inr(c['charges']), 'Rs ' + inr(c['gst']),
-            'Rs ' + inr(c['balance']), str(c['days_out']), charge_rate_label(c['tat']), c['status'],
+            'Rs ' + inr(c['balance']), str(c['days_out']), charge_rate_display(c), c['status'],
         ]
         xc = x0
         for (col, w, align), val in zip(OPEN_COLS, row_vals):
@@ -909,7 +1004,12 @@ def draw_open_cases_table(pdf, open_cases, cluster_filter=None):
     pdf.set_xy(x0, pdf.get_y() + 1)
     pdf.set_font('Helvetica', 'I', 6)
     pdf.set_text_color(*C_TEXT_MED)
-    pdf.cell(total_w, 4, '* Charges fixed at disbursement per BLP/CIR/001/2026-27. Not recalculated daily.', border=0, ln=False)
+    if any(c.get('charge_plan') == 'NEW' for c in cases):
+        footnote = ('* Charges are 0.50%+GST (fixed at disbursement), except BIB HDB Karnataka '
+                    'cases on the day-based schedule (Prov. until closed) - see RATE column.')
+    else:
+        footnote = '* Charges fixed at disbursement: 0.50% + 18% GST on all charges.'
+    pdf.cell(total_w, 4, footnote, border=0, ln=False)
     pdf.set_text_color(*C_TEXT_DARK)
     pdf.set_y(pdf.get_y() + 5)
 
@@ -978,6 +1078,38 @@ def draw_cluster_summary(pdf, open_cases):
     pdf.set_y(y + rh + 4)
     pdf.set_text_color(*C_TEXT_DARK)
 
+def _tat_cell(avg_tat):
+    """(display_text, is_over_target) for an average-TAT figure, against
+    TAT_TARGET_DAYS (T+1). Shows the discrepancy inline — e.g. '3.0d
+    (+2.0d)' — rather than just the raw average, per Prem's explicit
+    instruction (06-08-2026), so a report reader sees the gap from target
+    without doing the subtraction themselves. Epsilon avoids flagging
+    rounding noise right at the boundary (e.g. 1.02d) as 'over target'."""
+    if avg_tat is None:
+        return '-', False
+    over = avg_tat - TAT_TARGET_DAYS
+    if over > 0.05:
+        return f"{avg_tat:.1f}d (+{over:.1f}d)", True
+    return f"{avg_tat:.1f}d", False
+
+def _case_period_stats(cases):
+    """Cases -> {cases, volume, closed, close_rate, avg_tat} — shared by
+    every MTD/YTD/branch breakdown in this file (cluster-level, branch-
+    level) so 'closed' and 'avg TAT' can never be defined two different
+    ways in two different reports. 'closed' = status == 'Closed' exactly
+    (see draw_monthly_dashboard()'s note: authoritative since 22-Jun-2026,
+    not a balance<1 proxy). avg_tat is None (not 0) when there's no closed
+    case yet in the period — a real 'no data' state, never conflated with
+    a genuinely fast TAT of 0 days."""
+    n = len(cases)
+    volume = sum(c['amount'] for c in cases)
+    closed = [c for c in cases if c['status'] == 'Closed']
+    close_rate = (len(closed) / n * 100) if n else 0.0
+    tats = [c['tat'] for c in closed if c['tat'] >= 0]
+    avg_tat = (sum(tats) / len(tats)) if tats else None
+    return {'cases': n, 'volume': volume, 'closed': len(closed),
+            'close_rate': close_rate, 'avg_tat': avg_tat}
+
 # --- CLUSTER ANALYTICS -------------------------------------------------------
 def draw_cluster_analytics(pdf, all_cases, metrics):
     import calendar as _cal
@@ -1005,9 +1137,9 @@ def draw_cluster_analytics(pdf, all_cases, metrics):
 
     x0, rh = L_MAR, 7
     cols = [
-        ('RANK', 10, 'C'), ('CLUSTER', 30, 'L'), ('CASES', 14, 'C'),
-        ('CLOSED', 14, 'C'), ('VOLUME', 32, 'R'), ('CHARGES', 28, 'R'),
-        ('AVG TAT', 18, 'C'), ('ROI %', 18, 'C'),
+        ('RANK', 10, 'C'), ('CLUSTER', 26, 'L'), ('CASES', 12, 'C'),
+        ('CLOSED', 12, 'C'), ('VOLUME', 30, 'R'), ('CHARGES', 26, 'R'),
+        ('AVG TAT', 28, 'C'), ('ROI %', 16, 'C'),
     ]
     total_w = sum(c[1] for c in cols)
 
@@ -1028,14 +1160,15 @@ def draw_cluster_analytics(pdf, all_cases, metrics):
         if rank % 2 == 0: pdf.set_fill_color(*C_LT_GOLD)
         else:             pdf.set_fill_color(*C_WHITE)
         pdf.rect(x0, y, total_w, rh, 'F')
-        tat_str  = f"{r['avg_tat']:.1f}" if r['avg_tat'] is not None else '-'
-        tat_fail = r['avg_tat'] is not None and r['avg_tat'] > 1.5
+        tat_str, tat_fail = _tat_cell(r['avg_tat'])
         vals = [f"#{rank}", r['cl'], str(r['cases']), str(r['closed']),
                 'Rs ' + inr(r['vol']), 'Rs ' + inr(r['chg']), tat_str, f"{r['roi']:.3f}%"]
         xc = x0
         for (col, w, align), val in zip(cols, vals):
             if col == 'AVG TAT' and tat_fail:
-                pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_RED)
+                pdf.set_font('Helvetica', 'B', 6.5); pdf.set_text_color(*C_RED)
+            elif col == 'AVG TAT':
+                pdf.set_font('Helvetica', '', 7); pdf.set_text_color(*C_TEXT_DARK)
             elif col == 'ROI %':
                 pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_PRI_NAVY)
             else:
@@ -1231,7 +1364,7 @@ def draw_monthly_dashboard(pdf, all_cases_full, metrics):
         ('MONTH',       22, 'L'), ('CASES',       12, 'C'), ('VOLUME',      28, 'R'),
         ('CHARGES',     24, 'R'), ('GST',         18, 'R'), ('TOTAL BILLED',24, 'R'),
         ('COLLECTED',   24, 'R'), ('OUTSTANDING', 24, 'R'), ('CLOSED',      13, 'C'),
-        ('OPEN',        10, 'C'), ('AVG TAT',     15, 'C'), ('ROI %',       14, 'C'),
+        ('OPEN',        10, 'C'), ('AVG TAT',     24, 'C'), ('ROI %',       14, 'C'),
     ]
     scale   = pw / sum(c[1] for c in cols)
     cols    = [(l, w * scale, a) for l, w, a in cols]
@@ -1258,8 +1391,7 @@ def draw_monthly_dashboard(pdf, all_cases_full, metrics):
         if is_cur:
             pdf.set_fill_color(*C_GOLD_RULE); pdf.rect(x0, y, 1.2, rh, 'F')
 
-        tat_str  = f"{r['avg_tat']:.1f}" if r['avg_tat'] is not None else '-'
-        tat_fail = r['avg_tat'] is not None and r['avg_tat'] > 1.5
+        tat_str, tat_fail = _tat_cell(r['avg_tat'])
         row_vals = [
             r['label'], str(r['cases']), 'Rs ' + inr(r['volume']), 'Rs ' + inr(r['charges']),
             'Rs ' + inr(r['gst']), 'Rs ' + inr(r['billed']), 'Rs ' + inr(r['collected']),
@@ -1304,7 +1436,7 @@ def draw_monthly_dashboard(pdf, all_cases_full, metrics):
     pdf.set_y(y + rh + 2)
     pdf.set_xy(x0, pdf.get_y()); pdf.set_font('Helvetica', 'I', 6); pdf.set_text_color(*C_TEXT_MED)
     pdf.cell(total_w, 4,
-             'Highlighted = current month  |  TAT red = avg > 1.5d  |  Outstanding red = pending  |  Includes all clusters incl. Mandya',
+             'Highlighted = current month  |  TAT red = over T+1 target (parenthetical = days over)  |  Outstanding red = pending  |  Includes all clusters incl. Mandya',
              border=0, ln=False)
     pdf.set_text_color(*C_TEXT_DARK); pdf.set_y(pdf.get_y() + 5)
 
@@ -1484,8 +1616,8 @@ def draw_guidelines(pdf):
     pdf.section_title('Mandatory Guidelines')
     lines = [
         '1. All refunds must originate from the SAME account as disbursement (BLP/CIR/002/2026-27). Violation is taxable under S.68 IT Act.',
-        '2. Service charges are computed at disbursement and stored in sheet. Do NOT recalculate on collection day (BLP/CIR/001/2026-27).',
-        '3. Close cases within TAT target. TAT directly impacts charge rate - longer TAT means higher charges per BLP/CIR/001/2026-27.',
+        '2. Service charges are fixed at disbursement (0.50% + GST) and stored in sheet, except BIB HDB Karnataka\'s day-based schedule, which finalizes only at closing (BLP/CIR/001/2026-27).',
+        '3. BIB HDB Karnataka: close cases promptly - each day past next-day-EOD adds 0.20% to the charge rate, uncapped. Other clusters are flat-rate regardless of timing.',
         '4. GST @ 18% applies on all charges from 01-Apr-2026 onwards.',
         '5. Disbursements must be submitted before EOD for same-day processing priority.',
     ]
@@ -1527,7 +1659,8 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
     pdf.cell(pwi * 0.5, 6, 'INVOICE AND LEDGER', align='C', border=0, ln=False)
     pdf.set_font('Helvetica', 'B', 8.5)
     pdf.set_text_color(*C_GOLD_LBL)
-    pdf.cell(pwi * 0.5, 6, f'Ref: {case["id"]}   |   Date: {fmt_date(case["date"])}', align='R', border=0, ln=False)
+    req_id_display = case.get('request_id') or '-'
+    pdf.cell(pwi * 0.5, 6, f'Ref: {case["id"]}   |   Req: {req_id_display}   |   Date: {fmt_date(case["date"])}', align='R', border=0, ln=False)
     y += 11
 
     # --- Stat bar: 3 accent cells + 1 headline cell (balance / paid in full) ---
@@ -1536,7 +1669,7 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
     cells = [
         ('STATUS', case['status']),
         ('DAYS OUTSTANDING', str(case['days_out'])),
-        ('CHARGE RATE', charge_rate_label(case['tat'])),
+        ('CHARGE RATE', charge_rate_display(case)),
     ]
     cw = pwi * 0.22
     total_w = pwi - 3 * cw
@@ -1623,11 +1756,20 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
     running_bal += case['amount']
     ledger_rows.append((fmt_date(case['date']), 'Loan Disbursed', case['amount'], 0.0, running_bal))
 
-    running_bal += case['charges']
-    ledger_rows.append((fmt_date(case['date']), 'Service Charges', case['charges'], 0.0, running_bal))
+    if case.get('charge_plan') == 'NEW':
+        # BIB HDB Karnataka's day-based schedule is GST-inclusive and their own
+        # disbursement memo shows only one "Charges" figure, no separate GST
+        # line (per the methodology's own terms) — one combined row here
+        # reconstructs that inclusive total exactly, since calc_charges()
+        # always derives GST as the precise remainder of the rounded total.
+        running_bal += case['charges'] + case['gst']
+        ledger_rows.append((fmt_date(case['date']), 'Charges (incl. GST)', case['charges'] + case['gst'], 0.0, running_bal))
+    else:
+        running_bal += case['charges']
+        ledger_rows.append((fmt_date(case['date']), 'Service Charges', case['charges'], 0.0, running_bal))
 
-    running_bal += case['gst']
-    ledger_rows.append((fmt_date(case['date']), 'GST on Service Charges (18%)', case['gst'], 0.0, running_bal))
+        running_bal += case['gst']
+        ledger_rows.append((fmt_date(case['date']), 'GST on Service Charges (18%)', case['gst'], 0.0, running_bal))
 
     if case.get('discount') and case['discount'] != 0:
         disc_abs = abs(case['discount'])
@@ -1685,7 +1827,8 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
         xc += w
     y += rh_l + 1 + 6
 
-    # --- TAT charge policy note ---
+    # --- Charge policy note ---
+    is_new_methodology = case.get('charge_plan') == 'NEW'
     note_h = 18
     pdf.set_fill_color(*C_MEMO_CREAM)
     pdf.set_draw_color(*C_GOLD_RULE)
@@ -1693,13 +1836,22 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
     pdf.set_fill_color(*C_GOLD_RULE); pdf.rect(x0, y, 1.5, note_h, 'F')
     pdf.set_xy(x0 + 4, y + 2)
     pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_PRI_NAVY)
-    pdf.cell(0, 4, 'TAT Charge Policy (BLP/CIR/001/2026-27)', border=0, ln=False)
+    if is_new_methodology:
+        pdf.cell(0, 4, 'BIB HDB Karnataka Charge Policy (Day-Based)', border=0, ln=False)
+    else:
+        pdf.cell(0, 4, 'Charge Policy (BLP/CIR/001/2026-27)', border=0, ln=False)
     pdf.set_xy(x0 + 4, y + 7)
     pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_TEXT_DARK)
-    pdf.cell(0, 4, '<=2d: 0.50%  |  3d: 1.00%  |  4d: 1.50%  |  5d+: 0.50% x days  |  GST 18% on all charges', border=0, ln=False)
+    if is_new_methodology:
+        pdf.cell(0, 4, '0.40% incl. GST if collected by EOD of day after disbursement  |  +0.20% incl. GST per additional day late, uncapped', border=0, ln=False)
+    else:
+        pdf.cell(0, 4, 'Flat rate: 0.50% + 18% GST on all charges', border=0, ln=False)
     pdf.set_xy(x0 + 4, y + 12)
     pdf.set_font('Helvetica', 'BI', 6.5); pdf.set_text_color(*C_TEXT_MED)
-    pdf.cell(0, 4, 'Charges fixed at disbursement. Refunds must be from same disbursing account (BLP/CIR/002/2026-27).', border=0, ln=False)
+    if is_new_methodology:
+        pdf.cell(0, 4, 'Charges are PROVISIONAL until collection, finalized at closing. Refunds must be from same disbursing account (BLP/CIR/002/2026-27).', border=0, ln=False)
+    else:
+        pdf.cell(0, 4, 'Charges fixed at disbursement. Refunds must be from same disbursing account (BLP/CIR/002/2026-27).', border=0, ln=False)
     y += note_h + 8
 
     # --- Signatures ---
@@ -1780,7 +1932,8 @@ def generate_invoice_ledger(case, mcoll_entry=None, paid_in_full=False):
     return pdf.output()
 
 # --- COLLECTION CARD (per case, disbursed amount OR outstanding balance < COLLECTION_CARD_THRESHOLD) ---
-def generate_collection_card(case, branch_contacts, cluster_mgrs):
+def generate_collection_card(case, branch_contacts, cluster_mgrs,
+                              area_mgrs=None, territory_to_area=None):
     pdf = BLPdf(subtitle='COLLECTION CARD', report_date=fmt_date(TODAY))
     pdf.add_page()
 
@@ -1953,19 +2106,31 @@ def generate_collection_card(case, branch_contacts, cluster_mgrs):
     y += qr_h + 6
 
     # --- Branch contact note ---
-    contact, fallback = find_branch_contact(case['cluster'], case['branch'], branch_contacts, cluster_mgrs)
-    note_h = 16
+    contact, fallback, escalation = find_branch_contact(
+        case['cluster'], case['branch'], branch_contacts, cluster_mgrs,
+        area_mgrs, territory_to_area)
+    # Box only grows for clusters with an escalation chain on file (BIB HDB
+    # Karnataka today) -- every other cluster renders byte-for-byte as
+    # before, since escalation is always [] for them.
+    esc_line_h = 4.5
+    note_h = 16 if not escalation else 13 + len(escalation) * esc_line_h + 3
     pdf.set_fill_color(*C_MEMO_CREAM)
     pdf.set_draw_color(*C_GOLD_RULE)
     pdf.rect(x0, y, pwi, note_h, 'FD')
     pdf.set_fill_color(*C_GOLD_RULE); pdf.rect(x0, y, 1.5, note_h, 'F')
     pdf.set_xy(x0 + 4, y + 2)
     pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_PRI_NAVY)
-    pdf.cell(0, 4, 'BRANCH CONTACT FOR FOLLOW-UP', border=0, ln=False)
+    title = 'BRANCH CONTACT FOR FOLLOW-UP' + (' (1ST CALL)' if escalation else '')
+    pdf.cell(0, 4, title, border=0, ln=False)
     contact_line = f'{contact["name"]}{"  (cluster mgr fallback)" if fallback else ""}   |   {contact["phone"]}'
     pdf.set_xy(x0 + 4, y + 7.5)
     pdf.set_font('Helvetica', 'B', 9.5); pdf.set_text_color(*C_TEXT_DARK)
     pdf.cell(0, 4, contact_line, border=0, ln=False)
+    for i, (label, info) in enumerate(escalation):
+        pdf.set_xy(x0 + 4, y + 13 + i * esc_line_h)
+        pdf.set_font('Helvetica', 'B', 7.5); pdf.set_text_color(*C_TEXT_MED)
+        pdf.cell(0, 4, f'{label} (fallback): {info["name"]}   |   {info["phone"]}', border=0, ln=False)
+    pdf.set_text_color(*C_TEXT_DARK)
     y += note_h + 6
 
     # --- Signature ---
@@ -2017,7 +2182,8 @@ class FollowUpPDF(BLPdf):
     # inner_w, section_title — all inherited unchanged from BLPdf
 
 
-def generate_calling_followup_pdf(open_cases, cluster_mgrs, branch_contacts):
+def generate_calling_followup_pdf(open_cases, cluster_mgrs, branch_contacts,
+                                   area_mgrs=None, territory_to_area=None):
     """
     Calling follow-up sheet on BridgeLine letterhead (landscape A4).
     Groups open cases by cluster, sorted by days outstanding descending.
@@ -2108,8 +2274,9 @@ def generate_calling_followup_pdf(open_cases, cluster_mgrs, branch_contacts):
         _table_header()
 
         for idx, c in enumerate(cl_cases):
-            contact, fallback = find_branch_contact(
-                cluster, c['branch'], branch_contacts, cluster_mgrs
+            contact, fallback, _escalation = find_branch_contact(
+                cluster, c['branch'], branch_contacts, cluster_mgrs,
+                area_mgrs, territory_to_area
             )
             if fallback:
                 any_fallback = True
@@ -2233,8 +2400,9 @@ def generate_calling_followup_pdf(open_cases, cluster_mgrs, branch_contacts):
         _extreme_table_header()
 
         for idx, c in enumerate(extreme_cases):
-            contact, fallback = find_branch_contact(
-                c['cluster'], c['branch'], branch_contacts, cluster_mgrs
+            contact, fallback, _escalation = find_branch_contact(
+                c['cluster'], c['branch'], branch_contacts, cluster_mgrs,
+                area_mgrs, territory_to_area
             )
             if fallback:
                 any_fallback = True
@@ -2352,12 +2520,165 @@ def generate_consolidated_mis(open_cases, all_cases, all_cases_full, metrics):
     return pdf.output()
 
 # --- CLUSTER MIS PDF ---------------------------------------------------------
+def draw_cluster_period_strip(pdf, cluster, all_cases):
+    """MTD + YTD operational reference for the cluster manager's own copy —
+    deliberately excludes Charges/GST/ROI (revenue figures, kept out of the
+    per-cluster PDF per Prem's instruction, 06-08-2026) and shows only
+    volume, close rate, and TAT. Reuses the exact same period-bucketing and
+    'closed'/'tat' conventions as draw_mtd_ytd_report() (MTD = disbursed
+    this calendar month) and draw_cluster_analytics() (TAT = avg of the
+    'tat' field, closed cases only, FY-to-date for YTD) so this can never
+    silently drift from what the consolidated report already shows —
+    same source data, just scoped to one cluster and a narrower column set.
+    """
+    fy_start = datetime.date(TODAY.year if TODAY.month >= 4 else TODAY.year - 1, 4, 1)
+    fy_label = f'FY {fy_start.year}-{str(fy_start.year + 1)[2:]}'
+    cluster_cases = [c for c in all_cases if c['cluster'] == cluster]
+
+    mtd_cases = [c for c in cluster_cases if isinstance(c['date'], datetime.date)
+                 and c['date'].year == TODAY.year and c['date'].month == TODAY.month]
+    ytd_cases = [c for c in cluster_cases if isinstance(c['date'], datetime.date)
+                 and c['date'] >= fy_start]
+    periods = [(f'MTD ({TODAY.strftime("%b %Y")})', _case_period_stats(mtd_cases)),
+               (f'YTD ({fy_label})', _case_period_stats(ytd_cases))]
+
+    pdf.section_title(f'{cluster} Performance - MTD / YTD (Operational)')
+    x0, rh = L_MAR, 7
+    cols = [
+        ('PERIOD', 30, 'L'), ('CASES', 14, 'C'), ('VOLUME', 30, 'R'),
+        ('CLOSE RATE', 20, 'C'), ('AVG TAT', 28, 'C'),
+    ]
+    scale = pdf.inner_w() / sum(c[1] for c in cols)
+    cols = [(l, w * scale, a) for l, w, a in cols]
+    total_w = sum(c[1] for c in cols)
+
+    hdr_y = pdf.get_y()
+    pdf.set_fill_color(*C_PRI_NAVY)
+    pdf.rect(x0, hdr_y, total_w, rh, 'F')
+    xc = x0
+    for col, w, align in cols:
+        pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_WHITE)
+        pdf.set_xy(xc, hdr_y + 1.5); pdf.cell(w, rh - 3, col, align=align, border=0, ln=False)
+        xc += w
+    pdf.set_y(hdr_y + rh)
+
+    for idx, (label, s) in enumerate(periods):
+        y = pdf.get_y()
+        pdf.set_fill_color(*(C_LT_GOLD if idx % 2 == 0 else C_WHITE))
+        pdf.rect(x0, y, total_w, rh, 'F')
+        tat_str, tat_fail = _tat_cell(s['avg_tat'])
+        vals = [label, str(s['cases']), 'Rs ' + inr(s['volume']),
+                f"{s['close_rate']:.1f}%", tat_str]
+        xc = x0
+        for (col, w, align), val in zip(cols, vals):
+            if col == 'AVG TAT' and tat_fail:
+                pdf.set_font('Helvetica', 'B', 6.5); pdf.set_text_color(*C_RED)
+            elif col == 'PERIOD':
+                pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_PRI_NAVY)
+            else:
+                pdf.set_font('Helvetica', '', 7); pdf.set_text_color(*C_TEXT_DARK)
+            pdf.set_xy(xc, y + 1.5); pdf.cell(w, rh - 3, val, align=align, border=0, ln=False)
+            xc += w
+        pdf.set_y(y + rh)
+
+    pdf.set_fill_color(*C_GOLD_RULE)
+    pdf.rect(x0, pdf.get_y(), total_w, 0.4, 'F')
+    pdf.set_xy(x0, pdf.get_y() + 1.5)
+    pdf.set_font('Helvetica', 'I', 6); pdf.set_text_color(*C_TEXT_MED)
+    pdf.cell(total_w, 4,
+             f'Close Rate = closed / disbursed in period  |  TAT = avg days to close (closed cases only), target T+1  |  FY runs Apr-Mar',
+             border=0, ln=False)
+    pdf.set_text_color(*C_TEXT_DARK); pdf.set_y(pdf.get_y() + 5)
+
+def draw_cluster_branch_table(pdf, cluster, all_cases):
+    """Branch-wise MTD leaderboard within this one cluster — Prem's
+    explicit instruction (06-08-2026): branches see each other's numbers to
+    'induce competition', ranked by TAT specifically ("for me tat is
+    paramount"), best (lowest) TAT first since TAT is a lower-is-better
+    metric — the opposite sort direction from draw_cluster_analytics()'s
+    ROI ranking. Branches with no closed case yet this month have no TAT to
+    rank on (None, not 0 — see _case_period_stats) and sort to the bottom,
+    alphabetically among themselves, rather than being read as failing.
+    MTD only, not MTD+YTD — a leaderboard is inherently about current
+    standing, and this keeps the table's length independent of how many
+    branches a cluster has.
+    """
+    fy_start = datetime.date(TODAY.year if TODAY.month >= 4 else TODAY.year - 1, 4, 1)
+    cluster_cases = [c for c in all_cases if c['cluster'] == cluster]
+    mtd_cases = [c for c in cluster_cases if isinstance(c['date'], datetime.date)
+                 and c['date'].year == TODAY.year and c['date'].month == TODAY.month]
+    if not mtd_cases:
+        return
+
+    by_branch = defaultdict(list)
+    for c in mtd_cases:
+        by_branch[(c.get('branch') or 'Unspecified').strip()].append(c)
+
+    rows = []
+    for branch, cases in by_branch.items():
+        s = _case_period_stats(cases)
+        rows.append({'branch': branch, **s})
+    # TAT ascending (best first); branches with no TAT data go last, A-Z among themselves.
+    rows.sort(key=lambda r: (r['avg_tat'] is None, r['avg_tat'] if r['avg_tat'] is not None else 0, r['branch']))
+    if len(rows) < 2:
+        return  # nothing to compete over with a single branch
+
+    pdf.section_title(f'{cluster} Branch Leaderboard - MTD ({TODAY.strftime("%b %Y")}), ranked by TAT')
+    x0, rh = L_MAR, 7
+    cols = [
+        ('RANK', 10, 'C'), ('BRANCH', 30, 'L'), ('CASES', 14, 'C'),
+        ('VOLUME', 30, 'R'), ('CLOSE RATE', 20, 'C'), ('AVG TAT', 28, 'C'),
+    ]
+    scale = pdf.inner_w() / sum(c[1] for c in cols)
+    cols = [(l, w * scale, a) for l, w, a in cols]
+    total_w = sum(c[1] for c in cols)
+
+    hdr_y = pdf.get_y()
+    pdf.set_fill_color(*C_PRI_NAVY)
+    pdf.rect(x0, hdr_y, total_w, rh, 'F')
+    xc = x0
+    for col, w, align in cols:
+        pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_WHITE)
+        pdf.set_xy(xc, hdr_y + 1.5); pdf.cell(w, rh - 3, col, align=align, border=0, ln=False)
+        xc += w
+    pdf.set_y(hdr_y + rh)
+
+    for rank, r in enumerate(rows, 1):
+        y = pdf.get_y()
+        pdf.set_fill_color(*(C_LT_GOLD if rank % 2 == 0 else C_WHITE))
+        pdf.rect(x0, y, total_w, rh, 'F')
+        tat_str, tat_fail = _tat_cell(r['avg_tat'])
+        vals = [f"#{rank}", r['branch'], str(r['cases']), 'Rs ' + inr(r['volume']),
+                f"{r['close_rate']:.1f}%", tat_str]
+        xc = x0
+        for (col, w, align), val in zip(cols, vals):
+            if col == 'AVG TAT' and tat_fail:
+                pdf.set_font('Helvetica', 'B', 6.5); pdf.set_text_color(*C_RED)
+            elif col == 'RANK' and rank == 1 and r['avg_tat'] is not None:
+                pdf.set_font('Helvetica', 'B', 7); pdf.set_text_color(*C_GREEN)
+            else:
+                pdf.set_font('Helvetica', '', 7); pdf.set_text_color(*C_TEXT_DARK)
+            pdf.set_xy(xc, y + 1.5); pdf.cell(w, rh - 3, val, align=align, border=0, ln=False)
+            xc += w
+        pdf.set_y(y + rh)
+
+    pdf.set_fill_color(*C_GOLD_RULE)
+    pdf.rect(x0, pdf.get_y(), total_w, 0.4, 'F')
+    pdf.set_xy(x0, pdf.get_y() + 1.5)
+    pdf.set_font('Helvetica', 'I', 6); pdf.set_text_color(*C_TEXT_MED)
+    pdf.cell(total_w, 4,
+             'Ranked by AVG TAT (lowest first) - target T+1  |  No-TAT branches (no closed case yet this month) rank last, A-Z',
+             border=0, ln=False)
+    pdf.set_text_color(*C_TEXT_DARK); pdf.set_y(pdf.get_y() + 5)
+
 def generate_cluster_mis(cluster, open_cases, all_cases, metrics):
     pdf = BLPdf(subtitle=f'{cluster} Cluster MIS Report', report_date=fmt_date(TODAY))
     pdf.add_page()
 
     cluster_open = [c for c in open_cases if c['cluster'] == cluster]
     draw_kpi_strip(pdf, cluster_open)
+    draw_cluster_period_strip(pdf, cluster, all_cases)
+    draw_cluster_branch_table(pdf, cluster, all_cases)
     draw_open_cases_table(pdf, open_cases, cluster_filter=cluster)
 
     if pdf.get_y() > pdf.content_bottom() - 50: pdf.add_page()
@@ -2367,6 +2688,305 @@ def generate_cluster_mis(cluster, open_cases, all_cases, metrics):
     return pdf.output()
 
 # --- MAIN --------------------------------------------------------------------
+# --- GOVERNANCE REPORTS ------------------------------------------------------
+# Built 12-08-2026 for the investor/partner-facing pack. All reuse BLPdf so
+# they carry the same branded header/footer as every other BridgeLine PDF.
+
+def _fin_row(pdf, label, value, bold=False, indent=0, color=None,
+             top_rule=False, shaded=False, dec=False):
+    """One label/amount line of a financial statement. `value` may be a
+    number (formatted here) or a pre-formatted string."""
+    x0, pw = L_MAR, pdf.inner_w()
+    if pdf.get_y() > pdf.content_bottom() - 8:
+        pdf.add_page()
+    y, h = pdf.get_y(), 6
+    if shaded:
+        pdf.set_fill_color(*C_LT_SLATE)
+        pdf.rect(x0, y, pw, h, 'F')
+    if top_rule:
+        pdf.set_draw_color(*C_RULE)
+        pdf.line(x0, y, x0 + pw, y)
+    pdf.set_xy(x0 + 2 + indent, y + 1)
+    pdf.set_font('Helvetica', 'B' if bold else '', 8)
+    pdf.set_text_color(*(color or C_TEXT_DARK))
+    pdf.cell(pw * 0.62 - indent, 4, str(label), border=0, ln=False)
+    if value != '':
+        txt = value if isinstance(value, str) else (inr_dec(value, 2) if dec else inr(value))
+        pdf.set_xy(x0 + pw * 0.62, y + 1)
+        pdf.cell(pw * 0.36, 4, txt, align='R', border=0, ln=False)
+    pdf.set_text_color(*C_TEXT_DARK)
+    pdf.set_y(y + h)
+
+def _note_box(pdf, lines):
+    """Cream disclosure box — same visual language as draw_guidelines()."""
+    x0, pw = L_MAR, pdf.inner_w()
+    line_h = 5
+    total_h = len(lines) * line_h + 5
+    if pdf.get_y() + total_h > pdf.content_bottom():
+        pdf.add_page()
+    y = pdf.get_y()
+    pdf.set_fill_color(*C_MEMO_CREAM)
+    pdf.set_draw_color(*C_GOLD_RULE)
+    pdf.rect(x0, y, pw, total_h, 'FD')
+    pdf.set_fill_color(*C_GOLD_RULE)
+    pdf.rect(x0, y, 1.5, total_h, 'F')
+    for i, line in enumerate(lines):
+        pdf.set_xy(x0 + 4, y + 2.5 + i * line_h)
+        pdf.set_font('Helvetica', '', 7)
+        pdf.set_text_color(*C_TEXT_DARK)
+        pdf.cell(pw - 6, 4, line, border=0, ln=False)
+    pdf.set_y(y + total_h + 4)
+
+def generate_pl_statement(fin, period_label):
+    """Cash-basis P&L. GST is shown below the line as a liability, never
+    inside profit; partner drawings likewise, as a capital appropriation."""
+    pdf = BLPdf(subtitle=f'Profit & Loss - {period_label}', report_date=fmt_date(TODAY))
+    pdf.add_page()
+
+    pdf.section_title(f'Profit and Loss Statement - {period_label}')
+    _fin_row(pdf, 'INCOME', '', bold=True)
+    _fin_row(pdf, 'Service charges earned (on collection)', fin['charges_earned'], indent=4)
+    if fin.get('other_income'):
+        _fin_row(pdf, 'Interest / other income', fin['other_income'], indent=4)
+    total_income = fin['charges_earned'] + fin.get('other_income', 0)
+    _fin_row(pdf, 'Total Income', total_income, bold=True, top_rule=True)
+    pdf.ln(2)
+
+    _fin_row(pdf, 'EXPENSES', '', bold=True)
+    cats = fin.get('expenses_by_category') or {}
+    if cats:
+        for cat, amt in cats.items():
+            _fin_row(pdf, str(cat)[:58], amt, indent=4)
+    else:
+        _fin_row(pdf, 'No expenses recorded in this period', '', indent=4)
+    _fin_row(pdf, 'Total Expenses', fin['total_expenses'], bold=True, top_rule=True)
+    pdf.ln(2)
+
+    net = fin['net_profit']
+    unident = fin.get('unidentified') or []
+    label = 'NET PROFIT' if net >= 0 else 'NET LOSS'
+    if unident:
+        label += ' (before unidentified items)'
+    _fin_row(pdf, label, net, bold=True, shaded=True,
+             color=C_GREEN if net >= 0 else C_RED)
+    pdf.ln(4)
+
+    if unident:
+        pdf.section_title('Unidentified - held in suspense, NOT charged to profit')
+        for u in unident:
+            _fin_row(pdf, f"{u['date']}  {u['description'][:52]}", u['amount'], indent=4,
+                     color=C_RED)
+        _fin_row(pdf, 'Total unidentified', fin.get('unidentified_total', 0),
+                 bold=True, top_rule=True, color=C_RED)
+        _fin_row(pdf, f"Net profit if ALL of the above prove to be expenses",
+                 net - fin.get('unidentified_total', 0), indent=4, color=C_TEXT_MED)
+        pdf.ln(3)
+
+    pdf.section_title('Below the line')
+    _fin_row(pdf, 'GST collected - liability, payable to Government', fin['gst_collected'], indent=4)
+    _fin_row(pdf, 'Partner drawings - capital appropriation, not an expense',
+             fin.get('partner_withdrawals', 0), indent=4)
+    pdf.ln(3)
+
+    notes = [
+        'Basis: CASH. Charges are recognised when COLLECTED, not when invoiced - a case contributes',
+        'only once it is Closed and its collection falls inside this period. Charges invoiced on a still-open',
+        'case are future income and are deliberately excluded.',
+        'Excess collected beyond Total is counted as additional charges earned, split GST-inclusive at 18%.',
+        'GST is collected on the Government\'s behalf and is never treated as earnings.',
+    ]
+    if fin.get('unidentified'):
+        notes.append('Unidentified items are large payments with no recognisable category. They are held')
+        notes.append('in suspense and NOT charged to profit until identified - profit above is stated before them.')
+    if fin.get('expenses_incomplete_before'):
+        notes.append(f"Expenses are sourced from reconciled bank statements, which begin "
+                     f"{fin['expenses_incomplete_before']}. Any period starting earlier UNDERSTATES costs.")
+    _note_box(pdf, notes)
+
+    pdf.set_page_count(pdf.page_no())
+    return pdf.output()
+
+def generate_money_integrity_report(integrity, summary=None, solvency=None):
+    """The investor-facing document: every distinct way a rupee could go
+    missing, each with its own figure. Deliberately not a single variance -
+    a bank statement's own arithmetic always balances, so one aggregate
+    number proves nothing."""
+    pdf = BLPdf(subtitle='Money Integrity & Audit Report', report_date=fmt_date(TODAY))
+    pdf.add_page()
+    L = integrity.get('leaks', {})
+    win = integrity.get('reconciled_window', {}) or {}
+
+    clear = bool(integrity.get('all_clear'))
+    pdf.section_title('Verdict')
+    _fin_row(pdf, 'Is every rupee accounted for?',
+             'YES - no discrepancies' if clear else 'ITEMS NEED REVIEW - see below',
+             bold=True, shaded=True, color=C_GREEN if clear else C_RED)
+    _fin_row(pdf, 'Bank data verified for period',
+             f"{win.get('from') or '-'}  to  {win.get('to') or '-'}", indent=4)
+    pdf.ln(3)
+
+    pdf.section_title('The five ways money could go missing')
+    unc = (L.get('unclassified_types') or {}).get('total_net_out_of_bank', 0)
+    bank_un = L.get('bank_entries_not_tied_to_a_case') or {}
+    book_un = L.get('book_entries_with_no_bank_evidence') or {}
+    book_amt = (book_un.get('disbursement_total', 0) or 0) + (book_un.get('collection_total', 0) or 0)
+    internal = abs(L.get('contra_imbalance', 0) or 0) + abs(L.get('fd_unparsed_net', 0) or 0)
+
+    checks = [
+        ('1. Bank movement with no explanation', unc,
+         'Every debit and credit is classified.'),
+        ('2. Bank entry not tied to any customer case',
+         (bank_un.get('total_debit', 0) or 0) + (bank_un.get('total_credit', 0) or 0),
+         f"{bank_un.get('count', 0)} entry(s)."),
+        ('3. Book entry with no bank evidence', book_amt,
+         f"{book_un.get('disbursement_count', 0)} disbursement(s), "
+         f"{book_un.get('collection_count', 0)} collection(s)."),
+        ('4. Internal transfers not netting to zero', internal,
+         'Own-account transfers and FD sweeps must cancel out.'),
+        ('5. FD swept in from an untracked deposit', L.get('fd_orphan_total', 0) or 0,
+         'Deposit booked before bank records begin.'),
+    ]
+    for label, amt, sub in checks:
+        ok = abs(amt) < 1
+        _fin_row(pdf, label, 'CLEAR' if ok else inr_dec(abs(amt), 2), bold=True,
+                 color=C_GREEN if ok else C_RED)
+        _fin_row(pdf, sub, '', indent=6, color=C_TEXT_MED)
+    pdf.ln(3)
+
+    if summary:
+        pdf.section_title('Position at report date')
+        _fin_row(pdf, 'Cash in bank', summary.get('bank_balance', 0), indent=4)
+        _fin_row(pdf, 'Held in fixed deposits', summary.get('fd_outstanding', 0), indent=4)
+        _fin_row(pdf, 'Available to disburse', summary.get('available_for_disbursement', 0),
+                 bold=True, top_rule=True)
+        _fin_row(pdf, 'Loans outstanding with customers', summary.get('total_outstanding', 0), indent=4)
+        pdf.ln(3)
+
+    notes = ['Each figure above should read CLEAR. Any amount shown is money whose movement is not yet',
+             'fully evidenced, and is listed so it can be resolved - not netted away or hidden.']
+    if win.get('from'):
+        notes.append(f"Bank records in this system begin {win['from']}. Activity before that date is not "
+                     f"covered by this report.")
+    _note_box(pdf, notes)
+
+    pdf.set_page_count(pdf.page_no())
+    return pdf.output()
+
+def generate_position_statement(summary, integrity=None, capital_log=None):
+    """Assets vs how they're funded. Cash view is primary (Prem's decision,
+    12-08-2026); the capital-deployment view is kept as a clearly labelled
+    secondary so the two can never again be mistaken for each other."""
+    pdf = BLPdf(subtitle='Statement of Position', report_date=fmt_date(TODAY))
+    pdf.add_page()
+
+    bank = summary.get('bank_balance', 0) or 0
+    fd = summary.get('fd_outstanding', 0) or 0
+    avail = summary.get('available_for_disbursement', 0) or 0
+    outstanding = summary.get('total_outstanding', 0) or 0
+    total_assets = avail + outstanding
+
+    pdf.section_title('Assets')
+    bank_date = summary.get('bank_balance_date') or ''
+    _fin_row(pdf, f"Bank balances (all accounts{', as at ' + bank_date if bank_date else ''})",
+             bank, indent=4)
+    _fin_row(pdf, 'Fixed deposits (sweep)', fd, indent=4)
+    # Without this line the column visibly fails to add up: Available is
+    # measured as at TODAY, but the bank balance is as at the last
+    # reconciled date, so lending activity in between has to be shown.
+    since = (summary.get('collected_since_bank', 0) or 0) - (summary.get('disbursed_since_bank', 0) or 0)
+    if abs(since) >= 1:
+        _fin_row(pdf, 'Net collections less disbursements since that date', since, indent=4)
+    _fin_row(pdf, 'Available to Disburse (deployable cash)', avail, bold=True, top_rule=True)
+    _fin_row(pdf, 'Loans outstanding with customers (receivable)', outstanding, indent=4)
+    _fin_row(pdf, 'TOTAL ASSETS', total_assets, bold=True, shaded=True)
+    pdf.ln(4)
+
+    net_capital = None
+    if capital_log and capital_log.get('available'):
+        net_capital = capital_log.get('net_capital')
+    if net_capital is not None:
+        pdf.section_title('Funded by')
+        _fin_row(pdf, 'Capital introduced (net of drawings)', net_capital, indent=4)
+        _fin_row(pdf, 'Retained earnings (balancing figure)', total_assets - net_capital, indent=4)
+        _fin_row(pdf, 'TOTAL', total_assets, bold=True, shaded=True)
+        pdf.ln(4)
+
+        pdf.section_title('Secondary view - capital deployment')
+        _fin_row(pdf, 'Capital introduced', net_capital, indent=4)
+        _fin_row(pdf, 'Less: deployed with customers', -outstanding, indent=4)
+        _fin_row(pdf, 'Undeployed capital', net_capital - outstanding, bold=True, top_rule=True)
+        _note_box(pdf, [
+            'The Undeployed Capital figure above is NOT cash available. It ignores expenses paid,',
+            'partner drawings and profit retained, so it drifts further from reality every month.',
+            'Available to Disburse (top of this page) is the authoritative figure for what can be lent today.',
+        ])
+
+    pdf.set_page_count(pdf.page_no())
+    return pdf.output()
+
+def generate_gst_register_pdf(months, gstin=None):
+    """Month-wise GST register on the collection basis, so the PDF and the
+    GST Register sheet tab can never disagree."""
+    pdf = BLPdf(subtitle='GST Register', report_date=fmt_date(TODAY))
+    pdf.add_page()
+
+    pdf.section_title(f'GST Register - GSTIN {gstin or CO_GSTIN}')
+    x0, pw = L_MAR, pdf.inner_w()
+    col = [pw * 0.30, pw * 0.16, pw * 0.27, pw * 0.27]
+    y = pdf.get_y()
+    pdf.set_fill_color(*C_NAVY)
+    pdf.rect(x0, y, pw, 7, 'F')
+    pdf.set_font('Helvetica', 'B', 7.5)
+    pdf.set_text_color(*C_HDR_TXT)
+    cx = x0 + 2
+    for i, h in enumerate(['MONTH', 'CASES', 'TAXABLE VALUE (CHARGES)', 'GST @ 18%']):
+        pdf.set_xy(cx, y + 1.8)
+        pdf.cell(col[i] - 2, 4, h, align='L' if i == 0 else 'R', border=0, ln=False)
+        cx += col[i]
+    pdf.set_text_color(*C_TEXT_DARK)
+    pdf.set_y(y + 7)
+
+    tot_ch = tot_gst = 0.0
+    for i, m in enumerate(months):
+        if pdf.get_y() > pdf.content_bottom() - 10:
+            pdf.add_page()
+        y = pdf.get_y()
+        if i % 2:
+            pdf.set_fill_color(*C_LT_GOLD)
+            pdf.rect(x0, y, pw, 6, 'F')
+        pdf.set_font('Helvetica', '', 7.5)
+        vals = [m['label'], str(m.get('cases', 0)), inr_dec(m['charges'], 2), inr_dec(m['gst'], 2)]
+        cx = x0 + 2
+        for j, v in enumerate(vals):
+            pdf.set_xy(cx, y + 1.5)
+            pdf.cell(col[j] - 2, 4, v, align='L' if j == 0 else 'R', border=0, ln=False)
+            cx += col[j]
+        tot_ch += m['charges']; tot_gst += m['gst']
+        pdf.set_y(y + 6)
+
+    y = pdf.get_y()
+    pdf.set_fill_color(*C_NAVY)
+    pdf.rect(x0, y, pw, 7, 'F')
+    pdf.set_font('Helvetica', 'B', 8)
+    pdf.set_text_color(*C_GOLD_LBL)
+    cx = x0 + 2
+    for j, v in enumerate(['TOTAL', '', inr_dec(tot_ch, 2), inr_dec(tot_gst, 2)]):
+        pdf.set_xy(cx, y + 1.8)
+        pdf.cell(col[j] - 2, 4, v, align='L' if j == 0 else 'R', border=0, ln=False)
+        cx += col[j]
+    pdf.set_text_color(*C_TEXT_DARK)
+    pdf.set_y(y + 9)
+
+    _note_box(pdf, [
+        'Basis: CASH. GST is recognised in the month the charge was COLLECTED, not the month the loan',
+        'was disbursed - so a June loan collected in July appears in July. Only fully closed cases count.',
+        'Excess collected beyond Total is treated as GST-inclusive additional charges at 18%.',
+        'Returns are due by the 20th of the following month.',
+    ])
+
+    pdf.set_page_count(pdf.page_no())
+    return pdf.output()
+
 def main():
     excel_path = sys.argv[1] if len(sys.argv) > 1 else EXCEL_PATH
     global OUTPUT_DIR
@@ -2386,7 +3006,7 @@ def main():
     else:
         print(f'WARNING: Logo not in /tmp — header renders without logo (run setup_logo.py to cache it)')
 
-    rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log = load_data(excel_path)
+    rows, db_raw, mcoll, (cluster_mgrs, branch_contacts, area_mgrs, territory_to_area), capital_log = load_data(excel_path)
     open_cases, all_cases, all_cases_full = parse_cases(rows, mcoll)
 
     print(f'Open cases: {len(open_cases)}')
@@ -2414,7 +3034,8 @@ def main():
     print(f'\nActive clusters: {active_clusters}')
 
     zip_bytes = build_zip(open_cases, all_cases, all_cases_full, metrics,
-                           cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=mcoll)
+                           cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=mcoll,
+                           area_mgrs=area_mgrs, territory_to_area=territory_to_area)
 
     date_human = TODAY.strftime('%d-%b-%Y')
     zip_name   = f'{date_human} BridgeLine MIS Package.zip'
@@ -2426,7 +3047,8 @@ def main():
 
 
 def build_zip(open_cases, all_cases, all_cases_full, metrics,
-               cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=None):
+               cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=None,
+               area_mgrs=None, territory_to_area=None):
     """Builds the full BridgeLine MIS Package zip (in memory) and returns its bytes.
 
     Shared by the CLI entrypoint (main()) and any other caller (e.g. a web route
@@ -2448,7 +3070,8 @@ def build_zip(open_cases, all_cases, all_cases_full, metrics,
         cc_folder = f'{date_label} Collection Cards'
 
         print('Generating Calling Follow-Up...')
-        followup_bytes = generate_calling_followup_pdf(open_cases, cluster_mgrs, branch_contacts)
+        followup_bytes = generate_calling_followup_pdf(open_cases, cluster_mgrs, branch_contacts,
+                                                         area_mgrs, territory_to_area)
         if followup_bytes:
             zf.writestr(f'{cc_folder}/{date_human} BridgeLine Calling Follow-Up.pdf', followup_bytes)
 
@@ -2460,7 +3083,9 @@ def build_zip(open_cases, all_cases, all_cases_full, metrics,
             safe = c['customer'].replace('/', '-').replace('\\', '-')
             card_name = f'{date_label} {c["cluster"]} {safe} {c["id"]} Collection Card.pdf'
             print(f'  Card: {card_name}')
-            zf.writestr(f'{cc_folder}/{card_name}', generate_collection_card(c, branch_contacts, cluster_mgrs))
+            zf.writestr(f'{cc_folder}/{card_name}',
+                        generate_collection_card(c, branch_contacts, cluster_mgrs,
+                                                  area_mgrs, territory_to_area))
 
         # --- Cluster folders: cluster MIS + Invoice and Ledger per open case ---
         for cluster in active_clusters:

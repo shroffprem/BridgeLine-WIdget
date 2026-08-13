@@ -11,6 +11,9 @@ import io
 import threading
 import time
 import os
+import urllib.request
+from dataclasses import dataclass
+from typing import Optional
 from datetime import datetime, date, timedelta, timezone
 from flask import Flask, request, jsonify, render_template_string, Response, send_from_directory
 
@@ -18,11 +21,47 @@ from flask import Flask, request, jsonify, render_template_string, Response, sen
 import gspread
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from googleapiclient.discovery import build as _build_google_client
+from googleapiclient.http import MediaIoBaseUpload
 
 SPREADSHEET_ID = "1LKhDNyOd1u48UFgQafbz3oP4Ehgf1hJBt59F9A-8H7U"
 SHEET_NAME     = "Accounts"
 SCOPES         = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
 IST            = timezone(timedelta(hours=5, minutes=30))
+
+# ── Ops alerting ───────────────────────────────────────────────────────────────
+# Basic push-notification hook for the highest-stakes routes (disbursement/
+# repayment recording, bank-file export) so a real failure surfaces
+# immediately instead of only being noticed if someone happens to check.
+# ntfy.sh needs no account/API key -- Prem subscribes by opening this exact
+# URL (or the ntfy app) on his phone: https://ntfy.sh/bridgeline-ops-25eb13e871
+NTFY_TOPIC = "bridgeline-ops-25eb13e871"
+
+def notify_ops(context, exc):
+    """Best-effort push notification -- must NEVER raise or block the real
+    request, since a notification failure is not a reason to also fail the
+    actual disbursement/repayment/export the officer is waiting on.
+
+    Skips ValueError on purpose: every raise ValueError(...) in this codebase
+    is a deliberate, expected, user-facing rejection (missing UTR, case not
+    found, stale row, bad account number) -- not a real failure. Alerting on
+    those would page Prem every time someone forgets a UTR, which trains
+    everyone to ignore the channel within a day. Anything else (a real
+    exception -- gspread/API errors, bugs, timeouts) still alerts."""
+    if isinstance(exc, ValueError):
+        return
+    try:
+        msg = f"{context}: {exc}"[:500]
+        req = urllib.request.Request(
+            f"https://ntfy.sh/{NTFY_TOPIC}",
+            data=msg.encode("utf-8"),
+            headers={"Title": f"BridgeLine widget error: {context}",
+                     "Priority": "urgent", "Tags": "rotating_light"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5)
+    except Exception:
+        pass
 
 import requests
 
@@ -64,6 +103,7 @@ def rebuild_ledger_now():
 
 _gspread_client_cache = None  # (timestamp, client)
 _GSPREAD_CLIENT_TTL = 45 * 60  # seconds — Google access tokens last ~60 min
+_drive_client_cache = None  # (timestamp, client)
 
 def get_gspread_client():
     """Auth via a long-lived Google OAuth refresh token stored as Vercel env
@@ -98,6 +138,59 @@ def get_sheet():
     sh = gc.open_by_key(SPREADSHEET_ID)
     return sh.worksheet(SHEET_NAME)
 
+def get_drive_client():
+    """Same cached-creds pattern as get_gspread_client() -- SCOPES already
+    includes Drive, this just builds a second client (Sheets vs Drive are
+    different Google APIs) from the same refresh token."""
+    global _drive_client_cache
+    if _drive_client_cache and (time.time() - _drive_client_cache[0]) < _GSPREAD_CLIENT_TTL:
+        return _drive_client_cache[1]
+    creds = Credentials(
+        None,
+        refresh_token=os.environ["GOOGLE_REFRESH_TOKEN"],
+        client_id=os.environ["GOOGLE_CLIENT_ID"],
+        client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCOPES,
+    )
+    creds.refresh(Request())
+    client = _build_google_client("drive", "v3", credentials=creds)
+    _drive_client_cache = (time.time(), client)
+    return client
+
+def _drive_folder_id_from_url(kyc_folder_url):
+    """The Accounts/Requests 'KYC Folder' cell stores a full
+    https://drive.google.com/drive/folders/<id> link (written by the field
+    app's upload-kyc-docs.py) -- this repo only ever needs the id portion to
+    upload into or rename an already-existing folder; it never creates the
+    per-request folder itself, that's the field app's job."""
+    if not kyc_folder_url:
+        return ''
+    return kyc_folder_url.rstrip('/').rsplit('/', 1)[-1]
+
+def _upsert_drive_file(drive, folder_id, filename, content_bytes, mime_type):
+    """Idempotent by filename -- mirrors upload-kyc-docs.py's upsert_file()
+    exactly (a re-generated invoice, e.g. from a corrected amount, replaces
+    the earlier file rather than stacking duplicates). supportsAllDrives is
+    required throughout -- the KYC Documents folder lives inside the
+    BridgeLine Partners Shared Drive, and Drive's API silently can't see
+    Shared Drive content without it (confirmed live while building the
+    upload side of this)."""
+    q = f"'{folder_id}' in parents and name='{filename}' and trashed=false"
+    existing = drive.files().list(
+        q=q, fields="files(id)", supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute().get("files", [])
+    media = MediaIoBaseUpload(io.BytesIO(content_bytes), mimetype=mime_type, resumable=False)
+    if existing:
+        return drive.files().update(fileId=existing[0]["id"], media_body=media, supportsAllDrives=True).execute()
+    return drive.files().create(
+        body={"name": filename, "parents": [folder_id]}, media_body=media, fields="id",
+        supportsAllDrives=True,
+    ).execute()
+
+def _rename_drive_folder(drive, folder_id, new_name):
+    drive.files().update(fileId=folder_id, body={"name": new_name}, supportsAllDrives=True).execute()
+
 _accounts_bank_col_ensured = False
 
 def _ensure_accounts_bank_account_column(ws):
@@ -120,11 +213,69 @@ def _ensure_accounts_bank_account_column(ws):
         ws.update_cell(header_idx + 1, COL['bank_account'], 'Bank Account')
     _accounts_bank_col_ensured = True
 
+_accounts_charge_plan_col_ensured = False
+
+def _ensure_accounts_charge_plan_column(ws):
+    """Same auto-heal pattern as _ensure_accounts_bank_account_column() —
+    'Charge Plan' marks which BIB HDB Karnataka disbursements use the new
+    day-based schedule (stamped 'NEW') vs the flat legacy formula (left
+    blank — covers every non-BIB-HDB-Karnataka row AND pre-cutover BIB HDB
+    Karnataka rows alike, needing no backfill)."""
+    global _accounts_charge_plan_col_ensured
+    if _accounts_charge_plan_col_ensured:
+        return
+    all_vals = ws.get_all_values()
+    header_idx = next((i for i, r in enumerate(all_vals) if r and 'Disbursement ID' in r), 1)
+    header = all_vals[header_idx] if header_idx < len(all_vals) else []
+    if 'Charge Plan' not in header:
+        if ws.col_count < COL['charge_plan']:
+            ws.resize(cols=COL['charge_plan'])
+        ws.update_cell(header_idx + 1, COL['charge_plan'], 'Charge Plan')
+    _accounts_charge_plan_col_ensured = True
+
+_accounts_kyc_folder_col_ensured = False
+
+def _ensure_accounts_kyc_folder_column(ws):
+    """Same auto-heal pattern as _ensure_accounts_bank_account_column() —
+    'KYC Folder' is stamped once at save_disbursement() time (looked up from
+    the Requests row, never mutated by update_disbursement()/save_repayment()
+    afterward), so this only ever needs checking from that one call site."""
+    global _accounts_kyc_folder_col_ensured
+    if _accounts_kyc_folder_col_ensured:
+        return
+    all_vals = ws.get_all_values()
+    header_idx = next((i for i, r in enumerate(all_vals) if r and 'Disbursement ID' in r), 1)
+    header = all_vals[header_idx] if header_idx < len(all_vals) else []
+    if 'KYC Folder' not in header:
+        if ws.col_count < COL['kyc_folder']:
+            ws.resize(cols=COL['kyc_folder'])
+        ws.update_cell(header_idx + 1, COL['kyc_folder'], 'KYC Folder')
+    _accounts_kyc_folder_col_ensured = True
+
+_accounts_request_id_col_ensured = False
+
+def _ensure_accounts_request_id_column(ws):
+    """Same auto-heal pattern as _ensure_accounts_kyc_folder_column() —
+    'Request ID' is stamped once at save_disbursement() time (the value is
+    already in the posted data, no lookup needed), never mutated afterward."""
+    global _accounts_request_id_col_ensured
+    if _accounts_request_id_col_ensured:
+        return
+    all_vals = ws.get_all_values()
+    header_idx = next((i for i, r in enumerate(all_vals) if r and 'Disbursement ID' in r), 1)
+    header = all_vals[header_idx] if header_idx < len(all_vals) else []
+    if 'Request ID' not in header:
+        if ws.col_count < COL['request_id']:
+            ws.resize(cols=COL['request_id'])
+        ws.update_cell(header_idx + 1, COL['request_id'], 'Request ID')
+    _accounts_request_id_col_ensured = True
+
 REQUESTS_SHEET_NAME = "Requests"
 REQUESTS_HEADERS = [
     "Request ID", "Submitted At", "Customer Name", "Cluster", "Branch",
     "Amount", "Account No", "IFSC", "Phone", "SO Name", "Gold Weight",
-    "Status", "Disb ID", "Notes", "Bank", "Debit Account"
+    "Status", "Disb ID", "Notes", "Bank", "Debit Account", "KYC Folder",
+    "Company"
 ]
 
 def get_requests_sheet():
@@ -238,8 +389,16 @@ RTGS_MIN_AMOUNT = 200000
 IDFC_DEBIT_ACCOUNT = '52202388167'
 
 # ── Config ────────────────────────────────────────────────────────────────────
-COMPANIES = ["HDB", "ICICI"]
-CLUSTERS  = ["Bellary", "Hassan", "Hubli", "Mandya", "Mangalore", "Mysore", "Other"]
+COMPANIES = ["HDB", "ICICI", "ESAF"]
+CLUSTERS  = ["Bellary", "BIB HDB Karnataka", "Hassan", "Hubli", "Mandya", "Mangalore", "Mysore", "Other"]
+
+# Day-based, GST-inclusive charge schedule for BIB HDB Karnataka only (every
+# other cluster stays on the flat 0.5%+18%-on-top formula). Only disbursements
+# on/after this date use the new schedule — already-open BIB HDB Karnataka
+# cases keep their original flat terms exactly as already recorded. Once a
+# disbursement is stamped with its methodology (COL['charge_plan']), this
+# constant is never consulted again for that row — see calc_charges().
+BIB_HDB_TAT_CUTOVER_DATE = date(2026, 7, 23)
 BRANCHES  = sorted([
     "Adyar", "Beejadi", "Bellary", "Chitradurga", "Chitrapady", "Davangere",
     "Gulbarga", "Hassan", "Hospet", "JP Nagar", "Kedinje", "Kollegala", "Kuvempu Nagar",
@@ -315,7 +474,7 @@ def _clean_numeric_cell(v):
 
 def load_data_from_sheet(sh):
     """Live-Sheets equivalent of generate_mis.load_data(): same return shape
-    (rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log),
+    (rows, db_raw, mcoll, (cluster_mgrs, branch_contacts, area_mgrs, territory_to_area), capital_log),
     sourced from the same spreadsheet the widget already reads/writes,
     instead of a manually downloaded Excel snapshot."""
     acc_vals = sh.worksheet(SHEET_NAME).get_all_values()
@@ -341,8 +500,8 @@ def load_data_from_sheet(sh):
 
     rows = []
     for raw in raw_rows:
-        row = list(raw[:22])
-        row += [None] * (22 - len(row))
+        row = list(raw[:26])
+        row += [None] * (26 - len(row))
         row = [None if c == '' else c for c in row]  # match openpyxl's blank-cell None
         for i in _MIS_NUMERIC_COLS:
             row[i] = _clean_numeric_cell(row[i])
@@ -371,7 +530,7 @@ def load_data_from_sheet(sh):
     wb_shim = _WorkbookShim(sheets)
 
     mcoll = mis.load_mcoll(wb_shim)
-    cluster_mgrs, branch_contacts = mis.load_contacts(wb_shim)
+    cluster_mgrs, branch_contacts, area_mgrs, territory_to_area = mis.load_contacts(wb_shim)
     capital_log = mis.load_capital_log(wb_shim)
 
     db_raw = {}
@@ -385,7 +544,7 @@ def load_data_from_sheet(sh):
     except gspread.exceptions.WorksheetNotFound:
         pass
 
-    return rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log
+    return rows, db_raw, mcoll, (cluster_mgrs, branch_contacts, area_mgrs, territory_to_area), capital_log
 
 # ── Extraction helpers ────────────────────────────────────────────────────────
 
@@ -401,7 +560,11 @@ def parse_inr_amount(text):
         if m:
             try:
                 val = float(m.group(1).replace(',', ''))
-                if val >= 1000:
+                # A genuine repayment can be well under Rs.1000 (part
+                # payments, small collections) -- the old >= 1000 floor
+                # silently rejected those instead of just accepting any
+                # real positive amount matched by the patterns above.
+                if val > 0:
                     return val
             except ValueError:
                 pass
@@ -409,6 +572,11 @@ def parse_inr_amount(text):
 
 def parse_date_from_message(text):
     patterns = [
+        # Explicit "Date:" / "Txn Date:" / "Value Date:" label -- the most
+        # common real-world format (e.g. "a. Date: 28-07-26") and previously
+        # not matched at all since every other pattern below requires either
+        # an "on " prefix or a 3-letter month name.
+        (r'Date[:\s]+(\d{2}[-/]\d{2}[-/]\d{2,4})',   ["%d-%m-%y", "%d-%m-%Y"]),
         (r'on\s+(\d{2}[-/][A-Za-z]{3}[-/]\d{2,4})', ["%d-%b-%y", "%d-%b-%Y"]),
         (r'On\s+(\d{2}[-/]\d{2}[-/]\d{2,4})',        ["%d-%m-%y", "%d-%m-%Y"]),
         (r'on\s+(\d{2}[-/]\d{2}[-/]\d{2,4})',        ["%d-%m-%y", "%d-%m-%Y"]),
@@ -423,7 +591,11 @@ def parse_date_from_message(text):
                     return datetime.strptime(m.group(1), fmt).strftime('%d-%m-%Y')
                 except ValueError:
                     pass
-    return date.today().strftime('%d-%m-%Y')
+    # No pattern matched -- return None rather than defaulting to today.
+    # Silently returning today() made every failed parse indistinguishable
+    # from a genuine "the message says today", so the frontend confidently
+    # filled in a date that had nothing to do with the pasted message.
+    return None
 
 def extract_utr(text):
     t = text.strip()
@@ -565,6 +737,8 @@ def extract_disbursement(text):
         info['company'] = 'HDB'
     elif re.search(r'\bICICI\b', text, re.IGNORECASE):
         info['company'] = 'ICICI'
+    elif re.search(r'\bESAF\b', text, re.IGNORECASE):
+        info['company'] = 'ESAF'
 
     for c in CLUSTERS:
         if re.search(r'\b' + re.escape(c) + r'\b', text, re.IGNORECASE):
@@ -591,6 +765,9 @@ COL = {
     'credit_note': 23,
     'remarks': 24,
     'bank_account': 25,
+    'charge_plan': 26,
+    'kyc_folder': 27,
+    'request_id': 28,
 }
 
 def _to_num(v):
@@ -600,11 +777,150 @@ def _to_num(v):
     except Exception:
         return 0.0
 
-def calc_total(amount, charges=None, gst=None):
+BIB_HDB_CLUSTER_NAME = "BIB HDB Karnataka"
+
+def _norm_cluster(cluster):
+    return str(cluster or '').strip().casefold()
+
+def _is_bib_hdb_cluster(cluster):
+    # Cluster is free-text (an <input list=...>, not a real <select>), so a
+    # bare == would silently miss "bib hdb karnataka" / trailing-whitespace
+    # variants and fall through to the flat formula for a case that should
+    # be on the new schedule.
+    return _norm_cluster(cluster) == _norm_cluster(BIB_HDB_CLUSTER_NAME)
+
+def _bib_hdb_territory_names():
+    """Branch/Area names registered under BIB HDB Karnataka in the Contact
+    sheet (Area Manager rows like 'ROK'/'Bengaluru-1' + Territory Manager
+    rows like 'SHIKARIPURA'), normalized. Sourced live from the sheet
+    (data-driven, same convention as find_branch_contact()'s Area/Territory
+    resolution) so a newly onboarded territory is covered automatically,
+    with no code change. Returns an empty set on any read failure — this
+    check must never block or error out a save just because Contact was
+    briefly unreachable."""
+    try:
+        contacts = read_contacts()
+    except Exception:
+        return set()
+    return {_norm_cluster(c['branch']) for c in contacts
+            if c.get('branch') and _is_bib_hdb_cluster(c.get('cluster', ''))}
+
+def _bib_territory_mismatch_warning(cluster, branch):
+    """Confirmed real failure mode (Fayaz ahammed, BLP-040826-371,
+    04-08-2026): BIB HDB Karnataka's own real place names (e.g.
+    'Shikaripura') can be identical to an ordinary cluster's real branch
+    name, so an officer picking the wrong cluster from the free-text
+    dropdown looks completely valid to every other check -- nothing else
+    would ever catch it. Non-blocking by design (a name collision is a
+    signal, not proof; the ordinary cluster's branch might just happen to
+    share the name for real) -- surfaced as a warning for a human to
+    confirm, never silently auto-corrected."""
+    if _is_bib_hdb_cluster(cluster):
+        return None
+    b = _norm_cluster(branch)
+    if not b:
+        return None
+    if b in _bib_hdb_territory_names():
+        return (f"Branch '{branch.strip()}' matches a known BIB HDB Karnataka "
+                f"territory/area name, but Cluster is set to "
+                f"'{cluster.strip() if cluster and cluster.strip() else '(blank)'}'. "
+                f"If this is actually BIB HDB Karnataka business, change Cluster so the "
+                f"correct day-based charge schedule applies.")
+    return None
+
+def _to_plain_date(v):
+    """Accepts a date, a datetime, or a string in any format _parse_any_date
+    understands; returns a plain date (or None)."""
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    parsed = _parse_any_date(v)
+    return parsed.date() if parsed else None
+
+def _resolve_bib_hdb_methodology(cluster, disbursement_date):
+    """Only ever called from save_disbursement() at the moment a new row is
+    created, when no charge_plan marker yet exists to read. Every other
+    caller must pass methodology='OLD'/'NEW' sourced from that stamped
+    marker instead of calling this — see calc_charges()'s docstring."""
+    if not _is_bib_hdb_cluster(cluster):
+        return None
+    d = _to_plain_date(disbursement_date)
+    if d is None:
+        return None
+    return 'NEW' if d >= BIB_HDB_TAT_CUTOVER_DATE else 'OLD'
+
+def calc_charges(amount, cluster=None, disbursement_date=None, collection_date=None, methodology=None):
+    """Single source of truth for Charges/GST/Total math — replaces the
+    flat 0.5%/18%-on-top formula that used to be duplicated across
+    calc_total(), save_disbursement(), and update_disbursement().
+
+    For every cluster except BIB HDB Karnataka (and for BIB HDB Karnataka
+    cases disbursed before BIB_HDB_TAT_CUTOVER_DATE), this is exactly the
+    original flat formula — charges = 0.5% of amount, GST = 18% of charges,
+    added on top.
+
+    BIB HDB Karnataka cases disbursed on/after the cutover use a day-based,
+    GST-INCLUSIVE schedule instead: 0.4% inclusive if collected by EOD of
+    the day after disbursement, +0.2% inclusive per additional day late,
+    uncapped. The inclusive total is rounded FIRST, then the GST portion is
+    back-calculated as the exact remainder (charges = incl/1.18, gst =
+    incl - charges) — never independently rounded — so charges+gst always
+    reconstructs the inclusive total to the paisa (the invoice's combined
+    "Charges (incl. GST)" line depends on this).
+
+    `methodology` ('OLD'/'NEW') should normally be passed explicitly,
+    sourced from the row's already-stamped charge_plan marker — this keeps
+    every caller except save_disbursement() from ever re-deriving
+    methodology from today's date after the fact (see COL['charge_plan']
+    and _ensure_accounts_charge_plan_column()). Only save_disbursement()
+    should leave it as None and let this function resolve it fresh, since
+    that's the one moment no marker yet exists.
+
+    `collection_date=None` means "not collected yet" — used for the
+    provisional estimate shown at disbursement time (days_late=0, i.e. the
+    best-case 0.4% rate). The real, final charge is only computed once a
+    collection_date is supplied, at the moment a case actually closes.
+    """
     amt = float(amount or 0)
-    ch  = round(float(charges or amt * 0.005), 2)
-    g   = round(float(gst or ch * 0.18), 2)
-    return round(amt + ch + g, 2)
+
+    if methodology is None:
+        methodology = _resolve_bib_hdb_methodology(cluster, disbursement_date)
+
+    if methodology != 'NEW':
+        charges = round(amt * 0.005, 2)
+        gst     = round(charges * 0.18, 2)
+        total   = round(amt + charges + gst, 2)
+        return {'charges': charges, 'gst': gst, 'total': total,
+                'methodology': methodology, 'rate_pct': 0.5, 'days_late': None}
+
+    d_date = _to_plain_date(disbursement_date)
+    c_date = _to_plain_date(collection_date)
+    days_late = 0 if c_date is None or d_date is None else max(0, (c_date - d_date).days - 1)
+    rate_pct  = 0.4 + 0.2 * days_late
+
+    incl_total = round(amt * rate_pct / 100, 2)
+    charges    = round(incl_total / 1.18, 2)
+    gst        = round(incl_total - charges, 2)   # remainder, not independently rounded
+    total      = round(amt + incl_total, 2)
+
+    return {'charges': charges, 'gst': gst, 'total': total,
+            'methodology': 'NEW', 'rate_pct': rate_pct, 'days_late': days_late}
+
+def calc_total(amount, charges=None, gst=None):
+    if charges is not None or gst is not None:
+        amt = float(amount or 0)
+        ch  = round(float(charges if charges is not None else amt * 0.005), 2)
+        g   = round(float(gst if gst is not None else ch * 0.18), 2)
+        return round(amt + ch + g, 2)
+    # No explicit override — delegate to the flat/legacy branch (cluster and
+    # dates omitted resolves methodology to None, i.e. the original formula).
+    # calc_total()'s 4 existing callers never pass cluster/dates and can't
+    # participate in the BIB HDB Karnataka schedule, so this preserves their
+    # exact prior behavior.
+    return calc_charges(amount)['total']
 
 FOLLOWUP_SHEET_NAME = 'Apr/May26'  # legacy follow-up tab, grandfathered into active_archive_tabs
 
@@ -693,6 +1009,7 @@ def read_mcoll_from_gsheet():
                 'disb_id': row[0],
                 'coll_date': row[1] if len(row) > 1 else '',
                 'amount': row[2] if len(row) > 2 else '',
+                'bank_account': row[5] if len(row) > 5 else '',
             })
     return rows
 
@@ -718,13 +1035,15 @@ def get_payment_events(records, mcoll_rows):
                 d = parse_disb_date(m['coll_date'])
                 amt = _to_num(m['amount'])
                 if d and amt:
-                    events.append({'disb_id': did, 'customer': name, 'date': d, 'amount': amt})
+                    events.append({'disb_id': did, 'customer': name, 'date': d, 'amount': amt,
+                                    'bank_account': (m.get('bank_account', '') or '').strip()})
         else:
             cd = r.get('Collected   Date', '') or r.get('Collected Date', '')
             d = parse_disb_date(cd)
             amt = _to_num(r.get('Collected Amount', 0))
             if d and amt:
-                events.append({'disb_id': did, 'customer': name, 'date': d, 'amount': amt})
+                events.append({'disb_id': did, 'customer': name, 'date': d, 'amount': amt,
+                                'bank_account': (r.get('Bank Account', '') or '').strip()})
     return events
 
 def read_contacts():
@@ -852,6 +1171,9 @@ def save_disbursement(data):
         raise ValueError('UTR / Reference number is required — a disbursement cannot be recorded without proof of transfer.')
     ws  = get_sheet()
     _ensure_accounts_bank_account_column(ws)
+    _ensure_accounts_charge_plan_column(ws)
+    _ensure_accounts_kyc_folder_column(ws)
+    _ensure_accounts_request_id_column(ws)
     # One read serves both the sequence number AND the insert row — the
     # latter used to cost a second, separate ws.get_all_values() call on
     # top of the read read_accounts_from_gsheet() already just did.
@@ -866,10 +1188,13 @@ def save_disbursement(data):
     ddmmyy  = d.strftime('%d%m%y')
     disb_id = f"BLP-{ddmmyy}-{seq:03d}"
 
-    amount  = float(data['amount'])
-    charges = round(amount * 0.005, 2)
-    gst     = round(charges * 0.18, 2)
-    total   = round(amount + charges + gst, 2)
+    amount = float(data['amount'])
+    cluster_for_charges = data.get('cluster', '')
+    charge_calc = calc_charges(amount, cluster=cluster_for_charges, disbursement_date=d.date())
+    charges = charge_calc['charges']
+    gst     = charge_calc['gst']
+    total   = charge_calc['total']
+    charge_methodology = charge_calc['methodology']  # None / 'OLD' / 'NEW'
 
     # Manual selection always wins; auto-resolve from the source Request's
     # export-time debit account only when the form field was left blank —
@@ -883,7 +1208,18 @@ def save_disbursement(data):
         except Exception:
             pass
 
-    row_data = [''] * 25
+    # KYC Folder has no manual form field to prefer -- it's set purely by
+    # whatever the field app's scan-upload flow stamped on the source
+    # Request row (if any). A missing/unreadable value must never fail the
+    # disbursement itself, same reasoning as the bank_account lookup above.
+    kyc_folder = ''
+    if request_id_for_lookup:
+        try:
+            kyc_folder = _lookup_request_kyc_folder(request_id_for_lookup)
+        except Exception:
+            pass
+
+    row_data = [''] * 28
     row_data[COL['disb_id']-1]      = disb_id
     row_data[COL['date']-1]         = d.strftime('%d-%m-%Y')
     row_data[COL['customer']-1]     = data.get('customer', '')
@@ -895,47 +1231,61 @@ def save_disbursement(data):
     row_data[COL['charges']-1]      = charges
     row_data[COL['gst']-1]          = gst
     row_data[COL['total']-1]        = total
-    # Balance and Current Date are left blank here (not COL['tat'] either) so
-    # Google Sheets' native "extend formula from the row above" behavior on
-    # row insert fills them in automatically — exactly how TAT already
-    # works without any code writing to it. Writing a plain value into
-    # either cell would permanently clobber that row's live formula (the
-    # app's own balance figure is always computed fresh from Total/
-    # Collected/Discount in Python — see _parse_case()/_case_detail() — so
-    # nothing here depends on what column O actually contains).
+    # Balance/TAT/Current Date (O/P/Q) are left blank here — written as
+    # explicit formulas right after the insert below, not as plain values,
+    # since the app's own balance figure is always computed fresh from
+    # Total/Collected/Discount in Python (see _parse_case()/_case_detail())
+    # and never reads column O itself.
     row_data[COL['status']-1]       = 'Follow Up!'
     row_data[COL['srv_branch']-1]   = data.get('serviced_branch', '')
     row_data[COL['srv_cluster']-1]  = data.get('serviced_cluster', '')
     row_data[COL['debit_note']-1]   = data.get('utr', '')
-    row_data[COL['remarks']-1]      = data.get('remarks', '')
+    # Only stamp when new-methodology actually applies — left blank for
+    # every non-BIB-HDB-Karnataka row AND pre-cutover BIB HDB Karnataka
+    # rows, so a blank cell always correctly means "flat legacy formula"
+    # with no backfill ever needed. Stamped from the SAME methodology value
+    # calc_charges() already resolved above, so the stamp and the number
+    # charged can never disagree with each other.
+    remarks_in = data.get('remarks', '')
+    if charge_methodology == 'NEW':
+        row_data[COL['charge_plan']-1] = 'NEW'
+        note = 'Day-based TAT charge schedule applied (BIB HDB Karnataka)'
+        remarks_in = f"{remarks_in} | {note}" if remarks_in.strip() else note
+    row_data[COL['remarks']-1]      = remarks_in
     row_data[COL['bank_account']-1] = bank_account
+    row_data[COL['kyc_folder']-1]   = kyc_folder
+    row_data[COL['request_id']-1]   = request_id_for_lookup
 
     ws.insert_row(row_data, next_row)
-    # Columns O/P/Q (Balance, TAT, Current Date) are live formulas on every
-    # existing row. Sheets' native "extend formula from the row above" is
-    # unreliable for API-inserted rows, so copy them down explicitly —
-    # copyPaste with PASTE_FORMULA adjusts the relative references (O15's
-    # =IF(B15...) becomes =IF(B16...) on row 16) exactly like a manual
-    # copy-down would. Best-effort: a failure here must not lose the
-    # disbursement row itself.
+    # Columns O/P/Q (Balance, TAT, Current Date) need a live formula on
+    # every row. Previously copied from the row directly above via a
+    # copyPaste (PASTE_FORMULA, adjusting relative references like a manual
+    # copy-down would) instead of writing plain values, specifically so a
+    # legitimate formula's cell references would keep working. That copy-
+    # from-above approach turned out to have a real blind spot: right after
+    # monthEndRollover() empties Accounts down to just its header row, the
+    # "row above" for that month's first new disbursement IS the header —
+    # so PASTE_FORMULA copied the header's own text/blank cells instead of
+    # a real formula (confirmed live, 03-08-2026: Balance came back as a
+    # bare '=K{row}' self-reference with no Collected-Amount subtraction at
+    # all, TAT as the literal string 'TAT', Current Date as a frozen
+    # number). Writing the formulas out explicitly here removes the
+    # dependency on whatever happens to be in the row above entirely, so it
+    # can't break this way again. Reconstructed by cross-referencing the
+    # archived "Jul 26" tab's frozen values against every input column:
+    # Balance is negative-outstanding / positive-overpaid (blank Collected
+    # Amount means nothing collected yet, so -(Total); otherwise Collected
+    # minus Total), TAT is days elapsed (blank Collected Date means still
+    # open, so TODAY()-Disbursement Date; otherwise Collected Date minus
+    # Disbursement Date), Current Date is just TODAY().
     try:
-        ws.spreadsheet.batch_update({
-            'requests': [{
-                'copyPaste': {
-                    'source': {'sheetId': ws.id,
-                               'startRowIndex': next_row - 2, 'endRowIndex': next_row - 1,
-                               'startColumnIndex': COL['balance'] - 1,
-                               'endColumnIndex': COL['current_date']},
-                    'destination': {'sheetId': ws.id,
-                                    'startRowIndex': next_row - 1, 'endRowIndex': next_row,
-                                    'startColumnIndex': COL['balance'] - 1,
-                                    'endColumnIndex': COL['current_date']},
-                    'pasteType': 'PASTE_FORMULA',
-                }
-            }]
-        })
+        ws.batch_update([
+            {'range': f'O{next_row}', 'values': [[f'=IF(M{next_row}="",-(K{next_row}),M{next_row}-K{next_row})']]},
+            {'range': f'P{next_row}', 'values': [[f'=IF(L{next_row}="",TODAY()-B{next_row},L{next_row}-B{next_row})']]},
+            {'range': f'Q{next_row}', 'values': [['=TODAY()']]},
+        ], value_input_option='USER_ENTERED')
     except Exception as e:
-        print(f'WARNING: could not copy O/P/Q formulas to row {next_row}: {e}')
+        print(f'WARNING: could not write O/P/Q formulas to row {next_row}: {e}')
     trigger_ledger_rebuild()
 
     request_id = data.get('request_id', '').strip()
@@ -944,6 +1294,37 @@ def save_disbursement(data):
             _mark_request_disbursed(request_id, disb_id)
         except Exception:
             pass  # don't fail the disbursement if Requests update errors
+        _log_request_disb_link(request_id, disb_id, data.get('customer', ''),
+                                d.strftime('%d-%m-%Y'))
+
+    # Drop the initial (provisional) invoice+ledger into the same Drive
+    # folder the field app already scanned KYC docs into, and rename that
+    # folder from "<customer> - <request_id>" to "<customer> - <disb_id>"
+    # now that a real disbursement ID exists. Only runs when this case is
+    # actually linked to a field request with a KYC folder -- a manually
+    # entered disbursement with no request_id has nothing to upload into.
+    # Best-effort throughout: a Drive/PDF failure here must never undo or
+    # block a disbursement that's already been recorded in the books.
+    if kyc_folder:
+        try:
+            folder_id = _drive_folder_id_from_url(kyc_folder)
+            if folder_id:
+                case_for_invoice = {
+                    'id': disb_id, 'date': d.date(), 'customer': data.get('customer', ''),
+                    'company': data.get('company', ''), 'cluster': data.get('cluster', ''),
+                    'branch': data.get('branch', ''), 'chq': data.get('chq', ''),
+                    'debit_note': data.get('utr', ''), 'amount': amount, 'charges': charges,
+                    'gst': gst, 'total': total, 'balance': total, 'status': 'Follow Up!',
+                    'days_out': 0, 'charge_plan': 'NEW' if charge_methodology == 'NEW' else '',
+                    'request_id': request_id_for_lookup, 'coll_amt': 0,
+                }
+                pdf_bytes = mis.generate_invoice_ledger(case_for_invoice, mcoll_entry=None, paid_in_full=False)
+                drive = get_drive_client()
+                _upsert_drive_file(drive, folder_id, 'Invoice (Initial).pdf', bytes(pdf_bytes), 'application/pdf')
+                safe_customer = (data.get('customer', '') or 'Customer').replace('/', '-')
+                _rename_drive_folder(drive, folder_id, f"{safe_customer} - {disb_id}")
+        except Exception as e:
+            notify_ops('save_disbursement_kyc_invoice', e)
 
     return disb_id
 
@@ -953,6 +1334,83 @@ def _cell_num(ws, row, col):
         return float(str(val).replace(',', '').replace('₹', '').strip())
     except Exception:
         return 0.0
+
+def _maybe_finalize_bib_hdb_charges(amount, cluster, disbursement_date_str,
+                                     collection_date_str, current_charge_plan,
+                                     was_closed, becomes_closed, new_coll, discount):
+    """Shared by save_repayment() and _recompute_case_from_mcoll() — both
+    reach the same 'a case just transitioned to Closed' moment via
+    different code paths (main Repayment tab vs. the Edit Case tab's
+    add/update/delete-payment actions). Charges for a new-methodology BIB
+    HDB Karnataka case are only PROVISIONAL (best-case 0.4%) until the case
+    actually closes; this finalizes them using the real collection date,
+    but ONLY on the specific call that first transitions non-Closed ->
+    Closed (never an earlier partial instalment, never repeated afterward).
+
+    Since the escalating rate only ever increases with lateness, the
+    recomputed total can only be >= the provisional one — so this can only
+    ever REVEAL a shortfall, never an overpayment. Re-derives new_bal/
+    new_status against the final total rather than blindly keeping
+    'Closed', so a case that collected exactly the provisional estimate
+    but closed a day later than assumed correctly stays open with the true
+    outstanding balance, instead of being marked paid in full.
+
+    Returns (final_charges, final_gst, final_total, new_bal, new_status),
+    or all-None if no recompute applies here — callers keep whatever
+    bal/status they already computed in that case.
+    """
+    if was_closed or not becomes_closed or current_charge_plan != 'NEW':
+        return None, None, None, None, None
+    d_date = _to_plain_date(disbursement_date_str)
+    c_date = _to_plain_date(collection_date_str)
+    charge_calc = calc_charges(amount, cluster=cluster, disbursement_date=d_date,
+                                collection_date=c_date, methodology='NEW')
+    final_charges = charge_calc['charges']
+    final_gst     = charge_calc['gst']
+    final_total   = charge_calc['total']
+    new_bal    = max(0, final_total - new_coll - discount)
+    new_status = 'Closed' if new_bal < 1 else 'Follow Up!'
+    return final_charges, final_gst, final_total, new_bal, new_status
+
+def _maybe_upload_final_invoice(disb_id, was_closed, becomes_closed):
+    """Shared by save_repayment(), _recompute_case_from_mcoll(), and
+    update_disbursement() -- every place a case can transition into
+    'Closed' -- same was_closed/becomes_closed gating convention as
+    _maybe_finalize_bib_hdb_charges() so this only fires on the specific
+    call that first closes the case, never an earlier partial instalment
+    or a later no-op re-save.
+
+    MUST be called after the caller's own sheet write has already
+    completed. Re-reads the case fresh via the exact same
+    _load_for_invoice()/parse_cases() pipeline the manual "Generate
+    Invoice" button itself uses, rather than threading a hand-built case
+    dict through 3 call sites that each have different data already in
+    scope -- fewer places for the final PDF's numbers to disagree with
+    what a human clicking that same button would see (in particular, this
+    means it automatically picks up whatever _maybe_finalize_bib_hdb_charges()
+    just wrote, without duplicating that recompute here).
+
+    Best-effort throughout: never raises, since a Drive/PDF failure here
+    must never affect the real status/balance write that already
+    happened."""
+    if was_closed or not becomes_closed:
+        return
+    try:
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+        rows, mcoll = _load_for_invoice(sh, disb_id)
+        _, _, all_cases_full = mis.parse_cases(rows, mcoll)
+        case = next((c for c in all_cases_full if c['id'].upper() == disb_id.upper()), None)
+        if not case or not case.get('kyc_folder'):
+            return  # not a field-request-linked case, or no KYC folder to file into
+        folder_id = _drive_folder_id_from_url(case['kyc_folder'])
+        if not folder_id:
+            return
+        mcoll_entry = mcoll.get(disb_id.upper())
+        pdf_bytes = mis.generate_invoice_ledger(case, mcoll_entry=mcoll_entry, paid_in_full=True)
+        drive = get_drive_client()
+        _upsert_drive_file(drive, folder_id, 'Invoice (Final).pdf', bytes(pdf_bytes), 'application/pdf')
+    except Exception as e:
+        notify_ops('final_invoice_upload', e)
 
 def save_repayment(data):
     disb_id = data['disb_id'].strip().upper()
@@ -979,6 +1437,7 @@ def save_repayment(data):
     sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
     row = info['row']
+    _ensure_accounts_charge_plan_column(ws)
 
     # One row read instead of up to 4 separate single-cell round trips
     # (coll_amount, total, amount, credit_note, remarks each used to be
@@ -1004,6 +1463,16 @@ def save_repayment(data):
     # generate_mis.py already uses for its own reports.
     new_status = 'Closed' if new_bal < 1 else info['status']
 
+    final_charges, final_gst, final_total, recomputed_bal, recomputed_status = \
+        _maybe_finalize_bib_hdb_charges(
+            amount=_rownum('amount'), cluster=_rowstr('cluster'),
+            disbursement_date_str=_rowstr('date'), collection_date_str=coll_date,
+            current_charge_plan=_rowstr('charge_plan'),
+            was_closed=(info['status'] == 'Closed'), becomes_closed=(new_status == 'Closed'),
+            new_coll=new_coll, discount=discount)
+    if final_charges is not None:
+        new_bal, new_status = recomputed_bal, recomputed_status
+
     updates = [
         (row, COL['coll_date'],   coll_date),
         (row, COL['coll_amount'], new_coll),
@@ -1016,6 +1485,10 @@ def save_repayment(data):
         # from Total/Collected/Discount (_parse_case()/_case_detail()), so
         # nothing here depends on what column O contains.
     ]
+    if final_charges is not None:
+        updates += [(row, COL['charges'], final_charges),
+                    (row, COL['gst'],     final_gst),
+                    (row, COL['total'],   final_total)]
     if discount:
         updates.append((row, COL['discount'], discount))
 
@@ -1066,6 +1539,9 @@ def save_repayment(data):
             ws.update_cell(row, COL['remarks'], combined)
         except Exception:
             pass  # best-effort — the warning-write itself must not blow up the request
+
+    _maybe_upload_final_invoice(disb_id, was_closed=(info['status'] == 'Closed'),
+                                 becomes_closed=(new_status == 'Closed'))
 
     trigger_ledger_rebuild()
     result = {'new_collected': new_coll, 'new_balance': new_bal, 'status': new_status}
@@ -1239,6 +1715,8 @@ def _case_detail(disb_id, known=None):
         'balance': balance, 'status': cell('status'),
         'srv_branch': cell('srv_branch'), 'srv_cluster': cell('srv_cluster'),
         'debit_note': cell('debit_note'), 'remarks': cell('remarks'),
+        'kyc_folder': cell('kyc_folder'),
+        'request_id': cell('request_id'),
         'payments': payments,
     }
 
@@ -1247,9 +1725,9 @@ EDITABLE_TEXT_FIELDS = ('date', 'customer', 'chq', 'company', 'cluster', 'branch
 
 def update_disbursement(data):
     """Writes corrected disbursement fields back to the case's Accounts row.
-    An amount change recomputes the derived money chain (charges 0.5%, GST
-    18% on charges, total) and re-derives status/balance against existing
-    collections."""
+    An amount change recomputes the derived money chain via calc_charges()
+    (flat 0.5%/18% for every cluster except BIB HDB Karnataka's day-based
+    schedule) and re-derives status/balance against existing collections."""
     disb_id = data['disb_id'].strip().upper()
     info = lookup_case(disb_id)
     if not info['found']:
@@ -1257,15 +1735,52 @@ def update_disbursement(data):
     sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
     row = info['row']
+    _ensure_accounts_charge_plan_column(ws)
 
     updates = [(row, COL[k], str(data[k]).strip())
                for k in EDITABLE_TEXT_FIELDS if k in data]
 
-    if str(data.get('amount', '')).strip() != '':
-        amount  = float(data['amount'])
-        charges = round(amount * 0.005, 2)
-        gst     = round(charges * 0.18, 2)
-        total   = round(amount + charges + gst, 2)
+    cluster_changing = 'cluster' in data
+    amount_changing  = str(data.get('amount', '')).strip() != ''
+
+    # One row read (only when actually needed) instead of separate single-
+    # cell round trips — same efficiency rationale save_repayment() already
+    # documents. Needed whenever we must know this row's CURRENT cluster/
+    # date/charge_plan marker (i.e. whichever of those aren't being
+    # overwritten by this exact call).
+    row_vals = None
+    def _current(col_key):
+        nonlocal row_vals
+        if row_vals is None:
+            row_vals = ws.row_values(row)
+        i = COL[col_key] - 1
+        return row_vals[i] if i < len(row_vals) else ''
+
+    if cluster_changing or amount_changing:
+        effective_cluster = str(data['cluster']).strip() if cluster_changing else _current('cluster')
+        effective_date = _to_plain_date(str(data['date']).strip() if 'date' in data else _current('date'))
+
+    # A mis-entered cluster fixed after the fact shouldn't permanently miss
+    # (or wrongly keep stamped) the day-based schedule just because the
+    # marker was only ever decided once, at original disbursement time.
+    new_marker = None
+    if cluster_changing:
+        new_marker = _resolve_bib_hdb_methodology(effective_cluster, effective_date)
+        # Only stamp 'NEW' — None/'OLD' both mean "flat legacy formula",
+        # same "blank = old" convention save_disbursement() establishes.
+        updates.append((row, COL['charge_plan'], 'NEW' if new_marker == 'NEW' else ''))
+
+    if amount_changing:
+        amount = float(data['amount'])
+        # Prefer a methodology just (re-)decided above if cluster changed
+        # this same call; otherwise this row's already-stamped marker is
+        # authoritative and untouched by this specific edit.
+        methodology = new_marker if cluster_changing else (
+            'NEW' if _current('charge_plan') == 'NEW' else None)
+        charge_calc = calc_charges(amount, cluster=effective_cluster,
+                                    disbursement_date=effective_date,
+                                    methodology=methodology)
+        charges = charge_calc['charges']; gst = charge_calc['gst']; total = charge_calc['total']
         collected = _cell_num(ws, row, COL['coll_amount'])
         discount  = _cell_num(ws, row, COL['discount'])
         bal       = max(0, total - collected - discount)
@@ -1288,6 +1803,14 @@ def update_disbursement(data):
         } for r, c, v in updates])
         trigger_ledger_rebuild()
 
+    # Only the amount-changing branch above can transition status here (an
+    # amount correction that leaves bal < 1) -- `status` only exists in that
+    # branch's scope, so gate on the same amount_changing flag rather than
+    # checking `'status' in locals()`.
+    if amount_changing:
+        _maybe_upload_final_invoice(disb_id, was_closed=(info['status'] == 'Closed'),
+                                     becomes_closed=(status == 'Closed'))
+
     # Handed back to the route so it can build the response via _case_detail()
     # without a second full lookup_case() (Accounts + every archive tab scan).
     return {'sheet': info['sheet'], 'row': row}
@@ -1305,6 +1828,7 @@ def _recompute_case_from_mcoll(disb_id):
     sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
     row = info['row']
+    _ensure_accounts_charge_plan_column(ws)
 
     mc_all = sh.worksheet('M Coll').get_all_values()
     payments = [{
@@ -1324,49 +1848,110 @@ def _recompute_case_from_mcoll(disb_id):
     dated = [(d, r[1]) for r in pays if len(r) > 1 for d in [_pd(r[1])] if d]
     coll_date = max(dated)[1] if dated else (pays[-1][1] if pays and len(pays[-1]) > 1 else '')
 
-    total    = _cell_num(ws, row, COL['total']) or calc_total(_cell_num(ws, row, COL['amount']))
-    discount = _cell_num(ws, row, COL['discount'])
+    # One row read — same efficiency rationale as save_repayment() — covers
+    # amount/total/discount/cluster/date/charge_plan without extra round trips.
+    row_vals = ws.row_values(row)
+    def _rownum(col_key):
+        i = COL[col_key] - 1
+        v = row_vals[i] if i < len(row_vals) else ''
+        try:
+            return float(str(v).replace(',', '').replace('₹', '').strip() or 0)
+        except Exception:
+            return 0.0
+    def _rowstr(col_key):
+        i = COL[col_key] - 1
+        return (row_vals[i] if i < len(row_vals) else '') or ''
+
+    total    = _rownum('total') or calc_total(_rownum('amount'))
+    discount = _rownum('discount')
     bal      = max(0, total - collected - discount)
     status   = 'Closed' if bal < 1 else 'Follow Up!'
+    was_closed = _rowstr('status').strip() == 'Closed'
+
+    final_charges, final_gst, final_total, recomputed_bal, recomputed_status = \
+        _maybe_finalize_bib_hdb_charges(
+            amount=_rownum('amount'), cluster=_rowstr('cluster'),
+            disbursement_date_str=_rowstr('date'), collection_date_str=coll_date,
+            current_charge_plan=_rowstr('charge_plan'),
+            was_closed=was_closed, becomes_closed=(status == 'Closed'),
+            new_coll=collected, discount=discount)
+    if final_charges is not None:
+        bal, status = recomputed_bal, recomputed_status
 
     # Balance (col O) is never written — same reasoning as save_repayment()
     # and update_disbursement(): it's a live formula that recomputes on its
     # own once Collected Amount (written below) changes.
+    batch = [(COL['coll_date'], coll_date), (COL['coll_amount'], collected),
+             (COL['status'], status)]
+    if final_charges is not None:
+        batch += [(COL['charges'], final_charges), (COL['gst'], final_gst),
+                  (COL['total'], final_total)]
     ws.batch_update([{
         'range': gspread.utils.rowcol_to_a1(row, c),
         'values': [[v]]
-    } for c, v in [(COL['coll_date'], coll_date), (COL['coll_amount'], collected),
-                   (COL['status'], status)]])
+    } for c, v in batch])
     trigger_ledger_rebuild()
+
+    _maybe_upload_final_invoice(disb_id, was_closed=was_closed, becomes_closed=(status == 'Closed'))
 
     return {'sheet': info['sheet'], 'row': row, 'payments': payments}
 
 def _mcoll_row_checked(sh, disb_id, mc_row):
     """Guard against stale row numbers: the M Coll row being targeted must
-    still belong to this case."""
+    still belong to this case. Returns (worksheet, current_row_values) so
+    callers that need the row's existing values don't re-fetch them."""
     mc = sh.worksheet('M Coll')
     current = mc.row_values(mc_row)
     if not current or str(current[0]).strip().upper() != disb_id.strip().upper():
         raise ValueError('That payment row has moved — reload the case and try again.')
-    return mc
+    return mc, current
 
 def update_repayment(data):
     disb_id = data['disb_id'].strip().upper()
     mc_row  = int(data['mc_row'])
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
-    mc = _mcoll_row_checked(sh, disb_id, mc_row)
+    mc, current = _mcoll_row_checked(sh, disb_id, mc_row)
+
+    # Known gap: _recompute_case_from_mcoll()'s BIB HDB Karnataka finalize
+    # hook only fires on a non-Closed -> Closed transition. Correcting the
+    # DATE of a payment that already closed the case stays Closed -> Closed
+    # throughout, so it's silently skipped — if that date correction would
+    # have shifted the days-late bucket, the already-finalized charge could
+    # go stale. Surfacing a warning (rather than silently doing nothing, or
+    # auto-recomputing against the "only on transition" default) matches
+    # this codebase's existing mcoll_warning precedent in save_repayment().
+    new_date = str(data.get('date', '')).strip()
+    warn = None
+    try:
+        info = lookup_case(disb_id)
+        if info['found'] and info['status'] == 'Closed':
+            ws_check = sh.worksheet(info.get('sheet', SHEET_NAME))
+            _ensure_accounts_charge_plan_column(ws_check)
+            if ws_check.cell(info['row'], COL['charge_plan']).value == 'NEW':
+                old_date = current[1] if len(current) > 1 else ''
+                if new_date and new_date != old_date:
+                    warn = ('This case is Closed under the BIB HDB Karnataka day-based '
+                            'schedule — correcting this payment\'s date does not '
+                            'automatically re-finalize Charges/GST/Total. Recheck them '
+                            'manually if the days-late bucket may have changed.')
+    except Exception:
+        pass  # best-effort warning only — must never block the actual correction
+
     mc.batch_update([
-        {'range': gspread.utils.rowcol_to_a1(mc_row, 2), 'values': [[str(data.get('date', '')).strip()]]},
+        {'range': gspread.utils.rowcol_to_a1(mc_row, 2), 'values': [[new_date]]},
         {'range': gspread.utils.rowcol_to_a1(mc_row, 3), 'values': [[float(data['amount'])]]},
         {'range': gspread.utils.rowcol_to_a1(mc_row, 4), 'values': [[str(data.get('utr', '')).strip()]]},
     ])
-    return _recompute_case_from_mcoll(disb_id)
+    result = _recompute_case_from_mcoll(disb_id)
+    if warn:
+        result['charge_plan_warning'] = warn
+    return result
 
 def delete_repayment(data):
     disb_id = data['disb_id'].strip().upper()
     mc_row  = int(data['mc_row'])
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
-    mc = _mcoll_row_checked(sh, disb_id, mc_row)
+    mc, _ = _mcoll_row_checked(sh, disb_id, mc_row)
     mc.delete_rows(mc_row)
     return _recompute_case_from_mcoll(disb_id)
 
@@ -1618,17 +2203,60 @@ def _last_recon_closing_for_account(account):
     except Exception:
         return None, None
 
-def _account_tagged_activity(records, mc_rows, account, period_month):
-    """This period's tagged disbursement/collection totals for ONE account,
-    plus a count of book entries this period (any account, including
-    untagged) — the untagged count is what decides whether the tie-out can
-    be trusted at all (see _account_tieout)."""
+# FD balance is deliberately NOT derived from summing "FD Booking"-classified
+# sweep-in/sweep-out transactions across reconciliation history (the old
+# approach) — that sum has no opening baseline (implicitly assumes the FD
+# balance was exactly ₹0 the day reconciliation tracking began) and is
+# silently corrupted by any gap in day-by-day reconciliation coverage: a
+# sweep-out captured on a reconciled day whose later matching sweep-in falls
+# on an unreconciled day never gets offset, permanently inflating the
+# figure. Confirmed live, 06-08-2026: applying a proper flow-balance check
+# (Prem's own model) against real classified IDFC data showed a ~₹39.5L gap
+# between what the transaction history implied and the real observed
+# closing balance, traced to 8 unreconciled days within the supposedly-
+# covered window. Available to Disburse was silently inflated by that same
+# broken derivation.
+#
+# Fixed the same way bank balance already works: trust a directly-entered,
+# real observed number (from an FD statement / netbanking FD summary) at
+# each check-in, exactly like Opening/Closing Balance already are for the
+# bank accounts, instead of reconstructing it from transaction arithmetic
+# that a reconciliation gap can silently corrupt. Reuses the Recon Log
+# sheet/mechanism verbatim via a pseudo-account label — no schema change,
+# and get_latest_bank_balance()'s own registered-accounts filter already
+# excludes anything not in Config's bank_accounts list, so this can never
+# accidentally get summed into the real bank_balance figure.
+FD_ACCOUNT_LABEL = 'FD (Total)'
+
+def get_latest_fd_balance():
+    """(balance, date) from the last directly-entered FD balance snapshot,
+    or (None, None) if none has ever been entered yet."""
+    return _last_recon_closing_for_account(FD_ACCOUNT_LABEL)
+
+def save_fd_balance(date_str, balance):
+    d = _parse_recon_date(date_str)
+    if not d:
+        raise ValueError(f"Could not parse date '{date_str}'.")
+    bal = float(balance)
+    ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(RECON_LOG_SHEET_NAME)
+    ws.append_row([d.strftime('%d-%m-%Y'), '', bal,
+                    datetime.today().strftime('%d-%m-%Y %H:%M'), FD_ACCOUNT_LABEL])
+    return bal, d
+
+def _account_tagged_activity(records, mc_rows, account, since_date, through_date):
+    """Tagged disbursement/collection totals for ONE account, dated strictly
+    AFTER since_date (the last reconciled closing's own date — already
+    reflected in that closing balance, so re-including it double-counts)
+    through through_date inclusive (this statement's own recon date) — NOT
+    the whole calendar month. Plus a count of book entries in that same
+    window (any account, including untagged) — the untagged count is what
+    decides whether the tie-out can be trusted at all (see _account_tieout)."""
     disb_total = disb_count = 0.0
     coll_total = coll_count = 0.0
     untagged = total = 0
     for r in records:
         ddate = str(r.get('Disbursement Date', '') or '')
-        if not _date_in_period(ddate, period_month):
+        if not _date_in_range(ddate, since_date, through_date):
             continue
         total += 1
         tag = (r.get('Bank Account', '') or '').strip()
@@ -1639,7 +2267,7 @@ def _account_tagged_activity(records, mc_rows, account, period_month):
     for mc in mc_rows:
         did   = (mc[0] if len(mc) > 0 else '').strip()
         pdate = mc[1] if len(mc) > 1 else ''
-        if not did or not _date_in_period(str(pdate), period_month):
+        if not did or not _date_in_range(str(pdate), since_date, through_date):
             continue
         total += 1
         tag = (mc[5] if len(mc) > 5 else '').strip()
@@ -1651,10 +2279,17 @@ def _account_tagged_activity(records, mc_rows, account, period_month):
             'coll_total': round(coll_total, 2), 'coll_count': coll_count,
             'untagged_count': untagged, 'total_count': total}
 
-def _account_tieout(records, mc_rows, account, period_month, classified_txns, statement_closing):
+def _account_tieout(records, mc_rows, account, period_month, classified_txns, statement_closing, recon_date=None):
     """Is this bank statement's own closing balance what the (tagged) books
-    say it should be for this one account? Degrades to 'incomplete' rather
-    than computing a number whenever any book entry this period — for ANY
+    say it should be for this one account? Compares against book activity
+    strictly AFTER the last reconciled closing's own date, through this
+    statement's own recon date — NOT the whole calendar month. The last
+    closing already reflects everything up to and including its own date,
+    so summing "this period" as the full month double-counts every day
+    between the 1st and the last reconciliation, which is exactly what
+    produced an impossible deeply-negative expected closing the one time
+    this went unnoticed (07-08-2026). Degrades to 'incomplete' rather than
+    computing a number whenever any book entry in that window — for ANY
     account, including untagged ones — lacks a Bank Account tag, since an
     untagged row could belong to the account being reconciled and there's
     no way to know; treating it as "not this account's" would silently
@@ -1665,21 +2300,22 @@ def _account_tieout(records, mc_rows, account, period_month, classified_txns, st
     if not account or not period_month:
         return {'status': 'no_account_selected'}
 
-    activity = _account_tagged_activity(records, mc_rows, account, period_month)
+    last_closing, last_date = _last_recon_closing_for_account(account)
+    if last_closing is None or last_date is None:
+        return {'status': 'no_history',
+                'message': f'No prior reconciliation found for "{account}" — nothing to tie out against yet.'}
+
+    through_date = _parse_flex_date(recon_date) or date.today()
+    activity = _account_tagged_activity(records, mc_rows, account, last_date.date(), through_date)
     if activity['untagged_count'] > 0:
         return {
             'status': 'incomplete',
             'untagged_count': activity['untagged_count'],
             'total_count': activity['total_count'],
             'message': (f"{activity['untagged_count']} of {activity['total_count']} book entries "
-                        f"this period have no Bank Account tag — cannot reliably attribute "
-                        f"book activity to \"{account}\" yet."),
+                        f"since the last reconciliation ({last_date.strftime('%d-%m-%Y')}) have no Bank "
+                        f"Account tag — cannot reliably attribute book activity to \"{account}\" yet."),
         }
-
-    last_closing, last_date = _last_recon_closing_for_account(account)
-    if last_closing is None:
-        return {'status': 'no_history',
-                'message': f'No prior reconciliation found for "{account}" — nothing to tie out against yet.'}
 
     expected_closing = round(last_closing + activity['coll_total'] - activity['disb_total'], 2)
     variance = round(statement_closing - expected_closing, 2)
@@ -1718,6 +2354,36 @@ def get_today_summary():
     bank_balance, bank_date = get_latest_bank_balance()
     today = datetime.today().date()
 
+    # Per-account last-reconciled date, so "since bank" activity is measured
+    # against the account it actually happened in -- NOT the single earliest
+    # date across all accounts. That single-cutoff approach double-counts:
+    # any disbursement/collection tagged to whichever account was
+    # reconciled MORE recently is already reflected in THAT account's own
+    # closing balance, but re-adding/re-subtracting it here too (because
+    # it's more recent than the OTHER account's cutoff) throws off
+    # Available to Disburse the moment two accounts' reconciliation dates
+    # drift apart -- which is the normal case, not an edge case; accounts
+    # are rarely reconciled on the exact same day. Untagged rows (no Bank
+    # Account column value) and any account with no reconciliation history
+    # yet fall back to the conservative shared earliest date, so they're
+    # never silently dropped from the window.
+    account_dates = {}
+    try:
+        for acc in (load_config().get('bank_accounts') or []):
+            acc_name = acc.get('name', '').strip()
+            if acc_name:
+                _, acc_date = _last_recon_closing_for_account(acc_name)
+                if acc_date:
+                    account_dates[acc_name] = acc_date
+    except Exception:
+        pass
+
+    def _cutoff_for_tag(tag):
+        tag = (tag or '').strip()
+        if tag and tag in account_dates:
+            return account_dates[tag]
+        return bank_date
+
     disbursed_today = 0
     collected_today = 0
     total_outstanding = 0
@@ -1734,7 +2400,8 @@ def get_today_summary():
             amt = _to_num(r.get('Amount', 0))
             disbursed_today += amt
             disb_rows.append({'disb_id': did, 'customer': name, 'amount': amt})
-        if d and bank_date and d.date() > bank_date.date():
+        cutoff = _cutoff_for_tag(r.get('Bank Account', ''))
+        if d and cutoff and d.date() > cutoff.date():
             disbursed_since_bank += _to_num(r.get('Amount', 0))
         if r.get('Overdue Status','').strip() not in ('Closed',''):
             _, total, collected, balance = _parse_case(r)
@@ -1750,19 +2417,50 @@ def get_today_summary():
         if ev_date == today:
             collected_today += ev['amount']
             coll_rows.append({'disb_id': ev['disb_id'], 'customer': ev['customer'], 'amount': ev['amount']})
-        if bank_date and ev_date > bank_date.date():
+        cutoff = _cutoff_for_tag(ev.get('bank_account', ''))
+        if cutoff and ev_date > cutoff.date():
             collected_since_bank += ev['amount']
 
     # Money currently parked in a sweep-in FD is still disbursable — it
     # sweeps back automatically the moment the account needs it — so it
     # must not read as unavailable just because it isn't sitting as raw
-    # balance. fd_total from _all_time_recon_totals() is already NET
-    # (booked minus matured/swept-back), so a matured FD stops counting
-    # here the moment it's reconciled back into the account.
+    # balance.
+    #
+    # Sourced from the PER-FD LEDGER (_fd_ledger()) — every sweep leg is in
+    # the bank statement and carries its own FD account number, so this is
+    # fully derivable with no manual entry at all, and it reconciled to the
+    # real FD balance to the rupee on 11-08-2026 (see _fd_ledger()'s comment
+    # for the proof and for why the old blind net-sum lost 2,14,528).
+    #
+    # A directly-entered balance (save_fd_balance()) still wins, but ONLY
+    # when it is dated on/after the newest FD transaction the ledger has
+    # seen — otherwise it is by definition stale (sweeps have happened since
+    # a human last looked) and would freeze the dashboard at an old number,
+    # which is precisely the failure this whole mechanism exists to end.
+    fd_date = None
+    fd_ledger_info = None
     try:
-        fd_outstanding = _all_time_recon_totals()['fd_total']
+        fd_ledger_info = _fd_ledger()
+        fd_outstanding = max(0.0, fd_ledger_info['fd_total'])
+        fd_source = 'fd_ledger'
+        direct_bal, direct_date = get_latest_fd_balance()
+        if direct_bal is not None and direct_date is not None:
+            latest_txn = fd_ledger_info.get('latest_fd_txn_date')
+            if latest_txn is None or direct_date.date() >= latest_txn:
+                fd_outstanding, fd_date = direct_bal, direct_date
+                fd_source = 'direct_override'
     except Exception:
-        fd_outstanding = 0.0
+        # Last-resort only: the old blind net sum. Known to understate
+        # whenever an FD predates the reconciliation history or interest
+        # comes back with the principal — kept purely so the dashboard
+        # degrades to a number rather than going blank, and labelled so it
+        # is never mistaken for the trustworthy figure.
+        try:
+            fd_outstanding = max(0.0, _all_time_recon_totals()['fd_total'])
+            fd_source = 'derived_fallback'
+        except Exception:
+            fd_outstanding = 0.0
+            fd_source = 'unavailable'
 
     available = None
     if bank_balance is not None:
@@ -1773,6 +2471,11 @@ def get_today_summary():
         'total_outstanding': total_outstanding,
         'available_for_disbursement': available,
         'fd_outstanding': fd_outstanding,
+        'fd_outstanding_date': fd_date.strftime('%d %b %Y') if fd_date else None,
+        'fd_outstanding_source': fd_source,
+        'fd_open_count': (fd_ledger_info or {}).get('open_fd_count'),
+        'fd_orphan_total': (fd_ledger_info or {}).get('orphan_sweepin_total'),
+        'fd_unparsed_count': len((fd_ledger_info or {}).get('unparsed') or []),
         'bank_balance': bank_balance,
         'bank_balance_date': bank_date.strftime('%d %b %Y') if bank_date else None,
         'disbursed_since_bank': disbursed_since_bank,
@@ -1789,32 +2492,221 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-def parse_bank_statement(filepath, filename):
-    """Parse bank statement CSV/Excel. Returns transactions + opening/closing balance."""
+def _parse_pdf_bank_statement(filepath):
+    """PDF 'Statement of Account' bank statements — confirmed against a real
+    IDFC FIRST Bank PDF (06-08-2026). Every page repeats two bordered
+    tables: a 4-column Opening/Total Debit/Total Credit/Closing summary,
+    and the 7-column transaction table (Transaction Date, Value Date,
+    Particulars, Cheque No, Debit, Credit, Balance) with its header row
+    repeated on every page. Tables are told apart by their own header text,
+    not position, so a page with only one of the two (or an extra
+    boilerplate table, e.g. the abbreviations glossary on the last pages)
+    is handled correctly either way.
+
+    One real wrinkle, confirmed in the sample: a transaction's multi-line
+    narration can be split across a page boundary — the tail of the
+    narration (and the actual Debit/Credit/Balance values) then land in a
+    separate 'row' at the very top of the next page, with both date cells
+    blank. Detected purely on "both date cells blank" and merged into the
+    previous row. The one other blank-dates case is the leading "Opening
+    Balance" row itself, handled as a special first case so it's never
+    mistaken for a continuation with nothing to attach to.
+
+    Cheque No is folded into Particulars unconditionally rather than kept
+    as its own column — in the real sample it never once carried a genuine
+    cheque number, only stray line-wrap fragments (e.g. a trailing "/")
+    that pdfplumber's grid extraction occasionally spills into that
+    column. Left as its own field, one of those fragments could get read
+    downstream as if it were a real credit reference — see the UTR
+    comment further below in parse_bank_statement().
+
+    Verified against the real sample: summed Debit/Credit across every
+    parsed row matched the statement's own printed Total Debit/Total
+    Credit to the paisa, and Opening − Debit + Credit reproduced the
+    printed Closing Balance exactly — i.e. no transaction is lost,
+    duplicated, or corrupted by the page-merge step.
+    """
+    import pdfplumber
+    all_rows = []
+    summary = {}
+    with pdfplumber.open(filepath) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables():
+                if not table or not table[0]:
+                    continue
+                header_text = ' '.join((c or '') for c in table[0]).lower()
+                if 'opening balance' in header_text and 'closing balance' in header_text:
+                    if not summary and len(table) > 1:
+                        vals = table[1]
+                        summary['opening'] = _clean_amount(vals[0]) if len(vals) > 0 else None
+                        summary['closing'] = _clean_amount(vals[3]) if len(vals) > 3 else None
+                elif 'transaction' in header_text and 'particulars' in header_text:
+                    for row in table[1:]:
+                        cells = [(c or '').strip() for c in row]
+                        cells += [''] * (7 - len(cells))
+                        all_rows.append(cells[:7])
+                # Any other table (e.g. the abbreviations glossary on the
+                # final pages) is boilerplate — not transaction data, skip.
+
+    if not all_rows:
+        raise ValueError("Could not find a transaction table in the PDF.")
+
+    merged = []
+    for date, value_date, particulars, cheque, debit, credit, balance in all_rows:
+        particulars = (particulars + ' ' + cheque).strip() if cheque else particulars
+        if not date and not value_date:
+            if particulars.strip().lower() == 'opening balance' and not merged:
+                continue  # already have this from the summary table
+            if merged:
+                prev = merged[-1]
+                if particulars: prev[1] = (prev[1] + ' ' + particulars).strip()
+                if debit:        prev[2] = debit
+                if credit:       prev[3] = credit
+                if balance:      prev[4] = balance
+                continue
+        merged.append([date, particulars, debit, credit, balance])
+
+    header = ['Date', 'Particulars', 'Debit', 'Credit', 'Balance']
+    df = pd.DataFrame([header] + merged)
+    return df, summary.get('opening'), summary.get('closing')
+
+# The statement declares its own period, e.g.
+#   'STATEMENT PERIOD    11-Aug-2026 TO 11-Aug-2026'
+# so the reconciliation date should be READ FROM THE FILE, never hand-typed.
+# Added 12-08-2026 after a mislabelled upload (an 11-Aug IDFC statement saved
+# under 12-Aug) put the two bank accounts on different reconciliation dates —
+# which is precisely the state in which a contra transfer between our own
+# accounts silently vanishes from the bank total (see _solvency_check()'s
+# divergence warning). Removing the manual step removes that whole class of
+# error rather than warning about it after the fact.
+_STMT_PERIOD_PATTERNS = (
+    re.compile(r'statement\s*period\s*[:\-]?\s*(.+?)\s+(?:to|through|-)\s+([0-9]{1,2}[-/][A-Za-z0-9]{2,9}[-/][0-9]{2,4})',
+               re.IGNORECASE),
+    re.compile(r'(?:period|from)\s*[:\-]?\s*([0-9]{1,2}[-/][A-Za-z0-9]{2,9}[-/][0-9]{2,4})\s+(?:to|through)\s+([0-9]{1,2}[-/][A-Za-z0-9]{2,9}[-/][0-9]{2,4})',
+               re.IGNORECASE),
+)
+
+def _extract_statement_period(text_lines):
+    """(from_date, to_date) as date objects, or (None, None). Only accepts a
+    period whose BOTH ends parse — a half-read period is worse than none,
+    since it would silently mislabel the save."""
+    for line in text_lines:
+        s = ' '.join(str(line).split())
+        if not s:
+            continue
+        for pat in _STMT_PERIOD_PATTERNS:
+            m = pat.search(s)
+            if not m:
+                continue
+            raw_from = m.group(1).strip().split()[-1] if m.group(1).strip() else ''
+            d_from = _parse_flex_date(raw_from)
+            d_to = _parse_flex_date(m.group(2).strip())
+            if d_from and d_to:
+                return d_from, d_to
+    return None, None
+
+# The statement also names its own account, e.g.
+#   'Account Number   50200012345678'   /   'A/c No: 10012345678'
+# Read it for the same reason the period is read: the account selector is the
+# other hand-entered field in this flow with no source of truth behind it, and
+# picking the wrong one files a whole day's transactions against the wrong
+# bank. With two statements uploaded together (13-08-2026) an unnoticed
+# mis-selection would additionally cross-pair the two accounts' transfers, so
+# detection matters more than it did when files were parsed one at a time.
+#
+# Masked forms (XXXXXXXX0923, ****3437) are accepted too — most statements
+# print the number that way, and the visible tail is enough to identify it.
+_STMT_ACCOUNT_PATTERNS = (
+    re.compile(r'(?:account|a\s*/?\s*c)\s*(?:number|no\.?|#)?\s*[:\-]?\s*([0-9X\*x]{2,20}[0-9]{4})\b',
+               re.IGNORECASE),
+    re.compile(r'\b([0-9]{9,18})\b\s*(?:current|savings|sb|ca)\s*(?:account|a/c)', re.IGNORECASE),
+)
+
+def _extract_statement_account(text_lines, bank_accounts):
+    """(account_name, detected_number) matched against Config's registered
+    bank_accounts, or (None, detected_number/None).
+
+    Matches on the FULL number when the statement prints it in full, and
+    otherwise on the last 4 digits — statements routinely mask the leading
+    digits (XXXXXXXX3437), and the last 4 are what a human recognises anyway.
+    A last-4 match is only accepted when exactly one registered account ends
+    in those digits; two accounts sharing a suffix means we cannot tell them
+    apart, and guessing would be worse than asking.
+    """
+    registered = [(a.get('name', '').strip(), re.sub(r'\D', '', str(a.get('account_number', '') or '')))
+                  for a in (bank_accounts or []) if a.get('name', '').strip()]
+    for line in text_lines[:60]:   # header block only; txn rows can contain long refs
+        s = ' '.join(str(line).split())
+        if not s:
+            continue
+        for pat in _STMT_ACCOUNT_PATTERNS:
+            for m in pat.finditer(s):
+                raw = m.group(1)
+                masked = bool(re.search(r'[X\*x]', raw))
+                num = re.sub(r'\D', '', raw)
+                if len(num) < 4:
+                    continue
+                # An unmasked value must still look like a real account
+                # number, or every long reference in a header line qualifies.
+                if not masked and not (9 <= len(num) <= 18):
+                    continue
+                if not masked:
+                    exact = [n for n, a in registered if a and a == num]
+                    if exact:
+                        return exact[0], num
+                tail = [n for n, a in registered if a and len(a) >= 4 and a[-4:] == num[-4:]]
+                if len(tail) == 1:
+                    return tail[0], raw
+                if len(tail) > 1:
+                    return None, raw
+    return None, None
+
+def parse_bank_statement(filepath, filename, bank_accounts=None):
+    """Parse bank statement CSV/Excel/PDF. Returns transactions + opening/closing balance."""
     ext = filename.lower().rsplit('.', 1)[-1]
     try:
         if ext == 'csv':
             df = pd.read_csv(filepath, header=None, dtype=str, encoding='utf-8', on_bad_lines='skip')
         elif ext == 'xls':
             df = pd.read_excel(filepath, header=None, dtype=str, engine='xlrd')
+        elif ext == 'pdf':
+            df, pdf_opening, pdf_closing = _parse_pdf_bank_statement(filepath)
         else:
             df = pd.read_excel(filepath, header=None, dtype=str, engine='openpyxl')
     except Exception as e:
         raise ValueError(f"Could not read file: {e}")
 
-    # Scan for opening / closing balance in metadata rows
+    # Read the statement's own declared period before anything else — this is
+    # the authoritative reconciliation date, in preference to whatever a human
+    # typed into the date box.
+    try:
+        _period_lines = [' '.join(str(c).strip() for c in row if pd.notna(c) and str(c).strip())
+                         for _, row in df.iterrows()]
+    except Exception:
+        _period_lines = []
+    stmt_from, stmt_to = _extract_statement_period(_period_lines)
+    stmt_account, stmt_account_no = _extract_statement_account(_period_lines, bank_accounts)
+
     opening_balance = closing_balance = None
-    for _, row in df.iterrows():
-        cells = [str(c).strip() for c in row if pd.notna(c) and str(c).strip()]
-        combined = ' '.join(cells).lower()
-        if opening_balance is None and 'opening' in combined and 'balance' in combined:
-            for c in cells:
-                v = _clean_amount(c)
-                if v: opening_balance = v; break
-        if closing_balance is None and ('closing' in combined or 'available balance' in combined) and 'balance' in combined:
-            for c in cells:
-                v = _clean_amount(c)
-                if v: closing_balance = v; break
+    if ext == 'pdf':
+        # The PDF's transaction table has no "Opening/Closing Balance"
+        # labeled row for the scan below to find (that text lives only in
+        # the separate summary table, already extracted above) — trust it
+        # directly rather than running a scan that would find nothing.
+        opening_balance, closing_balance = pdf_opening, pdf_closing
+    else:
+        # Scan for opening / closing balance in metadata rows
+        for _, row in df.iterrows():
+            cells = [str(c).strip() for c in row if pd.notna(c) and str(c).strip()]
+            combined = ' '.join(cells).lower()
+            if opening_balance is None and 'opening' in combined and 'balance' in combined:
+                for c in cells:
+                    v = _clean_amount(c)
+                    if v: opening_balance = v; break
+            if closing_balance is None and ('closing' in combined or 'available balance' in combined) and 'balance' in combined:
+                for c in cells:
+                    v = _clean_amount(c)
+                    if v: closing_balance = v; break
 
     # Find transaction header row
     header_row = None
@@ -1934,7 +2826,11 @@ def parse_bank_statement(filepath, filename):
 
     return {'transactions': rows,
             'opening_balance': opening_balance or 0,
-            'closing_balance': closing_balance or 0}
+            'closing_balance': closing_balance or 0,
+            'statement_from': stmt_from.strftime('%d-%m-%Y') if stmt_from else None,
+            'statement_to': stmt_to.strftime('%d-%m-%Y') if stmt_to else None,
+            'statement_account': stmt_account,
+            'statement_account_no': stmt_account_no}
 
 def _clean_amount(v):
     try:
@@ -2007,9 +2903,50 @@ def _expense_category(desc):
     if any(k in d for k in ['gst/bank','gst/gst','markup','dcc','dc intl','bank charg','service charge']):
                                                                        return 'Bank Charges / GST'
     if 'salary' in d or 'sal ' in d:                                  return 'Salary'
-    if 'partner' in d or 'withdrawal' in d or 'proprietor' in d:     return 'Partner Share'
+    # A bare 'partner' match is far too loose: the FIRM'S OWN NAME is
+    # "BridgeLine Partners", so any cheque or transfer whose narration
+    # carries the company name was booked as a partner drawing. Confirmed
+    # live 12-08-2026 — two cheques totalling Rs 5,75,000
+    # ("CHQ PAID-CTS S6-RK S-BRIDGELINE PARTNERS") were being reported as
+    # Partner Share purely because our own name contains the word PARTNERS,
+    # which alone turned a real profit into a reported loss. Strip the
+    # company name out first, then require actual drawing phrasing.
+    d_nc = d.replace('bridgeline partners', ' ').replace('bridgeline', ' ')
+    if any(k in d_nc for k in ('partner share', 'partner salary', 'partners share',
+                                'drawing', 'withdrawal', 'proprietor')):
+        return 'Partner Share'
     if any(k in d for k in ['pradaan','pradan']):                     return 'Pradaan Routing'
     return 'Miscellaneous'
+
+def _looks_like_own_transfer(desc):
+    """True when the narration names BridgeLine itself as the SENDER/DRAWER —
+    i.e. our own money arriving from another of our own accounts, never a
+    customer payment.
+
+    The distinction is the slot our name sits in, not merely that it appears:
+    on a genuine customer payment we are the RECEIVING account holder (e.g.
+    'FT -BRIDGELINE PARTNERS CR - ...'), which must NOT match here.
+
+    Cheque deposits use 'BB/CHQ DEP/<no>/<date>/<drawer>/<drawer bank>', so the
+    drawer occupies that sender slot. Confirmed live 12-08-2026: the ₹5,00,000
+    that opened the IDFC account reads
+    'BB/CHQ DEP/000107/14-07-2026/BRIDGELINE/HDFC BANK' — drawn by us, on our
+    own HDFC account. It had been auto-matched to a customer case purely on
+    amount, which is exactly what this prevents.
+    """
+    return bool(
+        re.search(r'\bCR[-/][A-Z]{4}0[A-Z0-9]{6}[-/]\s*BRIDGELINE PARTNERS\b', desc, re.IGNORECASE)
+        # Separators vary between statements for the SAME transfer type: IDFC
+        # has emitted both 'RTGS/<utr>/BRIDGELINE PARTNERS/' and
+        # 'RTGS/ <utr> BRIDGELINE PARTNERS/' (spaces, not slashes) — the latter
+        # seen live 12-08-2026 on an ₹18,00,000 own-account transfer that got
+        # typed Repayment because the old slash-only pattern missed it. Accept
+        # either separator. The leading 'RTGS/' (slash) is still REQUIRED: a
+        # customer payment reads 'RTGS CR-<ifsc>-<payer>-BRIDGELINE PARTNERS-…',
+        # which has no slash there and so still cannot match.
+        or re.search(r'(?:RTGS|NEFT|IMPS)\s*/\s*[A-Z0-9]+[\s/]+BRIDGELINE PARTNERS', desc, re.IGNORECASE)
+        or re.search(r'chq\s*dep\b[^/]*(?:/[^/]*){0,2}/\s*bridgeline', desc, re.IGNORECASE)
+    )
 
 def _is_fd_booking(desc):
     return bool(re.search(r'\bfd\b.*\bbooked\b', desc, re.IGNORECASE))
@@ -2036,24 +2973,190 @@ def _is_expense_debit(desc, amt):
         return True
     return False
 
+def _parse_flex_date(date_str):
+    """Parse date_str (any format DD/MM/YY, DD-MM-YYYY, YYYY-MM-DD, etc. —
+    whatever mix book rows and bank statements use) into a plain date, or
+    None if unparseable. Shared by _date_in_period (month-wide) and
+    _date_in_range (exact-window) so both agree on what counts as a date."""
+    if not date_str:
+        return None
+    from datetime import datetime as _dt
+    # %d-%b-%Y / %d-%b-%y (e.g. "7-Apr-2026", "17-Apr-26") -- the legacy
+    # "Apr/May26" archive tab's own date format, missed here until
+    # 11-08-2026 (a GST-figures cross-check against a real CA pivot table
+    # came back with April/May missing entirely -- these dates were
+    # silently failing to parse and getting dropped everywhere this
+    # function is used, not just that one check).
+    for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y', '%d-%m-%y',
+                '%Y-%m-%d', '%m/%d/%Y', '%d %b %Y', '%d %B %Y',
+                '%d-%b-%Y', '%d-%b-%y'):
+        try:
+            return _dt.strptime(str(date_str).strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
 def _date_in_period(date_str, period_month):
     """Return True if date_str (any format DD/MM/YY, DD-MM-YYYY, etc.) falls in period_month (e.g. 'Jun 2026')."""
-    if not date_str or not period_month:
+    if not period_month:
         return False
     try:
-        # period_month e.g. "Jun 2026" → month=6, year=2026
         from datetime import datetime as _dt
         pm = _dt.strptime(period_month, '%b %Y')
-        for fmt in ('%d/%m/%Y', '%d-%m-%Y', '%d/%m/%y', '%d-%m-%y',
-                    '%Y-%m-%d', '%m/%d/%Y', '%d %b %Y', '%d %B %Y'):
-            try:
-                d = _dt.strptime(str(date_str).strip(), fmt)
-                return d.month == pm.month and d.year == pm.year
-            except ValueError:
-                continue
     except Exception:
-        pass
-    return False
+        return False
+    d = _parse_flex_date(date_str)
+    return d is not None and d.month == pm.month and d.year == pm.year
+
+def _date_in_range(date_str, since_date, through_date):
+    """Return True if date_str falls strictly after since_date (exclusive —
+    that date's own activity is already reflected in a prior closing
+    balance) and on/before through_date (inclusive). since_date may be None
+    for an unbounded lower end; through_date is required."""
+    if through_date is None:
+        return False
+    d = _parse_flex_date(date_str)
+    if d is None:
+        return False
+    if since_date is not None and d <= since_date:
+        return False
+    return d <= through_date
+
+# ── Staged amount+date matcher ────────────────────────────────────────────────
+# Adapted from a standalone bank-reconciliation engine (exact match, then
+# date-tolerance match, run in that order of confidence). Slots in as a new
+# tier inside _match_transactions() between UTR matching (already
+# unambiguous, untouched) and the older amount-only fallback (kept as a
+# backstop below, untouched, for anything this doesn't resolve). The old
+# fallback picked the FIRST same-amount candidate by plain insertion order
+# with no date awareness at all -- a real wrong-match risk whenever an
+# amount recurs, e.g. two disbursements of the same round amount in one
+# week. Many-to-one/one-to-many grouping from the original engine was
+# deliberately left out of this integration: matched_ref is a single id
+# string everywhere downstream (_book_completeness, _sheet_coll_recon,
+# _account_tieout), and a comma-joined multi-id ref would silently break
+# every one of those without a wider audit this pass didn't do.
+@dataclass
+class _ReconTxn:
+    id: str
+    date: Optional[datetime]
+    amount: float
+
+
+_NARRATIVE_STOPWORDS = {'THE','AND','FOR','FROM','WITH','BANK','NEFT','RTGS','IMPS','UPI','CR','DR',
+                         'ACCOUNT','CHEQUE','DEPOSIT','DEPOSITS','SUBJECT','CLEARING','AVL','BAL','INR','UPDATE'}
+
+
+def _narrative_signature(text):
+    """Extract (trailing_digits, name_tokens) from a masked-account-style
+    narrative reference (e.g. 'FT - Cr - XXXXXXXXXX3437 - K S MAHESHA.'),
+    which the UTR regex extraction in _match_transactions() can never
+    capture -- it requires an unbroken alphanumeric token, and narrative
+    text with spaces/hyphens fails that \\b(...)\\b boundary entirely. A
+    case whose ONLY recorded reference is narrative-style then has nothing
+    to key UTR matching off, and previously fell straight through to the
+    weak amount-only fallback -- confirmed a real bug via a full-book
+    reference cross-reference audit (31-Jul-2026): K S Mahesh's repayment
+    matched to an unrelated, differently-dated case that happened to share
+    the same amount, when his own recorded reference (this narrative
+    pattern) exactly matched the real bank line once checked directly.
+    Returns None for a clean UTR-style reference (no name tokens in a bare
+    numeric/alphanumeric code), so this only ever fires for genuinely
+    narrative text."""
+    text = (text or '').strip()
+    digits = re.findall(r'\d', text)
+    if len(digits) < 4:
+        return None
+    names = {w for w in re.split(r'[^A-Za-z]+', text.upper()) if len(w) >= 4 and w not in _NARRATIVE_STOPWORDS}
+    if not names:
+        return None
+    return (''.join(digits[-4:]), names)
+
+
+def _narrative_ref_match(book_items, bank_txns_indexed, exclude_book_ids=()):
+    """book_items: [(book_id, raw_ref_text), ...]. Matches a bank txn to a
+    book item when the narration contains BOTH the reference's trailing 4
+    digits (typically the unmasked tail of an account number the book only
+    stored masked) and at least one shared name token. Deliberately only a
+    fallback consulted after UTR and the staged Amount+Date tier already
+    had their shot, since this is fuzzier than either of those."""
+    sigs = []
+    for book_id, text in book_items:
+        if book_id in exclude_book_ids:
+            continue
+        sig = _narrative_signature(text)
+        if sig:
+            sigs.append((book_id, sig[0], sig[1]))
+    result = {}
+    claimed = set()
+    for idx, desc in bank_txns_indexed:
+        desc_digits = re.sub(r'\D', '', desc)
+        desc_names = {w for w in re.split(r'[^A-Za-z]+', desc.upper()) if len(w) >= 4}
+        for book_id, tail, names in sigs:
+            if book_id in claimed:
+                continue
+            if tail in desc_digits and (names & desc_names):
+                result[idx] = book_id
+                claimed.add(book_id)
+                break
+    return result
+
+
+def _split_ref_tokens(value):
+    """Split a Debit/Credit Note field into individual reference tokens.
+    Only splits on a comma NOT immediately followed by a digit, so a
+    thousand-separator comma inside a raw narrative/SMS reference (e.g.
+    'Update! INR 61,360.00 deposited...') is never mistaken for a token
+    boundary between two genuinely separate references (e.g. '621119299326,
+    CNRBR52026073192673966', two real UTRs for a case with two payments) --
+    confirmed both patterns are real via the 31-Jul-2026 cross-reference
+    audit, and a naive re.split(',') breaks the first one."""
+    value = (value or '').strip()
+    if not value:
+        return []
+    return [p.strip() for p in re.split(r',(?!\d)', value) if p.strip()]
+
+
+def _staged_amount_date_match(book_txns, bank_txns_indexed, date_tolerance_days=5):
+    """book_txns: list of _ReconTxn (one per Accounts disbursement row, or
+    per M Coll payment row). bank_txns_indexed: list of (original txns
+    index, _ReconTxn) for the bank side. Returns {bank_index: (book_id,
+    match_type)} for every bank txn this can confidently tie to exactly one
+    still-unmatched book txn."""
+    by_amount: dict = {}
+    for b in book_txns:
+        by_amount.setdefault(round(b.amount, 2), []).append(b)
+
+    matched_book_ids = set()
+    result = {}
+
+    # Stage 1: exact same amount + same calendar date.
+    for idx, t in bank_txns_indexed:
+        if t.date is None:
+            continue
+        cands = [b for b in by_amount.get(round(t.amount, 2), [])
+                  if b.id not in matched_book_ids and b.date == t.date]
+        if cands:
+            chosen = cands[0]
+            matched_book_ids.add(chosen.id)
+            result[idx] = (chosen.id, 'exact')
+
+    # Stage 2: same amount, closest date within the tolerance window --
+    # covers the ordinary case of a bank clearing delay (cheque/NEFT taking
+    # a couple of days to reflect).
+    for idx, t in bank_txns_indexed:
+        if idx in result or t.date is None:
+            continue
+        cands = [b for b in by_amount.get(round(t.amount, 2), [])
+                  if b.id not in matched_book_ids and b.date is not None
+                  and abs((b.date - t.date).days) <= date_tolerance_days]
+        if cands:
+            chosen = min(cands, key=lambda b: abs((b.date - t.date).days))
+            matched_book_ids.add(chosen.id)
+            result[idx] = (chosen.id, 'date_tolerance')
+
+    return result
+
 
 # ── Transaction matcher ───────────────────────────────────────────────────────
 
@@ -2156,8 +3259,49 @@ def _match_transactions(txns, records, mc_rows):
             if m:
                 acct_to_disb[m.group(1)] = None  # placeholder; will resolve via amount below
 
+    # Staged exact+date-tolerance matcher (see _staged_amount_date_match) --
+    # built once here, consulted per-transaction below as a new tier between
+    # UTR matching and the older amount-only fallback.
+    disb_book_txns = []
+    for r in records:
+        did = r.get('Disbursement ID', '').strip()
+        amt = _to_num(r.get('Amount', 0))
+        if did and amt:
+            disb_book_txns.append(_ReconTxn(id=did, date=parse_disb_date(r.get('Disbursement Date', '')), amount=amt))
+    coll_book_txns = []
+    for mc in mc_rows:
+        did = (mc[0] if len(mc) > 0 else '').strip()
+        amt = _clean_amount(mc[2]) if len(mc) > 2 else 0
+        if did and amt:
+            coll_book_txns.append(_ReconTxn(id=did, date=parse_disb_date(mc[1] if len(mc) > 1 else ''), amount=amt))
+
+    debit_bank_txns = [(i, _ReconTxn(id=str(i), date=parse_disb_date(t.get('date', '')), amount=t['debit']))
+                       for i, t in enumerate(txns) if t['debit'] > 0]
+    credit_bank_txns = [(i, _ReconTxn(id=str(i), date=parse_disb_date(t.get('date', '')), amount=t['credit']))
+                        for i, t in enumerate(txns) if t['credit'] > 0]
+
+    staged_disb_matches = _staged_amount_date_match(disb_book_txns, debit_bank_txns)
+    staged_coll_matches = _staged_amount_date_match(coll_book_txns, credit_bank_txns)
+
+    # Narrative-reference matcher (see _narrative_ref_match) -- a further
+    # tier for cases whose ONLY recorded reference is masked-narrative text
+    # (e.g. Debit/Credit Note = 'FT - Cr - XXXXXXXXXX3437 - K S MAHESHA.'),
+    # which contributes nothing to the UTR maps above and can't carry a
+    # calendar date either, so the staged Amount+Date tier can't help it.
+    # Consulted after both of those, before the plain amount-only fallback.
+    disb_narrative_items = [(r.get('Disbursement ID', '').strip(), x)
+                             for r in records for x in _split_ref_tokens(r.get('Debit Note', ''))]
+    coll_narrative_items = [((mc[0] if len(mc) > 0 else '').strip(), x)
+                             for mc in mc_rows for x in _split_ref_tokens(mc[3] if len(mc) > 3 else '')]
+    debit_bank_desc = [(i, t.get('description', '')) for i, t in enumerate(txns) if t['debit'] > 0]
+    credit_bank_desc = [(i, t.get('description', '')) for i, t in enumerate(txns) if t['credit'] > 0]
+    staged_disb_ids = {book_id for book_id, _ in staged_disb_matches.values()}
+    staged_coll_ids = {book_id for book_id, _ in staged_coll_matches.values()}
+    narrative_disb_matches = _narrative_ref_match(disb_narrative_items, debit_bank_desc, exclude_book_ids=staged_disb_ids)
+    narrative_coll_matches = _narrative_ref_match(coll_narrative_items, credit_bank_desc, exclude_book_ids=staged_coll_ids)
+
     result = []
-    for tx in txns:
+    for i, tx in enumerate(txns):
         desc  = tx.get('description', '')
         utr   = tx.get('utr', '').strip().upper()
         dr, cr = tx['debit'], tx['credit']
@@ -2222,6 +3366,15 @@ def _match_transactions(txns, records, mc_rows):
                 if matched:
                     tx_type = 'Disbursement'; tx_ref = matched
                     tx_basis = 'UTR'; tx_notes = 'Accounts (Debit Note)'
+                elif i in staged_disb_matches:
+                    book_id, mtype = staged_disb_matches[i]
+                    tx_type = 'Disbursement'; tx_ref = book_id
+                    tx_basis = 'Amount+Date'
+                    tx_notes = ('Accounts (Disb) — exact amount+date match' if mtype == 'exact'
+                                else 'Accounts (Disb) — closest-date match within tolerance')
+                elif i in narrative_disb_matches:
+                    tx_type = 'Disbursement'; tx_ref = narrative_disb_matches[i]
+                    tx_basis = 'Narrative'; tx_notes = 'Accounts (Debit Note) — masked-ref narrative match'
                 else:
                     amt_cands = amt_to_disb_id.get(round(dr), [])
                     name_did, name_score = _fuzzy_name_match(desc)
@@ -2260,8 +3413,7 @@ def _match_transactions(txns, records, mc_rows):
             # ('FT -BRIDGELINE PARTNERS CR - ...') deliberately doesn't
             # match either pattern — there our name is the RECEIVING account
             # holder on a genuine customer payment.
-            elif (re.search(r'\bCR[-/][A-Z]{4}0[A-Z0-9]{6}[-/]\s*BRIDGELINE PARTNERS\b', desc, re.IGNORECASE)
-                  or re.search(r'(?:RTGS|NEFT|IMPS)/[A-Z0-9]+/BRIDGELINE PARTNERS/', desc, re.IGNORECASE)):
+            elif _looks_like_own_transfer(desc):
                 tx_type = 'Contra'; tx_notes = 'Own-account transfer (sender is BridgeLine)'
 
             # Bank-paid interest (savings/FD interest credits) — income the
@@ -2313,6 +3465,15 @@ def _match_transactions(txns, records, mc_rows):
                 if matched:
                     tx_type = 'Repayment'; tx_ref = matched
                     tx_basis = 'UTR'; tx_notes = 'Matched Collections'
+                elif i in staged_coll_matches:
+                    book_id, mtype = staged_coll_matches[i]
+                    tx_type = 'Repayment'; tx_ref = book_id
+                    tx_basis = 'Amount+Date'
+                    tx_notes = ('M Coll — exact amount+date match' if mtype == 'exact'
+                                else 'M Coll — closest-date match within tolerance')
+                elif i in narrative_coll_matches:
+                    tx_type = 'Repayment'; tx_ref = narrative_coll_matches[i]
+                    tx_basis = 'Narrative'; tx_notes = 'M Coll — masked-ref narrative match'
                 else:
                     coll_cands = amt_to_coll.get(round(cr), [])
                     name_did, name_score = _fuzzy_name_match(desc)
@@ -2368,6 +3529,34 @@ def _bank_matched_refs(classified_txns):
             coll_by_ref.setdefault(tx['matched_ref'], tx)
     return disb_by_ref, coll_by_ref
 
+def _ref_present_in_bank_text(ref_text, bank_descs_upper):
+    """True if ref_text (a book-recorded Debit/Credit Note token) can be
+    found in ANY bank transaction's narration this period, by exact
+    substring or by the same trailing-digits+name narrative signature
+    _narrative_ref_match uses. This is deliberately independent of
+    tx['matched_ref'] -- a single bank transaction can only ever be
+    matched_ref'd to ONE disb_id, but Prem's own books sometimes legitimately
+    cite the SAME real payment as the reference for two different
+    disbursements (confirmed real pattern, 31-Jul-2026 audit — e.g. one
+    payment recorded against both Ashrath Banu's and P Shanawaz's cases).
+    Without this, the second case would always show as a false "unmatched"
+    no matter how good the underlying matching gets, since the model can
+    only assign that transaction's matched_ref to one of the two."""
+    ref_norm = ref_text.strip().upper()
+    if not ref_norm:
+        return False
+    if any(ref_norm in d for d in bank_descs_upper):
+        return True
+    sig = _narrative_signature(ref_text)
+    if not sig:
+        return False
+    tail, names = sig
+    for d in bank_descs_upper:
+        if tail in re.sub(r'\D', '', d) and (names & {w for w in re.split(r'[^A-Za-z]+', d) if len(w) >= 4}):
+            return True
+    return False
+
+
 def _book_completeness(records, mc_rows, classified_txns, period_month):
     """Book-side disbursements/collections dated in period_month with no
     matching bank transaction in classified_txns — the reverse-direction
@@ -2375,6 +3564,7 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
     "does this bank line match a book record", never "does every book
     record this period have a matching bank line")."""
     disb_by_ref, coll_by_ref = _bank_matched_refs(classified_txns)
+    bank_descs_upper = [tx.get('description', '').upper() for tx in classified_txns]
 
     unmatched_disb = []
     for r in records:
@@ -2382,11 +3572,14 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
         ddate = str(r.get('Disbursement Date', '') or '')
         if not did or not _date_in_period(ddate, period_month) or did in disb_by_ref:
             continue
+        debit_note = str(r.get('Debit Note', '') or '').strip()
+        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(debit_note)):
+            continue
         unmatched_disb.append({
             'disb_id': did, 'date': ddate,
             'customer': r.get('Customer Name', ''),
             'amount': _to_num(r.get('Amount', 0)),
-            'utr': str(r.get('Debit Note', '') or '').strip(),
+            'utr': debit_note,
         })
 
     unmatched_coll = []
@@ -2395,11 +3588,14 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
         pdate = mc[1] if len(mc) > 1 else ''
         if not did or not _date_in_period(str(pdate), period_month) or did in coll_by_ref:
             continue
+        credit_note = mc[3] if len(mc) > 3 else ''
+        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(credit_note)):
+            continue
         unmatched_coll.append({
             'disb_id': did, 'date': pdate,
             'customer': mc[4] if len(mc) > 4 else '',
             'amount': _clean_amount(mc[2]) if len(mc) > 2 else 0,
-            'utr_or_note': mc[3] if len(mc) > 3 else '',
+            'utr_or_note': credit_note,
         })
 
     return {
@@ -2933,17 +4129,58 @@ def _all_time_recon_totals(periods=None):
     reads the ENTIRE Recon Txns sheet with latest-Batch-ID de-duplication
     built in; periods=None triggers a fresh load for standalone use,
     otherwise reuses an already-loaded list to avoid a second Sheets
-    round-trip within one request (see _solvency_check())."""
+    round-trip within one request (see _solvency_check()).
+
+    _load_recon_periods()'s "latest Batch ID wins" only replaces a period
+    sharing the exact same (recon_date, account) key -- it does NOT detect
+    when a LATER period's own date range overlaps or fully subsumes an
+    EARLIER one under a different recon_date (confirmed real, 01-08-2026:
+    July was reconciled incrementally in small date-specific batches
+    throughout the month, e.g. recon_date 20-07-2026, 21-07-2026, ... each
+    covering only its own few-day slice; a subsequent full-month save under
+    31-07-2026 then sat ALONGSIDE those instead of replacing them, since its
+    key differs, and every transaction in the overlap got summed twice --
+    inflated fd_total by ~15.7L and expense_total by ~60k in exactly this
+    way). Fixed by deduplicating individual transactions per account on a
+    content key (date+description+debit+credit+balance -- the same real
+    bank ledger line re-saved under a different period will always match
+    all five; two genuinely different transactions effectively never will),
+    processing periods NEWEST-first so a transaction's most recently-saved
+    classification wins if it was ever re-typed/corrected on a later save."""
     if periods is None:
         sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
         periods = _load_recon_periods(get_recon_txns_sheet(sh))
+    def _recon_date_key(p):
+        try:
+            return datetime.strptime(p['recon_date'], '%d-%m-%Y')
+        except Exception:
+            return datetime.min
+
     expense_total = fd_total = income_total = 0.0
     periods_seen = []
-    for p in periods:
+    seen_txn_keys = set()
+    for p in sorted(periods, key=_recon_date_key, reverse=True):
         periods_seen.append((p['recon_date'], p['account']))
         for tx in p['txns']:
-            if tx['type'] == 'Expense':
-                expense_total += tx['debit']
+            key = (p['account'], tx['date'], tx['description'], tx['debit'], tx['credit'], tx['balance'])
+            if key in seen_txn_keys:
+                continue
+            seen_txn_keys.add(key)
+            # Money-out types beyond the literal 'Expense' label must count
+            # here too, or they vanish from every downstream figure. Found
+            # live 12-08-2026: 'Partner Salary' (₹1,10,000) and
+            # 'Employee Salary' (₹60,000) are custom types invented at
+            # reconciliation time, carried real money out of the bank, and
+            # were counted NOWHERE — reading as unexplained missing money.
+            # Anything with no known cash role is treated by DIRECTION (a net
+            # debit is money out) so an unrecognised type can never again
+            # silently swallow cash; _money_integrity_check() reports it by
+            # name so it gets a proper role.
+            _role = CASH_ROLE.get((tx['type'] or '').strip())
+            if _role in ('expense', 'withdrawal'):
+                expense_total += tx['debit'] - tx['credit']
+            elif _role is None and tx['debit'] > tx['credit']:
+                expense_total += tx['debit'] - tx['credit']
             # 'FD Booking' is a NET figure: debits are money parked into an
             # FD, credits are the FD sweeping/maturing back into the account
             # — so fd_total is always the amount CURRENTLY sitting in FDs,
@@ -2960,6 +4197,721 @@ def _all_time_recon_totals(periods=None):
     return {'expense_total': round(expense_total, 2), 'fd_total': round(fd_total, 2),
             'income_total': round(income_total, 2),
             'periods_seen': periods_seen}
+
+# ── Per-FD-account sweep ledger ───────────────────────────────────────────────
+# Both banks put the FD's OWN account number in the narration, on BOTH legs:
+#   IDFC out : 'Sweepout FD 10297960466 booked'
+#   IDFC in  : 'Auto sweep in from 10297960466/Principal:444734/ BLKRTGS/...'
+#   HDFC out : 'FD BOOKED - 50301379044082 : BRIDGELINE PARTNERS'
+#   HDFC in  : 'SWEEP-IN CREDIT - 50301382223321'
+# so every booking can be matched to its OWN sweep-ins instead of blindly
+# netting one big total. That distinction is not cosmetic -- it is the whole
+# difference between a right and a wrong number, proven against real data on
+# 11-08-2026:
+#
+#   old blind net sum ............ 38,91,266
+#   per-FD ledger ................ 41,05,794   <- matches the real FD balance
+#                                                 to the rupee
+#
+# The 2,14,528 the old approach lost breaks down as:
+#   * 2,13,765 -- HDFC FD 50301355033761 swept back in on 20-Jul, but was
+#     BOOKED before reconciliation history begins (HDFC data starts 01-Jul).
+#     A blind net sum subtracts money returning from an FD it never saw
+#     created, and can never recover it.
+#   * 763 -- FD interest. Three IDFC FDs swept back slightly MORE than their
+#     principal (206 + 233 + 324). A blind sum lets that excess push the FD
+#     balance below zero.
+# Both are fixed by the same rule: track each FD separately and clamp it at
+# zero -- a fully-swept FD holds nothing, and the excess that came back IS
+# interest, which is already sitting in (and counted via) the bank balance.
+FD_OUT_PATTERNS = (
+    re.compile(r'sweepout\s+fd\s+(\d+)\s+booked', re.IGNORECASE),
+    re.compile(r'fd\s+booked\s*-\s*(\d+)', re.IGNORECASE),
+)
+FD_IN_PATTERNS = (
+    re.compile(r'auto\s+sweep\s+in\s+from\s+(\d+)\s*/\s*principal\s*:\s*([\d.]+)', re.IGNORECASE),
+    re.compile(r'sweep[-\s]*in\s+credit\s*-\s*(\d+)', re.IGNORECASE),
+)
+
+def _fd_ledger(periods=None):
+    """Money currently parked in FDs, derived per FD account number.
+
+    Returns total plus the diagnostics that make it self-validating:
+      * orphan_sweepins  -- a sweep-in citing an FD never seen booked. Proof
+        that FD predates the reconciliation history (or a day is missing).
+        Historical/closed orphans don't affect today's balance, but they are
+        surfaced rather than silently absorbed.
+      * unparsed         -- an 'FD Booking' txn whose narration matched no
+        known pattern. A new bank or changed phrasing lands here instead of
+        silently corrupting the total, which is exactly how the old
+        derivation went wrong unnoticed for weeks.
+    """
+    if periods is None:
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+        periods = _load_recon_periods(get_recon_txns_sheet(sh))
+
+    def _rdk(p):
+        try:
+            return datetime.strptime(p['recon_date'], '%d-%m-%Y')
+        except Exception:
+            return datetime.min
+
+    fds = {}
+    unparsed = []
+    latest_fd_txn_date = None
+    seen_txn_keys = set()
+    # Newest-first + content-key dedup: identical to _all_time_recon_totals(),
+    # and load-bearing here for the same reason -- the same bank line re-saved
+    # under a different recon_date would otherwise double every FD's booked
+    # amount (this was missed on a first pass and inflated the total ~2.5x).
+    for p in sorted(periods, key=_rdk, reverse=True):
+        acct = p['account']
+        for tx in p['txns']:
+            if (tx.get('type') or '').strip() != 'FD Booking':
+                continue
+            desc = tx.get('description', '') or ''
+            dr, cr = tx['debit'], tx['credit']
+            key = (acct, tx['date'], desc, dr, cr, tx['balance'])
+            if key in seen_txn_keys:
+                continue
+            seen_txn_keys.add(key)
+
+            d = _parse_flex_date(tx.get('date', ''))
+            if d and (latest_fd_txn_date is None or d > latest_fd_txn_date):
+                latest_fd_txn_date = d
+
+            fd_no = None
+            is_out = False
+            for pat in FD_OUT_PATTERNS:
+                m = pat.search(desc)
+                if m and dr > 0:
+                    fd_no, is_out = m.group(1), True
+                    break
+            if fd_no is None:
+                for pat in FD_IN_PATTERNS:
+                    m = pat.search(desc)
+                    if m and cr > 0:
+                        fd_no = m.group(1)
+                        break
+            if fd_no is None:
+                unparsed.append({'account': acct, 'date': tx.get('date'),
+                                  'debit': dr, 'credit': cr, 'description': desc[:120]})
+                continue
+
+            e = fds.setdefault(fd_no, {'account': acct, 'booked': 0.0, 'swept_in': 0.0,
+                                        'book_dates': [], 'sweepin_dates': []})
+            if is_out:
+                e['booked'] += dr
+                e['book_dates'].append(tx.get('date'))
+            else:
+                e['swept_in'] += cr
+                e['sweepin_dates'].append(tx.get('date'))
+
+    open_fds, orphans = {}, {}
+    total = 0.0
+    for fd_no, e in fds.items():
+        e['booked'] = round(e['booked'], 2)
+        e['swept_in'] = round(e['swept_in'], 2)
+        e['remaining'] = round(e['booked'] - e['swept_in'], 2)
+        if e['booked'] <= 0 and e['swept_in'] > 0:
+            orphans[fd_no] = e
+            continue
+        # Clamp at zero: a fully-swept FD holds nothing, and any excess that
+        # came back is interest already reflected in the bank balance.
+        if e['remaining'] > 0.5:
+            open_fds[fd_no] = e
+            total += e['remaining']
+
+    return {
+        'fd_total': round(total, 2),
+        'open_fds': open_fds,
+        'open_fd_count': len(open_fds),
+        'orphan_sweepins': orphans,
+        'orphan_sweepin_total': round(sum(o['swept_in'] for o in orphans.values()), 2),
+        'unparsed': unparsed,
+        'unparsed_net': round(sum(u['debit'] - u['credit'] for u in unparsed), 2),
+        'latest_fd_txn_date': latest_fd_txn_date,
+    }
+
+# Hardcoded per Prem's explicit instruction (06-08-2026): "just concentrate
+# on august" -- pre-August history has real, numerous day-level gaps (see
+# FD_ACCOUNT_LABEL's comment) that aren't worth excavating retroactively.
+# This draws a clean line and only holds August-onward to a day-by-day
+# standard, so a fresh, trustworthy baseline doesn't require first
+# resolving every historical gap. Revisit if this should ever roll forward
+# past August instead of staying fixed.
+# ── Money Integrity: what every transaction TYPE means for cash ──────────────
+# Single source of truth. Anything NOT in here is treated as unclassified and
+# loudly reported rather than silently dropped — which is exactly how
+# 'Partner Salary' (₹1,10,000) and 'Employee Salary' (₹60,000) went uncounted:
+# every totaliser matched type strings exactly, so a custom type invented at
+# reconciliation time carried real money out of the bank and landed nowhere.
+CASH_ROLE = {
+    'Disbursement':             'lending_out',
+    'Repayment':                'lending_in',
+    'Collection':               'lending_in',   # legacy label
+    'Collection (via Pradaan)': 'lending_in',   # legacy label
+    'Expense':                  'expense',
+    'Employee Salary':          'expense',
+    # A partner drawing is a CAPITAL withdrawal, not an operating expense —
+    # given its own role so it never distorts the expense/profit picture,
+    # while still being counted as money out so it can't go missing.
+    # ⚠ If partner drawings are ALSO recorded in the Capital Log, net_capital
+    # already reflects them and counting them here as well would double-count.
+    # Confirm with Prem before treating this as settled.
+    'Partner Salary':           'withdrawal',
+    'Partner Withdrawal':       'withdrawal',
+    'Interest Income':          'income',
+    'Other Income':             'income',
+    'FD Booking':               'fd',
+    'Contra':                   'contra',
+    'Capital In':               'contra',       # legacy label
+    'Capital Out':              'contra',       # legacy label
+    'Suspense':                 'suspense',
+    'Test Credit':              'ignore',
+    'Skip':                     'ignore',
+}
+
+# A transfer between our own accounts must show as a debit in one and a credit
+# in another. When only ONE leg gets typed Contra, the pair no longer nets to
+# zero and the difference reads as missing money.
+CONTRA_PAIR_MAX_DAYS = 3      # cheque/IMPS settlement slack between the legs
+CONTRA_PAIR_MIN_AMOUNT = 1000 # below this, coincidental same-amount pairs are likelier than real transfers
+
+def _cross_account_contra_pairs(periods):
+    """Own-account transfers where only one leg was typed Contra.
+
+    A single statement can never reveal these: the parser sees ONE account at
+    a time, so a cheque leaving HDFC and landing in Saraswat looks like an
+    ordinary payment on the HDFC side. Only the merged all-accounts view can
+    pair them — which is why this lives here and not in _match_transactions().
+
+    Confirmed live 12-08-2026: a ₹75,000 cheque out of HDFC on 07-Jul
+    ('CHQ PAID-CTS S6-RK S-BRIDGELINE PARTNERS') and a ₹75,000 branch deposit
+    into Saraswat the same day ('OW/570240002/29/000094/Dep Br 404') were the
+    two legs of one transfer. The Saraswat leg was typed Contra, the HDFC leg
+    was typed Expense, and that single unpaired leg WAS the entire −₹75,000
+    contra imbalance.
+
+    Derived at READ time rather than by re-typing stored rows: needs no
+    re-save (so it cannot drop a manual type_override — see the Jeevitha Bai K
+    precedent, where Suspense typing has to be re-applied on every save), and
+    it self-corrects historical data as well as future uploads.
+
+    Guards against false pairing: both legs must be in DIFFERENT own accounts,
+    neither already typed Contra, and — critically — neither tied to a customer
+    case (a real disbursement or collection always carries a matched_ref), so
+    an unrelated same-amount disbursement and collection can't pair up.
+    Matched one-to-one, nearest date first.
+    """
+    def _rdk(p):
+        try:
+            return datetime.strptime(p['recon_date'], '%d-%m-%Y')
+        except Exception:
+            return datetime.min
+
+    debits, credits, seen = [], [], set()
+    for p in sorted(periods, key=_rdk, reverse=True):
+        for tx in p['txns']:
+            key = (p['account'], tx['date'], tx['description'], tx['debit'], tx['credit'], tx['balance'])
+            if key in seen:
+                continue
+            seen.add(key)
+            # Already-Contra legs MUST stay in the pool: the whole point is to
+            # find the counter-leg of a transfer whose OTHER side was already
+            # typed Contra. Excluding them makes the unpaired leg unmatchable —
+            # which is exactly how a first attempt at this found nothing.
+            already = (tx.get('type') or '').strip() == 'Contra'
+            # The matched_ref guard stops a real disbursement pairing with an
+            # unrelated same-amount collection — but it must NOT apply to a leg
+            # explicitly typed Contra. Re-typing a transaction to Contra does
+            # not clear the customer ref an earlier auto-match had already
+            # stamped on it, so a genuine transfer can carry a stale ref
+            # forever. An explicit Contra type outranks a leftover auto-match.
+            # (Real case: the Saraswat 07-Jul ₹75,000 deposit is typed Contra
+            # yet still refs BLP-050626-179, and that stale ref alone was
+            # hiding the counter-leg of the −₹75,000 imbalance.)
+            # ...and likewise a leg whose narration names US as the sender is
+            # our own money by definition, however the amount-matcher happened
+            # to label it. That is what frees the IDFC opening deposit, which
+            # had been auto-matched to a customer case purely on amount.
+            if (not already and not _looks_like_own_transfer(tx.get('description', '') or '')
+                    and (tx.get('matched_ref') or '').strip()):
+                continue
+            d = _parse_flex_date(tx.get('date', ''))
+            if not d:
+                continue
+            rec = {'key': key, 'acct': p['account'], 'date': d,
+                    'desc': (tx.get('description') or '')[:110], 'already_contra': already}
+            if tx['debit'] >= CONTRA_PAIR_MIN_AMOUNT:
+                debits.append({**rec, 'amt': tx['debit']})
+            elif tx['credit'] >= CONTRA_PAIR_MIN_AMOUNT:
+                credits.append({**rec, 'amt': tx['credit']})
+
+    paired_keys, pairs, used = set(), [], set()
+    for dr in sorted(debits, key=lambda x: x['date']):
+        best = None
+        for i, cr in enumerate(credits):
+            if i in used or cr['acct'] == dr['acct']:
+                continue
+            if abs(cr['amt'] - dr['amt']) > 1:
+                continue
+            gap = abs((cr['date'] - dr['date']).days)
+            if gap > CONTRA_PAIR_MAX_DAYS:
+                continue
+            if best is None or gap < best[1]:
+                best = (i, gap)
+        if best is not None:
+            i = best[0]
+            used.add(i)
+            cr = credits[i]
+            # Only the side that ISN'T already Contra needs correcting. A pair
+            # already typed Contra on both sides is a no-op and isn't reported —
+            # otherwise every correct transfer would show up as a "correction".
+            corrected = []
+            if not dr['already_contra']:
+                paired_keys.add(dr['key']); corrected.append('outgoing leg')
+            if not cr['already_contra']:
+                paired_keys.add(cr['key']); corrected.append('incoming leg')
+            if corrected:
+                pairs.append({'amount': round(dr['amt'], 2), 'gap_days': best[1],
+                               'corrected': corrected,
+                               'out': {'account': dr['acct'], 'date': dr['date'].strftime('%d-%m-%Y'),
+                                        'description': dr['desc'],
+                                        'already_contra': dr['already_contra']},
+                               'in': {'account': cr['acct'], 'date': cr['date'].strftime('%d-%m-%Y'),
+                                       'description': cr['desc'],
+                                       'already_contra': cr['already_contra']}})
+    return {'paired_keys': paired_keys, 'pairs': pairs,
+            'paired_total': round(sum(p['amount'] for p in pairs), 2)}
+
+def _pair_uploaded_statements(statements):
+    """Pair own-account transfers ACROSS statements uploaded together, and
+    re-type both legs Contra in place. Returns the list of pairs found.
+
+    This is _cross_account_contra_pairs()'s job moved forward in time. That
+    one repairs history at read time and cannot be removed — it is the only
+    thing that fixes rows already saved. But repairing at read time means the
+    reconciliation screen still SHOWS the wrong classification on the day, and
+    every wrong classification lands in the review queue for a human to fix by
+    hand. Uploading both accounts together removes the guessing entirely:
+    ₹18,00,000 leaving HDFC and ₹18,00,000 arriving in IDFC on the same day is
+    a transfer by structure, whatever either narration happens to say.
+
+    That distinction matters because narration is not stable. Three separate
+    regex patches were needed in _looks_like_own_transfer() alone, the last
+    (13-08-2026) because the bank swapped slashes for spaces in an RTGS
+    reference. Structural matching does not care.
+
+    Guards are deliberately identical to the read-time version — a leg tied to
+    a customer case (matched_ref) can't be re-typed unless it is already Contra
+    or its narration names us as the sender — so the two passes can never
+    disagree about what is or isn't a transfer.
+    """
+    legs = []
+    for si, st in enumerate(statements):
+        for ti, tx in enumerate(st['transactions']):
+            already = (tx.get('type') or '').strip() == 'Contra'
+            if (not already and not _looks_like_own_transfer(tx.get('description', '') or '')
+                    and (tx.get('matched_ref') or '').strip()):
+                continue
+            d = _parse_flex_date(tx.get('date', ''))
+            if not d:
+                continue
+            legs.append({'si': si, 'ti': ti, 'date': d, 'already': already,
+                         'acct': st['account'] or f'File {si + 1}',
+                         'desc': (tx.get('description') or '')[:110],
+                         'debit': tx.get('debit', 0) or 0, 'credit': tx.get('credit', 0) or 0})
+
+    debits  = [l for l in legs if l['debit']  >= CONTRA_PAIR_MIN_AMOUNT]
+    credits = [l for l in legs if l['credit'] >= CONTRA_PAIR_MIN_AMOUNT]
+
+    pairs, used = [], set()
+    for dr in sorted(debits, key=lambda x: x['date']):
+        best = None
+        for i, cr in enumerate(credits):
+            # Different STATEMENTS, not merely different account labels: two
+            # files could arrive before either account is named.
+            if i in used or cr['si'] == dr['si']:
+                continue
+            if abs(cr['credit'] - dr['debit']) > 1:
+                continue
+            gap = abs((cr['date'] - dr['date']).days)
+            if gap > CONTRA_PAIR_MAX_DAYS:
+                continue
+            if best is None or gap < best[1]:
+                best = (i, gap)
+        if best is None:
+            continue
+        i, gap = best
+        used.add(i)
+        cr = credits[i]
+        retyped = []
+        for leg, side in ((dr, 'outgoing leg'), (cr, 'incoming leg')):
+            if leg['already']:
+                continue
+            tx = statements[leg['si']]['transactions'][leg['ti']]
+            other = cr['acct'] if leg is dr else dr['acct']
+            tx['type'] = 'Contra'
+            tx['match_basis'] = 'Cross-account'
+            tx['matched_ref'] = ''
+            tx['match_notes'] = (f"Own-account transfer — paired with the {other} leg "
+                                 f"of the same amount uploaded in this batch").strip()
+            retyped.append(side)
+        if retyped:
+            pairs.append({'amount': round(dr['debit'], 2), 'gap_days': gap, 'retyped': retyped,
+                          'out': {'account': dr['acct'], 'date': dr['date'].strftime('%d-%m-%Y'),
+                                  'description': dr['desc']},
+                          'in':  {'account': cr['acct'], 'date': cr['date'].strftime('%d-%m-%Y'),
+                                  'description': cr['desc']}})
+    return pairs
+
+def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
+    """Every distinct way a rupee could go missing, each as its own number
+    that should be zero. Deliberately NOT a single variance: the bank
+    statement's own arithmetic always balances, so one aggregate figure
+    proves nothing. What actually matters is whether every rupee of bank
+    movement is explained AND every book entry is backed by bank movement.
+
+    Leaks reported (each should be 0):
+      1. unclassified   -- a type with no cash role: money moved, meaning unknown
+      2. bank_unmatched -- a bank Disbursement/Repayment not tied to any case
+      3. book_unmatched -- a book disbursement/collection with no bank evidence
+      4. contra_imbalance -- own-account transfers must net to zero
+      5. fd_orphans / fd_unparsed -- sweeps that can't be attributed
+    """
+    if sh is None:
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    if periods is None:
+        periods = _load_recon_periods(get_recon_txns_sheet(sh))
+    if records is None:
+        records = read_accounts_from_gsheet()
+    if mc_rows is None:
+        mc_rows = sh.worksheet('M Coll').get_all_values()[1:]
+
+    def _rdk(p):
+        try:
+            return datetime.strptime(p['recon_date'], '%d-%m-%Y')
+        except Exception:
+            return datetime.min
+
+    # Own-account transfers whose two legs were typed inconsistently. Treated
+    # as Contra here so a half-typed transfer stops reading as missing money.
+    contra_pairing = _cross_account_contra_pairs(periods)
+    contra_paired_keys = contra_pairing['paired_keys']
+
+    role_totals = {}
+    unclassified = {}
+    bank_unmatched = []
+    all_txns = []
+    seen = set()
+    first_date = last_date = None
+    for p in sorted(periods, key=_rdk, reverse=True):
+        for tx in p['txns']:
+            k = (p['account'], tx['date'], tx['description'], tx['debit'], tx['credit'], tx['balance'])
+            if k in seen:
+                continue
+            seen.add(k)
+            all_txns.append(tx)
+            d = _parse_flex_date(tx.get('date', ''))
+            if d:
+                first_date = d if first_date is None or d < first_date else first_date
+                last_date = d if last_date is None or d > last_date else last_date
+
+            t = (tx.get('type') or '').strip() or '(blank)'
+            if k in contra_paired_keys:
+                t = 'Contra'          # matched to its counter-leg in another own account
+            role = CASH_ROLE.get(t)
+            net_out = tx['debit'] - tx['credit']
+            if role is None:
+                e = unclassified.setdefault(t, {'count': 0, 'net_out_of_bank': 0.0})
+                e['count'] += 1
+                e['net_out_of_bank'] += net_out
+                continue
+            r = role_totals.setdefault(role, {'count': 0, 'debit': 0.0, 'credit': 0.0})
+            r['count'] += 1
+            r['debit'] += tx['debit']
+            r['credit'] += tx['credit']
+            # A bank line the classifier called lending but couldn't tie to a
+            # case: real money in/out with no identified counterparty.
+            if role in ('lending_out', 'lending_in') and not (tx.get('matched_ref') or '').strip():
+                bank_unmatched.append({'date': tx.get('date'), 'type': t,
+                                        'debit': tx['debit'], 'credit': tx['credit'],
+                                        'description': (tx.get('description') or '')[:100]})
+
+    for r in role_totals.values():
+        r['debit'] = round(r['debit'], 2)
+        r['credit'] = round(r['credit'], 2)
+        r['net_out_of_bank'] = round(r['debit'] - r['credit'], 2)
+    for e in unclassified.values():
+        e['net_out_of_bank'] = round(e['net_out_of_bank'], 2)
+
+    # Book side: entries dated inside the reconciled window with no bank
+    # evidence at all. Range-scoped (not month-scoped like _book_completeness)
+    # so it covers exactly the window reconciliation actually proves.
+    disb_by_ref, coll_by_ref = _bank_matched_refs(all_txns)
+    bank_descs_upper = [(tx.get('description') or '').upper() for tx in all_txns]
+    def _in_window(dstr):
+        d = _parse_flex_date(str(dstr or ''))
+        return bool(d and first_date and last_date and first_date <= d <= last_date)
+
+    book_unmatched_disb, book_unmatched_coll = [], []
+    for r in records:
+        did = r.get('Disbursement ID', '')
+        if not did or not _in_window(r.get('Disbursement Date', '')) or did in disb_by_ref:
+            continue
+        note = str(r.get('Debit Note', '') or '').strip()
+        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(note)):
+            continue
+        book_unmatched_disb.append({'disb_id': did, 'customer': r.get('Customer Name', ''),
+                                     'date': r.get('Disbursement Date', ''),
+                                     'amount': _to_num(r.get('Amount', 0))})
+    for mc in mc_rows:
+        did = (mc[0] if len(mc) > 0 else '').strip()
+        if not did or not _in_window(mc[1] if len(mc) > 1 else '') or did in coll_by_ref:
+            continue
+        note = mc[3] if len(mc) > 3 else ''
+        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(note)):
+            continue
+        book_unmatched_coll.append({'disb_id': did, 'date': mc[1] if len(mc) > 1 else '',
+                                     'amount': _clean_amount(mc[2]) if len(mc) > 2 else 0})
+
+    fd = _fd_ledger(periods)
+    contra = role_totals.get('contra', {'net_out_of_bank': 0.0})
+    suspense = role_totals.get('suspense', {'net_out_of_bank': 0.0})
+
+    leaks = {
+        'unclassified_types': {
+            'total_net_out_of_bank': round(sum(e['net_out_of_bank'] for e in unclassified.values()), 2),
+            'types': unclassified},
+        'bank_entries_not_tied_to_a_case': {
+            'count': len(bank_unmatched),
+            'total_debit': round(sum(b['debit'] for b in bank_unmatched), 2),
+            'total_credit': round(sum(b['credit'] for b in bank_unmatched), 2),
+            'entries': bank_unmatched[:50]},
+        'book_entries_with_no_bank_evidence': {
+            'disbursement_count': len(book_unmatched_disb),
+            'disbursement_total': round(sum(d['amount'] for d in book_unmatched_disb), 2),
+            'collection_count': len(book_unmatched_coll),
+            'collection_total': round(sum(c['amount'] for c in book_unmatched_coll), 2),
+            'disbursements': book_unmatched_disb[:50],
+            'collections': book_unmatched_coll[:50]},
+        'contra_imbalance': round(contra.get('net_out_of_bank', 0.0), 2),
+        'suspense_net': round(suspense.get('net_out_of_bank', 0.0), 2),
+        'fd_orphan_total': fd['orphan_sweepin_total'],
+        'fd_unparsed_net': fd['unparsed_net'],
+    }
+    clean = (abs(leaks['unclassified_types']['total_net_out_of_bank']) < 1
+             and leaks['bank_entries_not_tied_to_a_case']['count'] == 0
+             and leaks['book_entries_with_no_bank_evidence']['disbursement_count'] == 0
+             and leaks['book_entries_with_no_bank_evidence']['collection_count'] == 0
+             and abs(leaks['contra_imbalance']) < 1
+             and abs(leaks['fd_orphan_total']) < 1
+             and abs(leaks['fd_unparsed_net']) < 1)
+
+    return {
+        'reconciled_window': {
+            'from': first_date.strftime('%d-%m-%Y') if first_date else None,
+            'to': last_date.strftime('%d-%m-%Y') if last_date else None},
+        'role_totals': role_totals,
+        'leaks': leaks,
+        'all_clear': clean,
+        'fd_total': fd['fd_total'],
+        # Auto-paired own-account transfers — shown so the correction is
+        # visible and auditable, never applied silently.
+        'contra_auto_paired': contra_pairing['pairs'],
+        'contra_auto_paired_total': contra_pairing['paired_total'],
+    }
+
+REPORT_GST_RATE = 0.18
+# A debit at or above this with no recognisable expense category is treated as
+# unidentified (held in suspense, excluded from profit, reported by name)
+# rather than silently charged to the P&L. Materiality threshold, not a rule
+# about any particular transaction.
+UNIDENTIFIED_MATERIALITY = 50000
+
+def _gst_of(record):
+    """The Accounts sheet's GST header carries a narrow no-break space, so a
+    plain 'GST (18%)' string literal never matches it. Find it by prefix."""
+    k = next((k for k in record if str(k).strip().upper().startswith('GST')), None)
+    return _to_num(record.get(k, 0)) if k else 0.0
+
+def _period_financials(from_date=None, to_date=None, periods=None, records=None, sh=None):
+    """Cash-basis P&L inputs for a date range — the single source of truth
+    behind every financial report, so the P&L, GST register and position
+    statement can never quote different numbers for the same period.
+
+    Revenue is recognised on COLLECTION, using the SAME rule as the GST
+    register (Prem's decision, 12-08-2026): a case contributes when it is
+    Closed AND its collection date falls in range. Charges invoiced on a
+    still-open case are future income, not cash earned, so they're excluded.
+
+    Excess collected — anything received beyond Total, even Re 1 — counts as
+    additional charges earned (Prem's explicit instruction, 11-08-2026),
+    decomposed GST-inclusive at 18%: the excess IS the cash received, so it's
+    split the same way Total = Amount + Charges + Charges×18% already is,
+    rather than grossed up on top.
+
+    GST is returned as its own LIABILITY figure and is deliberately NOT part
+    of net_profit — it's collected on the government's behalf, never earnings.
+
+    Partner drawings ('withdrawal' role) are returned separately too: a
+    capital appropriation belongs below the profit line, not inside expenses.
+    """
+    if sh is None:
+        sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+    if records is None:
+        records = read_accounts_from_gsheet()
+    if periods is None:
+        periods = _load_recon_periods(get_recon_txns_sheet(sh))
+    if to_date is None:
+        to_date = date.today()
+
+    def _in_range(d):
+        if d is None:
+            return False
+        if from_date and d < from_date:
+            return False
+        return d <= to_date
+
+    charges_earned = gst_collected = excess_total = 0.0
+    cases_closed = 0
+    for r in records:
+        if (r.get('Overdue Status', '') or '').strip() != 'Closed':
+            continue
+        if not _in_range(_parse_flex_date(r.get('Collected Date', ''))):
+            continue
+        _amt, total, collected, _bal = _parse_case(r)
+        excess = max(0.0, round(collected - total, 2))
+        ex_charges = excess / (1 + REPORT_GST_RATE)
+        charges_earned += _to_num(r.get('Charges', 0)) + ex_charges
+        gst_collected += _gst_of(r) + (excess - ex_charges)
+        excess_total += excess
+        cases_closed += 1
+
+    def _rdk(p):
+        try:
+            return datetime.strptime(p['recon_date'], '%d-%m-%Y')
+        except Exception:
+            return datetime.min
+
+    # A leg of an own-account transfer is not a cost — exclude both sides so a
+    # half-typed transfer can never land in expenses or in suspense.
+    contra_paired_keys = _cross_account_contra_pairs(periods)['paired_keys']
+
+    expenses_by_category = {}
+    unidentified = []
+    withdrawals = other_income = 0.0
+    recon_first = recon_last = None
+    seen = set()
+    for p in sorted(periods, key=_rdk, reverse=True):
+        for tx in p['txns']:
+            k = (p['account'], tx['date'], tx['description'], tx['debit'], tx['credit'], tx['balance'])
+            if k in seen:
+                continue
+            seen.add(k)
+            d = _parse_flex_date(tx.get('date', ''))
+            if d:
+                recon_first = d if recon_first is None or d < recon_first else recon_first
+                recon_last = d if recon_last is None or d > recon_last else recon_last
+            if not _in_range(d):
+                continue
+            if k in contra_paired_keys:
+                continue          # own-account transfer, not income or cost
+            role = CASH_ROLE.get((tx.get('type') or '').strip())
+            net_out = tx['debit'] - tx['credit']
+            if role == 'expense':
+                # Re-derive from the narration rather than trusting the label
+                # stored at save time: a stored label can carry a since-fixed
+                # classification bug forward forever. Exactly that happened —
+                # the firm's own name ("BridgeLine Partners") matched the
+                # partner rule and misbooked ₹5,75,000 of cheques as drawings.
+                cat = _expense_category(tx.get('description', '') or '') or 'Uncategorised'
+                if cat == 'Partner Share':
+                    # A partner drawing is a CAPITAL appropriation, not an
+                    # operating cost — it belongs below the profit line even
+                    # when the transaction is typed 'Expense'. Without this the
+                    # P&L charges real drawings against profit and can report a
+                    # loss on a genuinely profitable period.
+                    withdrawals += net_out
+                elif cat == 'Miscellaneous' and net_out >= UNIDENTIFIED_MATERIALITY:
+                    # A large debit with no recognisable category is UNIDENTIFIED,
+                    # not proven to be an expense. Standard practice is to hold it
+                    # in suspense until identified rather than let a guess hit the
+                    # P&L — so it is listed separately and excluded from profit,
+                    # and the report says so on its face.
+                    unidentified.append({
+                        'date': tx.get('date'), 'account': p['account'],
+                        'amount': round(net_out, 2),
+                        'description': (tx.get('description') or '')[:140]})
+                else:
+                    expenses_by_category[cat] = round(expenses_by_category.get(cat, 0.0) + net_out, 2)
+            elif role == 'withdrawal':
+                withdrawals += net_out
+            elif role == 'income':
+                other_income += tx['credit'] - tx['debit']
+            elif role is None and net_out > 0:
+                # Never let an unrecognised type silently swallow cash — it
+                # lands in its own visible category instead.
+                cat = f"Unclassified: {(tx.get('type') or '').strip() or '(blank)'}"
+                expenses_by_category[cat] = round(expenses_by_category.get(cat, 0.0) + net_out, 2)
+
+    total_expenses = round(sum(expenses_by_category.values()), 2)
+    charges_earned = round(charges_earned, 2)
+    other_income = round(other_income, 2)
+    return {
+        'from': from_date.strftime('%d-%m-%Y') if from_date else None,
+        'to': to_date.strftime('%d-%m-%Y'),
+        'basis': 'cash',
+        'charges_earned': charges_earned,
+        'gst_collected': round(gst_collected, 2),
+        'excess_collected': round(excess_total, 2),
+        'cases_closed': cases_closed,
+        'other_income': other_income,
+        'expenses_by_category': dict(sorted(expenses_by_category.items(),
+                                             key=lambda kv: -kv[1])),
+        'total_expenses': total_expenses,
+        # Stated BEFORE unidentified items — see `unidentified` below.
+        'net_profit': round(charges_earned + other_income - total_expenses, 2),
+        'partner_withdrawals': round(withdrawals, 2),
+        'unidentified': sorted(unidentified, key=lambda u: -u['amount']),
+        'unidentified_total': round(sum(u['amount'] for u in unidentified), 2),
+        # So every report can print its own data window and disclose, rather
+        # than imply, that expenses only exist from the first reconciled day.
+        'recon_data_from': recon_first.strftime('%d-%m-%Y') if recon_first else None,
+        'recon_data_to': recon_last.strftime('%d-%m-%Y') if recon_last else None,
+        'expenses_incomplete_before': recon_first.strftime('%d-%m-%Y') if recon_first else None,
+    }
+
+RECON_DAY_LEVEL_START = date(2026, 8, 1)
+
+def _day_level_coverage_gaps(periods, since=RECON_DAY_LEVEL_START):
+    """Unlike _recon_coverage_gaps() (month-level, all-time), this checks
+    EVERY CALENDAR DAY from `since` to today for each registered account --
+    the granularity that actually matters for fd_outstanding's accuracy
+    (see FD_ACCOUNT_LABEL). A single missing day is exactly what silently
+    breaks the sweep-out/sweep-in netting, so surfacing gaps at day
+    resolution (not month resolution) is the whole point of this check."""
+    registered = [a.get('name', '').strip() for a in (load_config().get('bank_accounts') or [])
+                  if a.get('name', '').strip()]
+    today = date.today()
+    gaps = {}
+    for acct in registered:
+        covered = set()
+        for p in periods:
+            if p['account'] != acct:
+                continue
+            d = _parse_recon_date(p['recon_date'])
+            if d:
+                covered.add(d.date())
+        missing = []
+        d = since
+        while d <= today:
+            if d not in covered:
+                missing.append(d.strftime('%d-%b'))
+            d += timedelta(days=1)
+        gaps[acct] = {'status': 'complete' if not missing else 'incomplete', 'missing_days': missing}
+    return gaps
 
 def _recon_coverage_gaps(periods):
     """Mirrors _account_tieout()'s 'incomplete' degradation pattern, but at
@@ -3022,10 +4974,19 @@ def _solvency_check():
     variance, so parking money in a Fixed Deposit never reads as unexplained
     missing money. Same reasoning _account_tieout() already uses for this
     statement's own Expense/Capital totals: context, not part of the formula.
+    That line now shows the DIRECTLY-ENTERED FD balance (see
+    FD_ACCOUNT_LABEL) as the trusted figure, alongside the old derived-from-
+    transaction-history total purely for comparison — a material gap between
+    the two is itself a signal something in the reconciled data is off
+    (exactly what surfaced the ~₹39.5L IDFC gap, 06-08-2026), not something
+    to silently paper over.
 
     Degrades to 'incomplete' (not a confident-looking wrong number) whenever
     reconciliation coverage has gaps, since Expenses sourced from that
-    history are then undercounted for the missing months.
+    history are then undercounted for the missing months. Also checked at
+    DAY resolution for August onward (see _day_level_coverage_gaps) — the
+    month-level check alone missed real gaps that were silently corrupting
+    fd_total.
     """
     sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
     capital_log = read_capital_log(sh)
@@ -3042,12 +5003,31 @@ def _solvency_check():
     periods = _load_recon_periods(get_recon_txns_sheet(sh))
     recon_totals = _all_time_recon_totals(periods)
     total_expenses = recon_totals['expense_total']
-    fd_total = recon_totals['fd_total']
+    fd_total_derived = recon_totals['fd_total']
     other_income_total = recon_totals['income_total']
+    fd_balance_direct, fd_balance_date = get_latest_fd_balance()
+    fd_ledger = _fd_ledger(periods)
+    fd_total = fd_ledger['fd_total']
 
     bank_balance, bank_date = get_latest_bank_balance()
     coverage_gaps = _recon_coverage_gaps(periods)
     incomplete_accounts = [a for a, g in coverage_gaps.items() if g['status'] != 'complete']
+    day_gaps = _day_level_coverage_gaps(periods)
+    day_gap_accounts = [a for a, g in day_gaps.items() if g['status'] != 'complete']
+
+    # A contra transfer dated inside the window between two accounts' own
+    # reconciliation dates is money that has LEFT the earlier-dated account's
+    # closing balance but not yet ARRIVED in the later-dated one — it simply
+    # vanishes from bank_balance, and no disbursement/collection adjustment
+    # compensates for it (contra isn't in Accounts or M Coll at all). Harmless
+    # only while every account shares one reconciliation date.
+    recon_dates_by_account = {}
+    for acct in [a.get('name', '').strip() for a in (load_config().get('bank_accounts') or [])
+                 if a.get('name', '').strip()]:
+        _, d = _last_recon_closing_for_account(acct)
+        if d:
+            recon_dates_by_account[acct] = d.strftime('%d-%m-%Y')
+    distinct_recon_dates = set(recon_dates_by_account.values())
 
     expected_bank_balance = variance = None
     if bank_balance is not None:
@@ -3060,6 +5040,32 @@ def _solvency_check():
     if incomplete_accounts:
         status = 'incomplete'
         reasons.append(f"Reconciliation coverage gaps for: {', '.join(incomplete_accounts)}")
+    if day_gap_accounts:
+        status = 'incomplete'
+        for a in day_gap_accounts:
+            reasons.append(f"{a} missing day-level reconciliation for: {', '.join(day_gaps[a]['missing_days'])}")
+    if fd_ledger['unparsed']:
+        status = 'incomplete'
+        reasons.append(
+            f"{len(fd_ledger['unparsed'])} FD sweep transaction(s) have a narration this system "
+            f"doesn't recognise, so they're excluded from the FD balance (net "
+            f"₹{fd_ledger['unparsed_net']:,.2f}). Usually means a bank changed its wording or a new "
+            f"account was added — the FD figure can't be fully trusted until these are handled.")
+    if fd_ledger['orphan_sweepins']:
+        reasons.append(
+            f"₹{fd_ledger['orphan_sweepin_total']:,.2f} swept back in from "
+            f"{len(fd_ledger['orphan_sweepins'])} FD(s) that were booked before reconciliation history "
+            f"begins ({', '.join(fd_ledger['orphan_sweepins'].keys())}). Those FDs are already fully "
+            f"swept back, so today's FD balance is unaffected — but if any pre-history FD is still open, "
+            f"its balance is invisible here.")
+    if len(distinct_recon_dates) > 1:
+        status = 'incomplete'
+        reasons.append(
+            'Bank accounts are reconciled to DIFFERENT dates ('
+            + '; '.join(f'{a}: {d}' for a, d in sorted(recon_dates_by_account.items()))
+            + '). Any transfer between your own accounts dated inside that window leaves one balance '
+              'but has not yet landed in the other, so the bank total silently understates. '
+              'Reconcile both to the same date.')
     if bank_balance is None:
         status = 'incomplete'
         reasons.append('No bank reconciliation history yet — cannot compare against a real bank balance.')
@@ -3070,12 +5076,20 @@ def _solvency_check():
         'total_disbursed_all': total_disbursed_all, 'total_collected_all': total_collected_all,
         'total_outstanding': total_outstanding,  # display context only — money currently with customers
         'total_expenses': total_expenses, 'fd_total': fd_total,
+        'fd_total_derived': fd_total_derived, 'fd_balance_direct': fd_balance_direct,
+        'fd_balance_date': fd_balance_date.strftime('%d-%m-%Y') if fd_balance_date else None,
+        'fd_open_count': fd_ledger['open_fd_count'],
+        'fd_open_accounts': {k: v['remaining'] for k, v in fd_ledger['open_fds'].items()},
+        'fd_orphan_total': fd_ledger['orphan_sweepin_total'],
+        'fd_unparsed_count': len(fd_ledger['unparsed']),
         'other_income_total': other_income_total,
         'bank_balance': bank_balance,
         'bank_balance_date': bank_date.strftime('%d-%m-%Y') if bank_date else None,
+        'recon_dates_by_account': recon_dates_by_account,
         'expected_bank_balance': expected_bank_balance, 'variance': variance,
         'ok': (variance is not None and abs(variance) <= 1.0),
         'coverage_gaps': coverage_gaps,
+        'day_level_gaps': day_gaps,
     }
 
 def save_reconciliation(recon_date, opening_balance, closing_balance, transactions,
@@ -3153,7 +5167,8 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
         is_current = (p['recon_date'] == recon_date and p['account'] == account)
         # Computed before the Recon Log append below, so "last closing"
         # correctly reflects the state BEFORE this save, not after.
-        current_tieout = (_account_tieout(records, mc_rows, account, p_label, p['txns'], p['closing'])
+        current_tieout = (_account_tieout(records, mc_rows, account, p_label, p['txns'], p['closing'],
+                                          recon_date=p['recon_date'])
                            if is_current else None)
         dr, cr = _sheet_statement(wb, sheet_label, p['remarks'], p['opening'],
                                   p['closing'], p['txns'], s, tieout=current_tieout)
@@ -3304,6 +5319,16 @@ HTML = """<!DOCTYPE html>
   .sum-modal td{padding:7px 14px;border-bottom:1px solid #eef}
   .sum-modal tr:hover td{background:#f8fbff}
   .sum-modal .empty{padding:20px;text-align:center;color:#888;font-size:.85rem}
+  .pdf-modal-bg{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:1000;align-items:center;justify-content:center}
+  .pdf-modal-bg.show{display:flex}
+  .pdf-modal{background:#fff;border-radius:10px;width:95%;max-width:1040px;height:92vh;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,.35);display:flex;flex-direction:column}
+  .pdf-modal-head{background:#1a3a5c;color:#fff;padding:12px 16px;display:flex;justify-content:space-between;align-items:center;flex-shrink:0}
+  .pdf-modal-head h3{margin:0;font-size:.95rem;font-weight:600}
+  .pdf-modal-head .acts{display:flex;gap:8px;align-items:center}
+  .pdf-modal-head button{background:rgba(255,255,255,.15);border:none;color:#fff;font-size:.82rem;cursor:pointer;padding:6px 12px;border-radius:6px}
+  .pdf-modal-head button:hover{background:rgba(255,255,255,.28)}
+  .pdf-modal-head .x{background:none;font-size:1.3rem;padding:0 6px;line-height:1}
+  .pdf-modal iframe{flex:1;width:100%;border:0}
   /* Calculator */
   .calc-display{background:#1a3a5c;color:#fff;font-size:2rem;text-align:right;padding:16px 20px;border-radius:8px;margin-bottom:12px;min-height:70px;word-break:break-all;line-height:1.2}
   .calc-display .calc-expr{font-size:.9rem;color:#a8c4e0;min-height:22px;margin-bottom:4px}
@@ -3360,6 +5385,26 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Report preview. Top-level sibling, NOT nested inside the summary
+       modal — nesting it there would inherit that modal's display:none and
+       it could never open. -->
+  <div class="pdf-modal-bg" id="pdf-modal-bg" onclick="if(event.target===this) closePdfModal()">
+    <div class="pdf-modal">
+      <div class="pdf-modal-head">
+        <h3 id="pdf-modal-title">Report</h3>
+        <div class="acts">
+          <!-- Inline iframe PDF rendering is unreliable on some browsers
+               (notably iOS Safari, which may show a blank frame), so there
+               is always an escape hatch to the browser's own PDF viewer. -->
+          <button onclick="openViewedPdfInTab()">↗ Open in tab</button>
+          <button onclick="downloadViewedPdf()">⬇ Download</button>
+          <button class="x" onclick="closePdfModal()">&times;</button>
+        </div>
+      </div>
+      <iframe id="pdf-frame" title="Report preview"></iframe>
+    </div>
+  </div>
+
   <div class="tabs">
     <button class="tab-btn active" onclick="showTab('disb',this); loadPendingRequests()">➕ New Disbursement</button>
     <button class="tab-btn" onclick="showTab('repa',this); loadOpenCases()">💰 Repayment</button>
@@ -3367,6 +5412,7 @@ HTML = """<!DOCTYPE html>
     <button class="tab-btn" onclick="showTab('calc',this)">🧮 Calculator</button>
     <button class="tab-btn" onclick="showTab('recon',this)">🏦 Bank Reconciliation</button>
     <button class="tab-btn" onclick="showTab('invoice',this); loadInvoiceCases()">📄 Invoice</button>
+    <button class="tab-btn" onclick="showTab('reports',this); loadReports()">📊 Reports</button>
     <button class="tab-btn" onclick="showTab('edit',this); loadRecentCases()">✏️ Edit Case</button>
     <button class="tab-btn" onclick="showTab('contacts',this); loadContacts()">👥 Contacts</button>
     <button class="tab-btn" onclick="showTab('settings',this); loadSettings()">⚙ Settings</button>
@@ -3423,9 +5469,9 @@ HTML = """<!DOCTYPE html>
         <div class="field"><label>Cheque No. (optional)</label><input type="text" id="d-chq"></div>
         <div class="field"><label>Amount (₹) *</label>
           <input type="number" id="d-amount" placeholder="e.g. 500000" oninput="calcCharges()"></div>
-        <div class="field"><label>Charges (0.5%)</label>
+        <div class="field"><label>Charges</label>
           <input type="text" id="d-charges" readonly><span class="hint">Auto-calculated</span></div>
-        <div class="field"><label>GST 18% on Charges</label>
+        <div class="field"><label>GST</label>
           <input type="text" id="d-gst" readonly><span class="hint">Auto-calculated</span></div>
         <div class="field"><label>Total Receivable (₹)</label>
           <input type="text" id="d-total" readonly><span class="hint">Auto-calculated</span></div>
@@ -3533,76 +5579,50 @@ HTML = """<!DOCTYPE html>
   <!-- BANK RECONCILIATION TAB -->
   <div id="recon" class="tab-content">
     <div class="section">
-      <h3>Daily Bank Statement Upload</h3>
-      <div class="grid" style="margin-bottom:12px">
-        <div class="field">
-          <label>Reconciliation Date *</label>
-          <div class="date-wrap">
-            <input type="text" id="rec-date" placeholder="DD-MM-YYYY">
-            <input type="date" class="date-native" id="rec-date-native" onchange="_pickDate('rec-date', this.value)">
-            <button type="button" class="date-cal-btn" onclick="_openDatePicker('rec-date-native')">📅</button>
-          </div>
-        </div>
-        <div class="field">
-          <label>Opening Balance (₹) <span style="color:#888;font-weight:400">(auto-read from statement)</span></label>
-          <input type="number" id="rec-opening" placeholder="Auto-extracted from statement" step="0.01" oninput="recomputeStatementCheck()">
-        </div>
-        <div class="field">
-          <label>Closing Balance (₹) <span style="color:#888;font-weight:400">(auto-read — correct here if the parse looks wrong)</span></label>
-          <input type="number" id="rec-closing" placeholder="Auto-extracted from statement" step="0.01" oninput="recomputeStatementCheck()">
-        </div>
-        <div class="field">
-          <label>Bank Account *</label>
-          <input type="text" id="rec-account" list="rec-account-list" placeholder="Select or type new...">
-          <datalist id="rec-account-list"></datalist>
-        </div>
-        <div class="field" style="grid-column:1/-1">
-          <label>Remarks / Account Name</label>
-          <input type="text" id="rec-remarks" placeholder="e.g. HDFC Current A/c XX0923">
-        </div>
+      <h3>Bank Statement Upload</h3>
+      <p style="font-size:.82rem;color:#555;margin:-4px 0 12px;line-height:1.6">
+        Upload <b>every account's statement for the same period together</b>. Transfers between your own
+        accounts are then matched by structure — same amount, opposite direction, different account — instead
+        of being guessed from the narration text, which the banks keep rewording.
+        Each file's <b>account and date are read from the statement itself</b>.
+      </p>
+      <div class="field" style="margin-bottom:12px">
+        <label>Remarks <span style="color:#888;font-weight:400">(optional, applies to every statement in this upload)</span></label>
+        <input type="text" id="rec-remarks" placeholder="e.g. month-end close">
       </div>
-      <label style="font-size:.8rem;font-weight:600;color:#444;display:block;margin-bottom:6px">Upload Bank Statement (CSV or Excel)</label>
+      <datalist id="rec-account-list"></datalist>
       <div class="upload-area" id="upload-area" onclick="document.getElementById('rec-file').click()">
-        <input type="file" id="rec-file" accept=".csv,.xlsx,.xls" onchange="onFileSelect(this)">
-        <div id="upload-label">📂 Click to upload bank statement<br><span style="font-size:.78rem">Supports CSV, Excel (.xlsx/.xls)</span></div>
+        <input type="file" id="rec-file" accept=".csv,.xlsx,.xls,.pdf" multiple onchange="onFileSelect(this)">
+        <div id="upload-label">📂 Click to upload bank statements<br><span style="font-size:.78rem">Select all accounts at once — CSV, Excel (.xlsx/.xls) or PDF</span></div>
       </div>
-      <button class="btn btn-extract" style="margin:0" onclick="parseStatement()">⚡ Parse Statement</button>
+      <div id="selected-files" style="display:none;margin:10px 0 0;font-size:.82rem"></div>
+      <button class="btn btn-extract" style="margin:0" onclick="parseStatement()">⚡ Parse Statements</button>
     </div>
 
     <!-- Reconciliation output -->
     <div id="recon-preview-section" style="display:none">
 
-      <!-- Balances summary strip -->
-      <div class="recon-summary" id="recon-summary" style="margin-bottom:14px"></div>
-
-      <!-- Same-statement arithmetic self-consistency check -->
-      <div id="statement-check-badge" style="margin:-4px 0 14px;font-size:.85rem;font-weight:600"></div>
-
-      <!-- Auto-reconciled confidence strip -->
-      <div class="section" style="background:#f0faf4;border-color:#a8d5b5">
-        <h3 style="color:#1a5c3a">✅ Auto-Reconciled <span id="confident-badge" style="font-weight:400;color:#555"></span></h3>
-        <div id="confident-summary" style="font-size:.83rem;color:#333;line-height:1.8"></div>
+      <!-- Own-account transfers paired across the uploaded statements -->
+      <div class="section" id="cross-account-section" style="display:none;background:#eef5fd;border-color:#a9c8e8">
+        <h3 style="color:#12467e">🔄 Own-Account Transfers Matched <span id="cross-badge" style="font-weight:400;color:#555"></span></h3>
+        <p style="font-size:.8rem;color:#555;margin:0 0 10px">Both legs found in this upload and typed <b>Contra</b> automatically — no review needed, and they can't distort profit or the contra balance.</p>
+        <div id="cross-account-body" style="font-size:.83rem"></div>
       </div>
 
-      <!-- Book vs Bank completeness — book entries with no matching bank txn -->
-      <div class="section" id="book-completeness-section" style="display:none;background:#fff5f5;border-color:#e0b0b0">
-        <h3 style="color:#a00">📋 Book vs Bank Completeness <span id="completeness-badge" style="font-weight:400;color:#888"></span></h3>
-        <div id="completeness-body" style="font-size:.83rem"></div>
-      </div>
+      <!-- Statements are reconciled to different dates -->
+      <div id="date-mismatch-note" style="display:none;margin-bottom:14px;padding:10px 12px;border:1px solid #e0c060;background:#fff3cd;color:#7a5c00;border-radius:6px;font-size:.82rem"></div>
 
-      <!-- Per-account book-balance tie-out -->
-      <div class="section" id="account-tieout-section" style="display:none">
-        <h3>🏦 Per-Account Book Tie-Out <span id="tieout-badge" style="font-weight:400;color:#888"></span></h3>
-        <div id="tieout-body" style="font-size:.85rem;line-height:1.7"></div>
-      </div>
+      <!-- One block per uploaded statement, built by renderReconResult() -->
+      <div id="recon-statements"></div>
 
-      <!-- Review queue — only uncertain entries -->
+      <!-- Review queue — uncertain entries across every statement -->
       <div class="section" id="review-section" style="display:none">
         <h3>⚠️ Needs Your Input <span id="review-badge" style="font-weight:400;color:#888"></span></h3>
         <p style="font-size:.8rem;color:#666;margin:0 0 10px">These couldn't be confidently matched. Set the correct <b>Type</b> and optionally add <b>Remarks</b> — then save.</p>
         <div style="overflow-x:auto">
           <table class="recon-table">
             <thead><tr>
+              <th style="width:110px">Account</th>
               <th>Date</th><th>Description</th><th>UTR</th>
               <th style="text-align:right">Amount</th>
               <th style="width:60px">Dr/Cr</th>
@@ -3733,6 +5753,32 @@ HTML = """<!DOCTYPE html>
       <h3>🧮 Company Solvency Check <span id="solvency-badge" style="font-weight:400;color:#888"></span></h3>
       <p style="font-size:.8rem;color:#666;margin:0 0 10px">Does Net Capital plus net cash from lending minus Expenses actually equal what's really in the bank?</p>
       <div id="solvency-body" style="font-size:.85rem;line-height:1.7"></div>
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid #eee">
+        <label style="font-size:.85rem;font-weight:600">Update FD Balance</label>
+        <p style="font-size:.78rem;color:#666;margin:2px 0 8px">Enter the real current total from your FD/netbanking summary — trusted directly, same as a bank closing balance, not derived from transaction history.</p>
+        <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+          <div class="field" style="flex:0 0 140px;margin:0">
+            <label style="font-size:.75rem">Date</label>
+            <div class="date-wrap">
+              <input type="text" id="fd-date" style="width:100%">
+              <input type="date" class="date-native" id="fd-date-native" onchange="_pickDate('fd-date', this.value)">
+              <button type="button" class="date-cal-btn" onclick="_openDatePicker('fd-date-native')">📅</button>
+            </div>
+          </div>
+          <div class="field" style="flex:0 0 160px;margin:0">
+            <label style="font-size:.75rem">Total FD Balance (₹)</label>
+            <input type="number" id="fd-balance" step="0.01">
+          </div>
+          <button class="btn btn-save" style="width:auto;padding:9px 18px" onclick="saveFdBalance()">💾 Save</button>
+        </div>
+        <div id="fd-balance-status" class="status"></div>
+      </div>
+    </div>
+
+    <div class="section" id="integrity-section">
+      <h3>🔒 Money Integrity <span id="integrity-badge" style="font-weight:400;color:#888"></span></h3>
+      <p style="font-size:.8rem;color:#666;margin:0 0 10px">Every distinct way a rupee could go missing, each proven separately. A single variance figure proves nothing — a bank statement's own arithmetic always balances.</p>
+      <div id="integrity-body" style="font-size:.85rem;line-height:1.6"></div>
     </div>
 
     <div class="section" id="capital-log-section">
@@ -3862,11 +5908,35 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <div id="reports" class="tab-content">
+    <div class="section">
+      <h3>📊 Reports <span id="reports-badge" style="font-weight:400;color:#888"></span></h3>
+      <p style="font-size:.8rem;color:#666;margin:0 0 12px">Every report downloads as a PDF. Financial reports are cash-basis — charges count when collected, not when invoiced.</p>
+      <div class="field" style="max-width:420px;margin-bottom:14px">
+        <label>Period <span style="font-weight:400;color:#888">(used by reports that need one)</span></label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div class="date-wrap" style="flex:1">
+            <input type="text" id="rep-from" placeholder="DD-MM-YYYY">
+            <input type="date" id="rep-from-native" class="date-native" onchange="_pickDate('rep-from',this.value)">
+            <button type="button" class="date-btn" onclick="_openDatePicker('rep-from-native')">📅</button>
+          </div>
+          <span style="color:#888;font-size:.8rem">to</span>
+          <div class="date-wrap" style="flex:1">
+            <input type="text" id="rep-to" placeholder="DD-MM-YYYY">
+            <input type="date" id="rep-to-native" class="date-native" onchange="_pickDate('rep-to',this.value)">
+            <button type="button" class="date-btn" onclick="_openDatePicker('rep-to-native')">📅</button>
+          </div>
+        </div>
+      </div>
+      <div id="reports-list"></div>
+      <div id="reports-status" class="status" style="margin-top:10px"></div>
+    </div>
+  </div>
+
 </div>
 
 <script>
 let openCasesData = [];
-let reconTxns     = [];
 let _pendingReqsOpen = true;
 
 async function loadPendingRequests() {
@@ -3891,15 +5961,20 @@ async function loadPendingRequests() {
       const badge = r.status === 'Exported'
         ? ' <span style="font-size:11px;background:#fff3cd;color:#856404;border:1px solid #ffeeba;border-radius:4px;padding:1px 6px;font-weight:400;">Exported</span>'
         : '';
+      const kycLine = r.kyc_folder
+        ? `<a href="${r.kyc_folder}" target="_blank" rel="noopener" class="req-kyc-link" style="font-size:11px;color:#1a7a3a;">📁 KYC Docs</a>`
+        : `<span style="font-size:11px;color:#c0392b;">⚠ No KYC docs</span>`;
       card.innerHTML = `<button class="req-del-btn" title="Delete request" style="float:right;font-size:12px;padding:2px 8px;cursor:pointer;border:1px solid #e0b4b4;border-radius:4px;background:#fff;color:#c0392b;">🗑</button>
         <div style="font-weight:600;font-size:14px;">${r.customer}${badge}</div>
         <div style="font-size:12px;color:#555;margin-top:3px;">${r.cluster} · ${r.branch} · ${amt}</div>
-        <div style="font-size:11px;color:#999;margin-top:2px;">${r.request_id} · ${r.submitted_at}</div>`;
+        <div style="font-size:11px;color:#999;margin-top:2px;">${r.request_id} · ${r.submitted_at} · ${kycLine}</div>`;
       card.addEventListener('click', () => selectPendingRequest(r));
       card.querySelector('.req-del-btn').addEventListener('click', (ev) => {
         ev.stopPropagation();
         deletePendingRequest(r);
       });
+      const kycLinkEl = card.querySelector('.req-kyc-link');
+      if (kycLinkEl) kycLinkEl.addEventListener('click', (ev) => ev.stopPropagation());
       list.appendChild(card);
     });
   } catch(e) {
@@ -3930,6 +6005,7 @@ async function deletePendingRequest(r) {
 
 function selectPendingRequest(r) {
   document.getElementById('d-customer').value = r.customer || '';
+  document.getElementById('d-company').value  = r.company  || '';
   document.getElementById('d-cluster').value  = r.cluster  || '';
   document.getElementById('d-branch').value   = r.branch   || '';
   if (r.amount) { document.getElementById('d-amount').value = r.amount; calcCharges(); }
@@ -3942,9 +6018,13 @@ function selectPendingRequest(r) {
 
   const info = document.getElementById('pending-selected-info');
   const amt = Number(r.amount) > 0 ? '₹' + Number(r.amount).toLocaleString('en-IN', {maximumFractionDigits:0}) : r.amount;
+  const kycInfoLine = r.kyc_folder
+    ? `<a href="${r.kyc_folder}" target="_blank" rel="noopener" style="color:#1a7a3a;">📁 KYC Docs</a>`
+    : `<span style="color:#c0392b;">⚠ No KYC docs</span>`;
   info.innerHTML = `<b>Selected:</b> ${r.customer} &nbsp;·&nbsp; ${r.cluster} / ${r.branch} &nbsp;·&nbsp; ${amt}<br>
     <b>Account:</b> ${r.account_no || '—'} &nbsp; <b>IFSC:</b> ${r.ifsc || '—'}<br>
     <b>Phone:</b> ${r.phone || '—'} &nbsp; <b>SO:</b> ${r.so_name || '—'} &nbsp; <b>Gold:</b> ${r.gold_weight || '—'} gms<br>
+    <b>KYC:</b> ${kycInfoLine}<br>
     <span style="color:#2a7ae2;font-size:11px;">${r.request_id}</span>
     <button onclick="clearDisb()" style="float:right;font-size:11px;padding:2px 8px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">✕ Clear</button>`;
   info.style.display = 'block';
@@ -4031,10 +6111,14 @@ function renderEditCase(c) {
   set('e-amount', c.amount); set('e-srv-branch', c.srv_branch); set('e-srv-cluster', c.srv_cluster);
   set('e-debit-note', c.debit_note); set('e-remarks', c.remarks);
   document.getElementById('e-new-pay-date').value = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
+  const kycDocsLine = c.kyc_folder
+    ? `<a href="${c.kyc_folder}" target="_blank" rel="noopener">📁 View</a>`
+    : `<span style="color:#a00">Not uploaded</span>`;
   document.getElementById('e-computed').innerHTML =
     `<b>Computed:</b> Charges ₹${fmtDec(c.charges)} &nbsp;|&nbsp; GST ₹${fmtDec(c.gst)} &nbsp;|&nbsp; Total ₹${fmtDec(c.total)}` +
     ` &nbsp;|&nbsp; Collected ₹${fmtDec(c.collected)} &nbsp;|&nbsp; Discount ₹${fmtDec(c.discount)}` +
-    ` &nbsp;|&nbsp; <b>Balance ₹${fmtDec(c.balance)}</b> &nbsp;|&nbsp; Status: <b>${c.status || '—'}</b>`;
+    ` &nbsp;|&nbsp; <b>Balance ₹${fmtDec(c.balance)}</b> &nbsp;|&nbsp; Status: <b>${c.status || '—'}</b>` +
+    ` &nbsp;|&nbsp; KYC Docs: ${kycDocsLine}`;
   renderEditPayments();
 }
 
@@ -4415,7 +6499,12 @@ async function saveDisb() {
   const r = await (await fetch('/save/disbursement', {method:'POST',
     headers:{'Content-Type':'application/json'}, body: JSON.stringify(data)})).json();
   btn.disabled = false; btn.textContent = '✅ Save Disbursement to Google Sheet';
-  if (r.ok) { showStatus('d-status','success',`✅ Saved! ID: ${r.disb_id}`); clearDisb(); loadPendingRequests(); kickLedgerRebuild(); }
+  if (r.ok) {
+    let msg = `✅ Saved! ID: ${r.disb_id}`;
+    if (r.warning) msg += `  ⚠ ${r.warning}`;
+    showStatus('d-status','success',msg);
+    clearDisb(); loadPendingRequests(); kickLedgerRebuild();
+  }
   else       showStatus('d-status','error','❌ ' + r.error);
 }
 
@@ -4426,9 +6515,11 @@ async function saveRepa() {
   if (!amount)  return showStatus('r-status','error','Amount is required.');
   const utr = document.getElementById('r-utr').value.trim();
   if (!utr) return showStatus('r-status','error','❌ UTR / Reference number is required — a repayment cannot be recorded without proof of payment.');
+  const rDate = document.getElementById('r-date').value.trim();
+  if (!rDate) return showStatus('r-status','error','Collection Date is required — the pasted message did not contain a date, please enter it manually.');
   const data = {
     disb_id,
-    date:     document.getElementById('r-date').value.trim(),
+    date:     rDate,
     amount,
     utr,
     discount: document.getElementById('r-discount').value || 0,
@@ -4513,9 +6604,14 @@ function openSumModal(kind) {
           <tr><td style="padding:6px 0;color:#555">Bank Closing Balance (${d.bank_balance_date||''})</td><td style="padding:6px 0;text-align:right;font-weight:600">₹${fmt(d.bank_balance||0)}</td></tr>
           <tr><td style="padding:6px 0;color:#555">Plus: Collected since then</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#1a5c3a">+₹${fmt(d.collected_since_bank||0)}</td></tr>
           <tr><td style="padding:6px 0;color:#555">Less: Disbursed since then</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#c00">−₹${fmt(d.disbursed_since_bank||0)}</td></tr>
-          <tr><td style="padding:6px 0;color:#555">Plus: Parked in sweep-in FDs</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#1a5c3a">+₹${fmt(d.fd_outstanding||0)}</td></tr>
+          <tr><td style="padding:6px 0;color:#555">Plus: Parked in FDs${d.fd_outstanding_date ? ' (as of '+d.fd_outstanding_date+')' : (d.fd_open_count ? ' ('+d.fd_open_count+' open FD'+(d.fd_open_count===1?'':'s')+')' : '')}</td><td style="padding:6px 0;text-align:right;font-weight:600;color:#1a5c3a">+₹${fmt(d.fd_outstanding||0)}</td></tr>
           <tr style="border-top:2px solid #1a3a5c"><td style="padding:8px 0;font-weight:700">Available to Disburse</td><td style="padding:8px 0;text-align:right;font-weight:700;color:#1a5c3a">₹${fmt(d.available_for_disbursement||0)}</td></tr>
-        </table></div>`;
+        </table>
+        ${d.fd_outstanding_source === 'fd_ledger' ? `<div style="margin-top:10px;padding:8px 10px;background:#eaf6ee;border:1px solid #9ccfae;border-radius:6px;font-size:.78rem;color:#1a5c3a">FD balance derived automatically from the sweep-out / sweep-in lines in your bank statements, tracked per FD account number. No manual entry needed.</div>` : ''}
+        ${d.fd_outstanding_source === 'direct_override' ? `<div style="margin-top:10px;padding:8px 10px;background:#eef3fa;border:1px solid #a9c2e0;border-radius:6px;font-size:.78rem;color:#1a3a5c">Using a manually entered FD balance, which is dated on/after the latest sweep activity. It will hand back to the automatic per-FD figure once newer sweeps come in.</div>` : ''}
+        ${d.fd_unparsed_count ? `<div style="margin-top:10px;padding:8px 10px;background:#fdecea;border:1px solid #e0a0a0;border-radius:6px;font-size:.78rem;color:#8a2020">⚠️ ${d.fd_unparsed_count} FD sweep transaction(s) have an unrecognised narration and are excluded from this FD figure. See Settings → Company Solvency Check.</div>` : ''}
+        ${d.fd_outstanding_source === 'derived_fallback' ? `<div style="margin-top:10px;padding:8px 10px;background:#fff3cd;border:1px solid #e0c060;border-radius:6px;font-size:.78rem;color:#7a5c00">⚠️ Falling back to the old derived-from-history FD figure, which is known to understate. Check Settings → Company Solvency Check.</div>` : ''}
+        </div>`;
     }
   } else if (!cfg.rows.length) {
     body.innerHTML = `<div class="empty">${cfg.emptyMsg}</div>`;
@@ -4604,39 +6700,63 @@ document.addEventListener('keydown', e => {
 // second upload in the same session silently no-op until the page was
 // reloaded. Resetting input.value immediately guarantees the NEXT selection
 // (same name or not) always fires 'change' again.
-let _selectedReconFile = null;
+// A LIST now — every account's statement for the period goes up together, so
+// transfers between our own accounts pair structurally instead of being read
+// out of narration text (see _pair_uploaded_statements() on the server).
+let _selectedReconFiles = [];
 
+// Accumulates across picks rather than replacing: banks export one account at
+// a time, so HDFC and IDFC are usually two separate trips to the file dialog.
+// Resetting input.value immediately guarantees the NEXT selection always fires
+// 'change' again — browsers don't fire it when the SAME filename is re-picked,
+// which used to make a second upload silently no-op until a page reload.
 function onFileSelect(input) {
-  _selectedReconFile = input.files[0] || null;
-  const name = _selectedReconFile ? _selectedReconFile.name : '';
-  document.getElementById('upload-label').innerHTML =
-    name ? `📄 <b>${name}</b> selected` : '📂 Click to upload bank statement';
+  for (const f of input.files) {
+    if (!_selectedReconFiles.some(x => x.name === f.name && x.size === f.size)) {
+      _selectedReconFiles.push(f);
+    }
+  }
   input.value = '';
+  renderSelectedFiles();
+}
+
+function removeReconFile(i) {
+  _selectedReconFiles.splice(i, 1);
+  renderSelectedFiles();
+}
+
+function renderSelectedFiles() {
+  const box = document.getElementById('selected-files');
+  const label = document.getElementById('upload-label');
+  if (!_selectedReconFiles.length) {
+    box.style.display = 'none'; box.innerHTML = '';
+    label.innerHTML = '📂 Click to upload bank statements<br><span style="font-size:.78rem">Select all accounts at once — CSV, Excel (.xlsx/.xls) or PDF</span>';
+    return;
+  }
+  label.innerHTML = `📂 ${_selectedReconFiles.length} file${_selectedReconFiles.length>1?'s':''} selected — click to add another`;
+  box.style.display = 'block';
+  box.innerHTML = _selectedReconFiles.map((f, i) =>
+    `<div style="display:flex;align-items:center;gap:8px;padding:5px 8px;background:#f4f8fc;border:1px solid #d0dce8;border-radius:5px;margin-bottom:5px">
+       <span style="flex:1">📄 ${f.name}</span>
+       <button type="button" onclick="removeReconFile(${i})"
+         style="border:none;background:none;color:#c00;cursor:pointer;font-size:1rem;line-height:1">×</button>
+     </div>`).join('');
 }
 
 async function parseStatement() {
-  if (!_selectedReconFile) return alert('Please upload a bank statement file first.');
-  const recDate = document.getElementById('rec-date').value.trim();
-  if (!recDate) return alert('Please enter the reconciliation date.');
-  const account = document.getElementById('rec-account').value.trim();
+  if (!_selectedReconFiles.length) return alert('Please upload at least one bank statement file first.');
 
   const formData = new FormData();
-  formData.append('file', _selectedReconFile, _selectedReconFile.name);
-  formData.append('date', recDate);
-  formData.append('account', account);
+  _selectedReconFiles.forEach(f => formData.append('files', f, f.name));
 
   const btn = event.target; btn.disabled = true; btn.textContent = 'Parsing...';
   try {
     const r = await (await fetch('/reconcile/parse', {method:'POST', body: formData})).json();
-    btn.disabled = false; btn.textContent = '⚡ Parse Statement';
+    btn.disabled = false; btn.textContent = '⚡ Parse Statements';
     if (!r.ok) return alert('❌ ' + r.error);
-
-    reconTxns = r.transactions;
-    if (r.opening_balance) document.getElementById('rec-opening').value = r.opening_balance;
-    if (r.closing_balance) document.getElementById('rec-closing').value = r.closing_balance;
     renderReconResult(r);
   } catch(e) {
-    btn.disabled = false; btn.textContent = '⚡ Parse Statement';
+    btn.disabled = false; btn.textContent = '⚡ Parse Statements';
     alert('Error parsing file: ' + e);
   }
 }
@@ -4734,19 +6854,35 @@ function _fmtSigned(n) {
   return (n < 0 ? '-\u20b9' : '\u20b9') + fmtDec(Math.abs(n));
 }
 
-function recomputeStatementCheck() {
-  const opening = parseFloat(document.getElementById('rec-opening').value) || 0;
-  const closing = parseFloat(document.getElementById('rec-closing').value) || 0;
-  const dr = (reconTxns||[]).reduce((s,t)=>s+t.debit,0);
-  const cr = (reconTxns||[]).reduce((s,t)=>s+t.credit,0);
-  const expected = opening + cr - dr;
-  const variance = closing - expected;
-  const el = document.getElementById('statement-check-badge');
+// Per-statement now \u2014 each uploaded file has its own editable opening/closing
+// and its own arithmetic badge, since one upload can carry several accounts.
+function recomputeStatementCheck(si) {
+  const st = (window._reconStatements || [])[si];
+  if (!st) return;
+  const opEl = document.querySelector(`input[data-open="${si}"]`);
+  const clEl = document.querySelector(`input[data-close="${si}"]`);
+  if (opEl) st.opening_balance = parseFloat(opEl.value) || 0;
+  if (clEl) st.closing_balance = parseFloat(clEl.value) || 0;
+  const dr = (st.transactions||[]).reduce((s,t)=>s+t.debit,0);
+  const cr = (st.transactions||[]).reduce((s,t)=>s+t.credit,0);
+  const expected = st.opening_balance + cr - dr;
+  const variance = st.closing_balance - expected;
+  const el = document.querySelector(`[data-check="${si}"]`);
   if (!el) return;
   el.style.color = Math.abs(variance) <= 1 ? '#1a5c3a' : '#c00';
   el.textContent = Math.abs(variance) <= 1
     ? `\u2713 Statement is internally consistent (Opening + Credits \u2212 Debits = Closing)`
-    : `\u2717 Mismatch: expected closing \u20b9${fmtDec(expected)}, statement says \u20b9${fmtDec(closing)} \u2014 \u0394${_fmtSigned(variance)}`;
+    : `\u2717 Mismatch: expected closing \u20b9${fmtDec(expected)}, statement says \u20b9${fmtDec(st.closing_balance)} \u2014 \u0394${_fmtSigned(variance)}`;
+}
+
+// The account a statement will be SAVED under. Auto-detected from the file
+// where possible; this is the manual fallback and override.
+function setStatementAccount(si, value) {
+  const st = (window._reconStatements || [])[si];
+  if (!st) return;
+  st.account = (value || '').trim();
+  const note = document.querySelector(`[data-acct-note="${si}"]`);
+  if (note) note.textContent = st.account ? '(you set this)' : '';
 }
 
 function buildUnmatchedTable(rows, refLabel) {
@@ -4761,61 +6897,73 @@ function buildUnmatchedTable(rows, refLabel) {
     </tr>`).join('')}</tbody></table></div>`;
 }
 
-function renderReconResult(r) {
-  const opening = r.opening_balance || 0;
-  const closing = r.closing_balance || 0;
-  const totalDr = r.transactions.reduce((s,t) => s+t.debit, 0);
-  const totalCr = r.transactions.reduce((s,t) => s+t.credit, 0);
-
-  // Unconditionally clear/hide these before repopulating \u2014 otherwise a
-  // second parse in the same session (different file, or a correction)
-  // could show leftover rows from the previous statement.
-  document.getElementById("book-completeness-section").style.display = "none";
-  document.getElementById("completeness-body").innerHTML = "";
-  document.getElementById("account-tieout-section").style.display = "none";
-  document.getElementById("tieout-body").innerHTML = "";
-  document.getElementById("review-tbody").innerHTML = "";
-
-  document.getElementById("recon-summary").innerHTML = `
-    <div class="recon-card"><div class="rv">\u20b9${fmtDec(opening)}</div><div class="rl">Opening</div></div>
-    <div class="recon-card" style="background:#c00"><div class="rv">\u20b9${fmtDec(totalDr)}</div><div class="rl">Total Debits</div></div>
-    <div class="recon-card" style="background:#1a5c3a"><div class="rv">\u20b9${fmtDec(totalCr)}</div><div class="rl">Total Credits</div></div>
-    <div class="recon-card" style="background:#b8860b"><div class="rv">\u20b9${fmtDec(closing)}</div><div class="rl">Closing</div></div>`;
-
-  recomputeStatementCheck();
-
-  const bc = r.book_completeness;
-  if (bc && (bc.unmatched_disbursements_count || bc.unmatched_collections_count)) {
-    document.getElementById("book-completeness-section").style.display = "block";
-    document.getElementById("completeness-badge").textContent =
-      `\u2014 ${bc.unmatched_disbursements_count} disb. + ${bc.unmatched_collections_count} coll. not found in this statement`;
-    document.getElementById("completeness-body").innerHTML =
-      (bc.unmatched_disbursements_count
-        ? `<p><b>Disbursements not found in bank (\u20b9${fmtDec(bc.unmatched_disbursements_total)}):</b></p>` +
-          buildUnmatchedTable(bc.unmatched_disbursements, 'Debit Note')
-        : '') +
-      (bc.unmatched_collections_count
-        ? `<p style="margin-top:12px"><b>Collections not found in bank (\u20b9${fmtDec(bc.unmatched_collections_total)}):</b></p>` +
-          buildUnmatchedTable(bc.unmatched_collections, 'UTR / Note')
-        : '');
+// One uploaded statement rendered as a self-contained block: its own balances,
+// its own date/account provenance, its own arithmetic check, completeness and
+// tie-out. Returns HTML; the caller joins them.
+function _statementBlock(st, si) {
+  if (st.error) {
+    return `<div class="section" style="background:#fdecea;border-color:#e0a0a0">
+      <h3 style="color:#8a2020">\u26a0\ufe0f ${st.filename} \u2014 could not be read</h3>
+      <div style="font-size:.83rem;color:#8a2020">${st.error}</div>
+      <div style="font-size:.78rem;color:#666;margin-top:6px">The other statements in this upload were parsed normally and can still be saved.</div>
+    </div>`;
   }
 
-  const to = r.account_tieout;
-  const toSec = document.getElementById("account-tieout-section");
-  const toBadge = document.getElementById("tieout-badge");
-  const toBody = document.getElementById("tieout-body");
-  if (to && to.status && to.status !== 'no_account_selected') {
-    toSec.style.display = "block";
+  const totalDr = st.transactions.reduce((s,t) => s+t.debit, 0);
+  const totalCr = st.transactions.reduce((s,t) => s+t.credit, 0);
+
+  // Date provenance \u2014 never silently change the save date underneath the user.
+  let dateNote;
+  if (st.date_corrected) {
+    dateNote = `<div style="margin:10px 0;padding:8px 10px;border:1px solid #e0c060;background:#fff3cd;color:#7a5c00;border-radius:6px;font-size:.82rem">\u26a0\ufe0f Date corrected from the statement: you entered <b>${st.typed_date}</b>, but the statement's own period is <b>${st.statement_from||''} to ${st.statement_to}</b>. This will be saved under <b>${st.recon_date}</b>.</div>`;
+  } else if (st.statement_to) {
+    dateNote = `<div style="margin:10px 0;padding:8px 10px;border:1px solid #9ccfae;background:#eaf6ee;color:#1a5c3a;border-radius:6px;font-size:.82rem">Statement period read from the file: <b>${st.statement_from||''} to ${st.statement_to}</b> \u2014 saving under <b>${st.recon_date}</b>.</div>`;
+  } else {
+    dateNote = `<div style="margin:10px 0;padding:8px 10px;border:1px solid #e0a0a0;background:#fdecea;color:#8a2020;border-radius:6px;font-size:.82rem">\u26a0\ufe0f This statement does not declare a STATEMENT PERIOD. Enter the reconciliation date below before saving.</div>`;
+  }
+
+  const acctKnown = !!st.account;
+  const acctNote = acctKnown
+    ? `<span style="color:#1a5c3a">\u2713 ${st.account_source}${st.account_number ? ' (a/c ' + st.account_number + ')' : ''}</span>`
+    : `<span style="color:#c00">\u26a0\ufe0f could not be identified from the file \u2014 set it here</span>`;
+
+  // Auto-reconciled summary, grouped by type.
+  const byType = {};
+  (st.confident || []).forEach(tx => {
+    byType[tx.type] = byType[tx.type] || {count:0, dr:0, cr:0};
+    byType[tx.type].count++; byType[tx.type].dr += tx.debit; byType[tx.type].cr += tx.credit;
+  });
+  const confHtml = Object.entries(byType).map(([t,v]) =>
+    `<span style="display:inline-block;margin-right:24px"><b>${t}</b>: ${v.count} txns`
+    + (v.dr ? ` &nbsp;Dr \u20b9${fmtDec(v.dr)}` : "")
+    + (v.cr ? ` &nbsp;Cr \u20b9${fmtDec(v.cr)}` : "") + `</span>`).join("");
+
+  const bc = st.book_completeness;
+  const bcHtml = (bc && (bc.unmatched_disbursements_count || bc.unmatched_collections_count))
+    ? `<div class="section" style="background:#fff5f5;border-color:#e0b0b0;margin-top:12px">
+         <h3 style="color:#a00">📋 Book vs Bank Completeness <span style="font-weight:400;color:#888">\u2014 ${bc.unmatched_disbursements_count} disb. + ${bc.unmatched_collections_count} coll. not found in bank</span></h3>
+         <div style="font-size:.83rem">` +
+         (bc.unmatched_disbursements_count
+           ? `<p><b>Disbursements not found in bank (\u20b9${fmtDec(bc.unmatched_disbursements_total)}):</b></p>`
+             + buildUnmatchedTable(bc.unmatched_disbursements, 'Debit Note') : '') +
+         (bc.unmatched_collections_count
+           ? `<p style="margin-top:12px"><b>Collections not found in bank (\u20b9${fmtDec(bc.unmatched_collections_total)}):</b></p>`
+             + buildUnmatchedTable(bc.unmatched_collections, 'UTR / Note') : '') +
+       `</div></div>` : '';
+
+  const to = st.account_tieout || {};
+  let toHtml = '';
+  if (to.status && to.status !== 'no_account_selected') {
+    let badge = '', body = '';
     if (to.status === 'incomplete') {
-      toBadge.textContent = '\u2014 Incomplete';
-      toBody.innerHTML = `<p style="color:#b8860b">\u26a0\ufe0f ${to.message}</p>`;
+      badge = '\u2014 Incomplete';
+      body = `<p style="color:#b8860b">\u26a0\ufe0f ${to.message}</p>`;
     } else if (to.status === 'no_history') {
-      toBadge.textContent = '\u2014 No history yet';
-      toBody.innerHTML = `<p style="color:#666">${to.message}</p>`;
+      badge = '\u2014 No history yet';
+      body = `<p style="color:#666">${to.message}</p>`;
     } else if (to.status === 'ok') {
-      toBadge.textContent = to.ok ? '\u2014 \u2713 Matches' : '\u2014 \u2717 Mismatch';
-      toBadge.style.color = to.ok ? '#1a5c3a' : '#c00';
-      toBody.innerHTML = `
+      badge = `<span style="color:${to.ok?'#1a5c3a':'#c00'}">${to.ok ? '\u2014 \u2713 Matches' : '\u2014 \u2717 Mismatch'}</span>`;
+      body = `
         <div>Last reconciled closing (${to.last_closing_date||'\u2014'}): <b>\u20b9${fmtDec(to.last_closing)}</b></div>
         <div>+ Tagged collections this period (${to.tagged_collected_count}): <b>\u20b9${fmtDec(to.tagged_collected)}</b></div>
         <div>\u2212 Tagged disbursements this period (${to.tagged_disbursed_count}): <b>\u20b9${fmtDec(to.tagged_disbursed)}</b></div>
@@ -4824,35 +6972,122 @@ function renderReconResult(r) {
         <div style="color:${to.ok?'#1a5c3a':'#c00'};font-weight:700">Variance: ${_fmtSigned(to.variance)}</div>
         <div style="margin-top:8px;font-size:.78rem;color:#888">
           This statement's own Expense total: \u20b9${fmtDec(to.this_statement_expense_total)} &nbsp;|&nbsp;
-          Capital In/Out net: ${_fmtSigned(to.this_statement_capital_net)}<br>${to.note}
+          Capital In/Out net: ${_fmtSigned(to.this_statement_capital_net)}<br>${to.note||''}
         </div>`;
     }
-  } else {
-    toSec.style.display = "none";
+    toHtml = `<div class="section" style="margin-top:12px">
+      <h3>🏦 Per-Account Book Tie-Out <span style="font-weight:400;color:#888">${badge}</span></h3>
+      <div style="font-size:.85rem;line-height:1.7">${body}</div></div>`;
   }
 
-  const conf = r.confident || [];
-  document.getElementById("confident-badge").textContent =
-    `\u2014 ${conf.length} of ${r.transactions.length} entries matched automatically`;
-  const byType = {};
-  conf.forEach(tx => {
-    byType[tx.type] = byType[tx.type] || {count:0, dr:0, cr:0};
-    byType[tx.type].count++;
-    byType[tx.type].dr += tx.debit;
-    byType[tx.type].cr += tx.credit;
-  });
-  document.getElementById("confident-summary").innerHTML = Object.entries(byType).map(([t,v]) =>
-    `<span style="display:inline-block;margin-right:24px"><b>${t}</b>: ${v.count} txns`
-    + (v.dr ? ` &nbsp;Dr \u20b9${fmtDec(v.dr)}` : "")
-    + (v.cr ? ` &nbsp;Cr \u20b9${fmtDec(v.cr)}` : "") + `</span>`
-  ).join("");
+  return `<div class="section" style="border-left:4px solid #1A3A5C">
+    <h3 style="margin-bottom:2px">🏦 ${st.account || 'Unidentified account'}</h3>
+    <div style="font-size:.78rem;color:#666;margin-bottom:12px">📄 ${st.filename} &nbsp;\u00b7&nbsp; ${st.transactions.length} transactions</div>
 
-  const rev = r.review || [];
+    <div class="grid" style="margin-bottom:12px">
+      <div class="field">
+        <label>Bank Account * <span style="font-weight:400;font-size:.75rem">${acctNote}</span> <span data-acct-note="${si}" style="font-weight:400;color:#888;font-size:.75rem"></span></label>
+        <input type="text" list="rec-account-list" value="${st.account||''}" placeholder="Select or type..."
+               oninput="setStatementAccount(${si}, this.value)">
+      </div>
+      <div class="field">
+        <label>Reconciliation Date *</label>
+        <input type="text" value="${st.recon_date||''}" placeholder="DD-MM-YYYY"
+               oninput="window._reconStatements[${si}].recon_date = this.value.trim()">
+      </div>
+      <div class="field">
+        <label>Opening Balance (\u20b9)</label>
+        <input type="number" data-open="${si}" value="${st.opening_balance}" step="0.01" oninput="recomputeStatementCheck(${si})">
+      </div>
+      <div class="field">
+        <label>Closing Balance (\u20b9)</label>
+        <input type="number" data-close="${si}" value="${st.closing_balance}" step="0.01" oninput="recomputeStatementCheck(${si})">
+      </div>
+    </div>
+
+    <div class="recon-summary" style="margin-bottom:10px">
+      <div class="recon-card"><div class="rv">\u20b9${fmtDec(st.opening_balance)}</div><div class="rl">Opening</div></div>
+      <div class="recon-card" style="background:#c00"><div class="rv">\u20b9${fmtDec(totalDr)}</div><div class="rl">Total Debits</div></div>
+      <div class="recon-card" style="background:#1a5c3a"><div class="rv">\u20b9${fmtDec(totalCr)}</div><div class="rl">Total Credits</div></div>
+      <div class="recon-card" style="background:#b8860b"><div class="rv">\u20b9${fmtDec(st.closing_balance)}</div><div class="rl">Closing</div></div>
+    </div>
+    ${dateNote}
+    <div data-check="${si}" style="margin:0 0 12px;font-size:.85rem;font-weight:600"></div>
+
+    <div class="section" style="background:#f0faf4;border-color:#a8d5b5;margin:0">
+      <h3 style="color:#1a5c3a">\u2705 Auto-Reconciled <span style="font-weight:400;color:#555">\u2014 ${(st.confident||[]).length} of ${st.transactions.length} entries matched automatically</span></h3>
+      <div style="font-size:.83rem;color:#333;line-height:1.8">${confHtml || '<span style="color:#888">Nothing matched automatically.</span>'}</div>
+    </div>
+    ${bcHtml}${toHtml}
+  </div>`;
+}
+
+function renderReconResult(r) {
+  // The server always sends 'statements'; the fallback keeps an older cached
+  // page from blanking if it ever receives the flat single-file shape.
+  const statements = r.statements || [{
+    filename: 'statement', transactions: r.transactions || [],
+    opening_balance: r.opening_balance || 0, closing_balance: r.closing_balance || 0,
+    account: '', account_source: 'not identified', recon_date: r.recon_date || '',
+    statement_from: r.statement_from, statement_to: r.statement_to,
+    date_corrected: r.date_corrected, typed_date: r.typed_date,
+    confident: r.confident || [], review: r.review || [],
+    book_completeness: r.book_completeness, account_tieout: r.account_tieout,
+  }];
+  window._reconStatements = statements;
+
+  document.getElementById("recon-statements").innerHTML =
+    statements.map((st, si) => _statementBlock(st, si)).join('');
+  statements.forEach((st, si) => { if (!st.error) recomputeStatementCheck(si); });
+
+  // Own-account transfers paired across the uploaded files.
+  const pairs = r.cross_account_pairs || [];
+  const xSec = document.getElementById("cross-account-section");
+  if (pairs.length) {
+    xSec.style.display = "block";
+    document.getElementById("cross-badge").textContent =
+      `\u2014 ${pairs.length} transfer${pairs.length>1?'s':''}, \u20b9${fmtDec(r.cross_account_total||0)}`;
+    document.getElementById("cross-account-body").innerHTML =
+      `<div style="overflow-x:auto"><table class="recon-table"><thead><tr>
+         <th style="text-align:right">Amount</th><th>Out of</th><th>Into</th><th>Dates</th><th>Re-typed</th>
+       </tr></thead><tbody>` + pairs.map(p => `<tr>
+         <td style="text-align:right;font-weight:600">\u20b9${fmtDec(p.amount)}</td>
+         <td style="font-size:.8rem"><b>${p.out.account}</b><br><span style="color:#666">${(p.out.description||'').replace(/</g,"&lt;")}</span></td>
+         <td style="font-size:.8rem"><b>${p.in.account}</b><br><span style="color:#666">${(p.in.description||'').replace(/</g,"&lt;")}</span></td>
+         <td style="font-size:.8rem;white-space:nowrap">${p.out.date} \u2192 ${p.in.date}${p.gap_days ? ` (${p.gap_days}d)` : ' (same day)'}</td>
+         <td style="font-size:.78rem;color:#12467e">${p.retyped.join(' + ')}</td>
+       </tr>`).join('') + `</tbody></table></div>`;
+  } else {
+    xSec.style.display = "none";
+  }
+
+  // Accounts reconciled to different dates is the one state in which a
+  // transfer between them is missing from the combined bank total.
+  const dm = document.getElementById("date-mismatch-note");
+  if (r.date_mismatch) {
+    dm.style.display = "block";
+    dm.innerHTML = `\u26a0\ufe0f These statements cover <b>different dates</b> (${r.date_mismatch.join(', ')}). A transfer between the accounts dated in that gap has left one account but not yet arrived in the other, so the combined bank total will understate until both are reconciled to the same date. Re-download them for the same period if you can.`;
+  } else {
+    dm.style.display = "none";
+  }
+
+  // One review queue across every statement. Each row remembers WHICH
+  // statement and WHICH row it came from, so a correction can never land on
+  // the same-looking transaction in the other account.
+  const rev = [];
+  statements.forEach((st, si) => {
+    if (st.error) return;
+    (st.review || []).forEach(tx => {
+      const ti = st.transactions.indexOf(tx);
+      if (ti >= 0) rev.push({si, ti, tx});
+    });
+  });
   window._reviewTxns = rev;
   if (rev.length) {
     document.getElementById("review-section").style.display = "block";
     document.getElementById("review-badge").textContent = `\u2014 ${rev.length} entries need review`;
-    document.getElementById("review-tbody").innerHTML = rev.map((tx, i) => {
+    document.getElementById("review-tbody").innerHTML = rev.map((row, i) => {
+      const tx = row.tx;
       const desc = (tx.description||"").replace(/</g,"&lt;");
       const amt  = tx.debit ? "\u20b9"+fmtDec(tx.debit) : "\u20b9"+fmtDec(tx.credit);
       const drCr = tx.debit ? `<span style="color:#c00;font-weight:600">Dr</span>`
@@ -4861,6 +7096,7 @@ function renderReconResult(r) {
         "Other Income":"#1a5c3a","Interest Income":"#1a5c3a",Expense:"#c00",
         "FD Booking":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
       return `<tr style="background:${i%2?"#f8fbff":"white"}">
+        <td style="font-size:.75rem;color:#12467e;font-weight:600">${statements[row.si].account || statements[row.si].filename}</td>
         <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
         <td style="font-size:.8rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${desc}">${desc}</td>
         <td style="font-size:.78rem;color:#666;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${tx.utr||"\u2014"}</td>
@@ -4881,42 +7117,52 @@ function renderReconResult(r) {
 
 
 async function saveRecon() {
-  if (!reconTxns.length) return alert('No transactions to save.');
-  const account = document.getElementById('rec-account').value.trim();
-  if (!account) return alert('Please select or enter the bank account this statement belongs to.');
-  await registerAccountIfNew(account);
+  const statements = (window._reconStatements || []).filter(s => !s.error && s.transactions.length);
+  if (!statements.length) return alert('No transactions to save.');
 
-  // Collect corrections from the review queue and apply back to full
-  // transaction list. Remarks are remarks ONLY — they used to also get
-  // saved as new dropdown "types", which is how the type list filled up
-  // with raw SMS text, case IDs, and one-off notes. New types are now
-  // added exclusively via the explicit "+ Add new type…" dropdown option.
-  const reviewCorrections = {};
-  (window._reviewTxns || []).forEach((tx, i) => {
+  // Every statement needs an account and a date before anything is written —
+  // checked up front, because the save is per-account and a half-done batch
+  // is far more annoying to reason about than a refused one.
+  for (const st of statements) {
+    if (!st.account) return alert(`Please set the bank account for ${st.filename} before saving.`);
+    if (!st.recon_date) return alert(`Please set the reconciliation date for ${st.filename} before saving.`);
+  }
+  for (const st of statements) await registerAccountIfNew(st.account);
+
+  // Corrections from the review queue, applied back by (statement, row)
+  // index. The old code matched on date+description+amount, which two
+  // accounts can share — with several statements in one upload that key
+  // could put a correction on the wrong account's transaction.
+  // Remarks are remarks ONLY — they used to also get saved as new dropdown
+  // "types", which is how the type list filled up with raw SMS text and
+  // case IDs. New types come exclusively from "+ Add new type…" now.
+  const fixes = {};
+  (window._reviewTxns || []).forEach((row, i) => {
     const sel = document.querySelector(`#review-tbody select[data-row="${i}"]`);
     const inp = document.querySelector(`input[data-review-row="${i}"]`);
-    const type_override = sel && sel.value !== '__add__' ? sel.value.trim() : '';
-    const row_remarks   = inp ? inp.value.trim() : '';
-    // Match back to full list by date+description+amount
-    reviewCorrections[`${tx.date}|${tx.description}|${tx.debit}|${tx.credit}`] = {type_override, row_remarks};
+    fixes[`${row.si}|${row.ti}`] = {
+      type_override: sel && sel.value !== '__add__' ? sel.value.trim() : '',
+      row_remarks:   inp ? inp.value.trim() : '',
+    };
   });
 
-  const txns = reconTxns.map(tx => {
-    const key = `${tx.date}|${tx.description}|${tx.debit}|${tx.credit}`;
-    const fix = reviewCorrections[key] || {};
-    return {...tx, type_override: fix.type_override||'', row_remarks: fix.row_remarks||''};
-  });
-
-  const remarksMap = {};
-
+  const remarks = document.getElementById('rec-remarks').value.trim();
   const data = {
-    date:        document.getElementById('rec-date').value.trim(),
-    opening:     parseFloat(document.getElementById('rec-opening').value) || 0,
-    closing:     parseFloat(document.getElementById('rec-closing').value) || 0,
-    remarks:     document.getElementById('rec-remarks').value.trim(),
-    account:     account,
-    transactions: txns,
-    remarks_map: remarksMap,
+    statements: statements.map(st => {
+      const si = window._reconStatements.indexOf(st);
+      return {
+        date:        st.recon_date,
+        opening:     st.opening_balance || 0,
+        closing:     st.closing_balance || 0,
+        remarks:     remarks,
+        account:     st.account,
+        remarks_map: {},
+        transactions: st.transactions.map((tx, ti) => {
+          const fix = fixes[`${si}|${ti}`] || {};
+          return {...tx, type_override: fix.type_override||'', row_remarks: fix.row_remarks||''};
+        }),
+      };
+    }),
   };
   const btn = event.target; btn.disabled = true; btn.textContent = 'Saving...';
   try {
@@ -4926,8 +7172,9 @@ async function saveRecon() {
       const err = await resp.json().catch(() => ({error: 'Unknown error'}));
       throw new Error(err.error || `HTTP ${resp.status}`);
     }
-    const rowsSaved = resp.headers.get('X-Rows-Saved') || txns.length;
-    const closingBal = resp.headers.get('X-Closing-Balance') || data.closing;
+    const rowsSaved = resp.headers.get('X-Rows-Saved') || '';
+    let perAccount = [];
+    try { perAccount = JSON.parse(resp.headers.get('X-Accounts-Saved') || '[]'); } catch {}
     const blob = await resp.blob();
     const disposition = resp.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename="(.+)"/);
@@ -4937,29 +7184,28 @@ async function saveRecon() {
     a.href = url; a.download = filename;
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
+    const detail = perAccount.length
+      ? perAccount.map(s => `${s.account} ${s.date}: ${s.rows} txns, closing ₹${fmtDec(s.closing)}`).join(' · ')
+      : `${rowsSaved} transactions`;
     showStatus('recon-status','success',
-      `✅ Downloaded ${filename} (full history) — ${rowsSaved} transactions this period, Closing Balance: ₹${fmtDec(closingBal)}`);
+      `✅ Downloaded ${filename} (full history) — ${detail}`);
 
-    // Full reset so the next upload (same session, no reload) starts clean
-    // — previously nothing here cleared reconTxns/the file input/these
-    // fields, so a leftover account/date/balance could silently carry into
-    // the next statement. Only on SUCCESS — a failed save should leave
-    // everything intact so the user can just retry.
-    reconTxns = [];
+    // Full reset so the next upload (same session, no reload) starts clean —
+    // otherwise a leftover account/date/balance could silently carry into the
+    // next statement. Only on SUCCESS — a failed save should leave everything
+    // intact so the user can just retry.
     window._reviewTxns = [];
-    _selectedReconFile = null;
+    window._reconStatements = [];
+    _selectedReconFiles = [];
     document.getElementById('rec-file').value = '';
-    document.getElementById('upload-label').innerHTML = '📂 Click to upload bank statement<br><span style="font-size:.78rem">Supports CSV, Excel (.xlsx/.xls)</span>';
+    renderSelectedFiles();
+    document.getElementById('recon-statements').innerHTML = '';
     document.getElementById('recon-preview-section').style.display = 'none';
-    document.getElementById('rec-date').value = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
-    document.getElementById('rec-opening').value = '';
-    document.getElementById('rec-closing').value = '';
     document.getElementById('rec-remarks').value = '';
-    document.getElementById('rec-account').value = '';
   } catch (e) {
     showStatus('recon-status','error','❌ ' + e.message);
   } finally {
-    btn.disabled = false; btn.textContent = '💾 Save to Daily Reconciliation Excel';
+    btn.disabled = false; btn.textContent = '💾 Complete Reconciliation & Save Excel';
   }
 }
 
@@ -5107,7 +7353,193 @@ async function loadSettings() {
   document.getElementById('set-bulk-narration').value = cfg.bulk_narration || '';
   document.getElementById('cl-date').value = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
   loadSolvencyCheck();
+  loadMoneyIntegrity();
   loadCapitalLog();
+}
+
+// ── Money Integrity panel ────────────────────────────────────────────────────
+async function loadMoneyIntegrity() {
+  const badge = document.getElementById('integrity-badge');
+  const body  = document.getElementById('integrity-body');
+  if (!body) return;
+  body.innerHTML = '<span style="color:#888">Checking every rupee…</span>';
+  try {
+    const r = await (await fetch('/money-integrity')).json();
+    if (r.error) {
+      badge.textContent = '— error';
+      body.innerHTML = '<span style="color:#c00">' + r.error + '</span>';
+      return;
+    }
+    const L = r.leaks || {};
+    const bank = L.bank_entries_not_tied_to_a_case || {};
+    const book = L.book_entries_with_no_bank_evidence || {};
+    const bookAmt = (book.disbursement_total||0) + (book.collection_total||0);
+    const internal = Math.abs(L.contra_imbalance||0) + Math.abs(L.fd_unparsed_net||0);
+    const rows = [
+      ['Bank movement with no explanation', (L.unclassified_types||{}).total_net_out_of_bank||0,
+       'Every debit and credit is classified.'],
+      ['Bank entry not tied to any case', (bank.total_debit||0)+(bank.total_credit||0),
+       (bank.count||0) + ' entry(s).'],
+      ['Book entry with no bank evidence', bookAmt,
+       (book.disbursement_count||0) + ' disbursement(s), ' + (book.collection_count||0) + ' collection(s).'],
+      ['Internal transfers not netting to zero', internal,
+       'Own-account transfers and FD sweeps must cancel out.'],
+      ['FD swept in from an untracked deposit', L.fd_orphan_total||0,
+       'Deposit booked before bank records begin.'],
+    ];
+    const clear = !!r.all_clear;
+    badge.textContent = clear ? '— ✅ all clear' : '— ⚠️ items to review';
+    badge.style.color = clear ? '#1a5c3a' : '#c00';
+    const w = r.reconciled_window || {};
+    body.innerHTML =
+      rows.map(([label, amt, sub]) => {
+        const ok = Math.abs(amt) < 1;
+        return `<div style="display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px solid #eee">
+            <div><b>${label}</b><br><span style="font-size:.76rem;color:#888">${sub}</span></div>
+            <div style="white-space:nowrap;font-weight:700;color:${ok?'#1a5c3a':'#c00'}">${ok?'✅ CLEAR':'⚠️ ₹'+fmtDec(Math.abs(amt))}</div>
+          </div>`;
+      }).join('') +
+      `<div style="margin-top:8px;font-size:.78rem;color:#888">Bank data verified ${w.from||'—'} to ${w.to||'—'}. Activity before that date is not covered.</div>
+       <button class="btn" style="width:auto;padding:8px 16px;margin-top:10px;background:#2d5986;color:#fff" onclick="viewReport('integrity')">👁 View full report</button>
+       <button class="btn btn-save" style="width:auto;padding:8px 16px;margin-top:10px;margin-left:8px" onclick="downloadReport('integrity')">⬇ Download</button>`;
+  } catch (e) {
+    badge.textContent = '— error';
+    body.innerHTML = '<span style="color:#c00">' + e.message + '</span>';
+  }
+}
+
+// ── Reports tab ──────────────────────────────────────────────────────────────
+let _reportsCatalogue = null;
+
+async function loadReports() {
+  const list = document.getElementById('reports-list');
+  if (_reportsCatalogue) return;             // catalogue is static; fetch once
+  list.innerHTML = '<span style="color:#888">Loading…</span>';
+  try {
+    const r = await (await fetch('/reports/catalogue')).json();
+    if (!r.ok) throw new Error(r.error || 'Could not load reports');
+    _reportsCatalogue = r;
+    // Default period: current financial year to date.
+    const now = new Date();
+    const fyStart = new Date(now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear()-1, 3, 1);
+    const dmy = d => String(d.getDate()).padStart(2,'0')+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+d.getFullYear();
+    if (!document.getElementById('rep-from').value) document.getElementById('rep-from').value = dmy(fyStart);
+    if (!document.getElementById('rep-to').value)   document.getElementById('rep-to').value   = dmy(now);
+
+    const groups = {};
+    r.reports.forEach(rep => { (groups[rep.group] = groups[rep.group] || []).push(rep); });
+    list.innerHTML = Object.entries(groups).map(([group, reps]) => `
+      <div style="margin-bottom:16px">
+        <div style="font-size:.78rem;font-weight:700;color:#1a3a5c;text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">${group}</div>
+        ${reps.map(rep => `
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:10px 12px;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:6px">
+            <div style="flex:1">
+              <b style="font-size:.88rem">${rep.label}</b>
+              ${rep.needs_period ? '<span style="font-size:.72rem;color:#b8860b;margin-left:6px">uses period above</span>' : ''}
+              <br><span style="font-size:.78rem;color:#666">${rep.desc}</span>
+            </div>
+            ${rep.needs_cluster ? `<select id="rep-cluster-${rep.id}" style="font-size:.8rem;max-width:130px">
+                ${(r.clusters||[]).map(c => `<option value="${c}">${c}</option>`).join('')}
+              </select>` : ''}
+            <button class="btn" style="width:auto;padding:8px 14px;white-space:nowrap;background:#2d5986;color:#fff"
+                    onclick="viewReport('${rep.id}')">👁 View</button>
+            <button class="btn btn-save" style="width:auto;padding:8px 14px;white-space:nowrap"
+                    onclick="downloadReport('${rep.id}')">⬇ PDF</button>
+          </div>`).join('')}
+      </div>`).join('');
+  } catch (e) {
+    list.innerHTML = '<span style="color:#c00">' + e.message + '</span>';
+  }
+}
+
+// One fetch shared by View and Download, so the two can never disagree
+// about which period/cluster was asked for.
+async function _fetchReport(reportId) {
+  const body = {report: reportId};
+  const f = document.getElementById('rep-from'), t = document.getElementById('rep-to');
+  if (f && f.value.trim()) body.from = f.value.trim();
+  if (t && t.value.trim()) body.to = t.value.trim();
+  const cl = document.getElementById('rep-cluster-' + reportId);
+  if (cl) body.cluster = cl.value;
+
+  const r = await fetch('/reports/generate', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({error: 'Unknown error'}));
+    throw new Error(err.error || ('HTTP ' + r.status));
+  }
+  const blob = await r.blob();
+  const disposition = r.headers.get('Content-Disposition') || '';
+  const m = disposition.match(/filename="(.+)"/);
+  return {blob: blob, filename: m ? m[1] : (reportId + '.pdf')};
+}
+
+function _saveBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function _statusTarget() {
+  return document.getElementById('reports-status') ? 'reports-status' : 'settings-status';
+}
+
+async function _withBusy(btn, label, fn) {
+  const orig = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = label; }
+  try { await fn(); }
+  catch (e) { showStatus(_statusTarget(), 'error', '❌ ' + e.message); }
+  finally { if (btn) { btn.disabled = false; btn.textContent = orig; } }
+}
+
+async function downloadReport(reportId) {
+  const btn = event && event.target ? event.target : null;
+  await _withBusy(btn, '⏳', async () => {
+    const {blob, filename} = await _fetchReport(reportId);
+    _saveBlob(blob, filename);
+    showStatus(_statusTarget(), 'success', `✅ Downloaded ${filename}`);
+  });
+}
+
+// ── Report preview ───────────────────────────────────────────────────────────
+let _viewedPdfBlob = null, _viewedPdfName = '', _viewedPdfUrl = null;
+
+async function viewReport(reportId) {
+  const btn = event && event.target ? event.target : null;
+  await _withBusy(btn, '⏳', async () => {
+    const {blob, filename} = await _fetchReport(reportId);
+    if (_viewedPdfUrl) URL.revokeObjectURL(_viewedPdfUrl);
+    _viewedPdfBlob = blob;
+    _viewedPdfName = filename;
+    _viewedPdfUrl = URL.createObjectURL(blob);
+    document.getElementById('pdf-modal-title').textContent = filename;
+    document.getElementById('pdf-frame').src = _viewedPdfUrl;
+    document.getElementById('pdf-modal-bg').classList.add('show');
+  });
+}
+
+function openViewedPdfInTab() {
+  // Keep the object URL alive — closePdfModal() revokes it, which would
+  // break the newly opened tab, so the modal is intentionally left open.
+  if (_viewedPdfUrl) window.open(_viewedPdfUrl, '_blank');
+}
+
+function downloadViewedPdf() {
+  if (_viewedPdfBlob) {
+    _saveBlob(_viewedPdfBlob, _viewedPdfName);
+    showStatus(_statusTarget(), 'success', `✅ Downloaded ${_viewedPdfName}`);
+  }
+}
+
+function closePdfModal() {
+  document.getElementById('pdf-modal-bg').classList.remove('show');
+  document.getElementById('pdf-frame').src = 'about:blank';
+  // Release the object URL — without this every preview leaks a blob for
+  // the life of the page.
+  if (_viewedPdfUrl) { URL.revokeObjectURL(_viewedPdfUrl); _viewedPdfUrl = null; }
+  _viewedPdfBlob = null; _viewedPdfName = '';
 }
 
 async function saveSettings() {
@@ -5142,6 +7574,20 @@ async function loadSolvencyCheck() {
     }
     const reasonsHtml = (r.reasons || []).length
       ? `<div style="color:#b8860b;margin-bottom:10px">⚠️ ${(r.reasons||[]).join('<br>⚠️ ')}</div>` : '';
+    const fdSourceNote = `<span style="color:#1a5c3a">auto-derived per FD account from statement sweep lines, ${r.fd_open_count||0} open FD${(r.fd_open_count===1)?'':'s'}</span>`;
+    const fdBreakdown = (r.fd_open_accounts && Object.keys(r.fd_open_accounts).length)
+      ? `<div style="font-size:.78rem;color:#666;margin-left:12px">`
+        + Object.entries(r.fd_open_accounts).sort((a,b)=>b[1]-a[1])
+            .map(([no, amt]) => `FD ${no}: ₹${fmtDec(amt)}`).join('<br>')
+        + `</div>`
+      : '';
+    // The old blind net-sum is kept purely as a cross-check. A gap between
+    // it and the per-FD figure is EXPECTED, not alarming — it's exactly the
+    // pre-history FDs and returned interest the per-FD ledger handles
+    // correctly and the old sum never could.
+    const fdCompareNote = (r.fd_total_derived != null && Math.abs(r.fd_total - r.fd_total_derived) > 1)
+      ? `<div style="font-size:.78rem;color:#888">Old net-sum method would say ₹${fmtDec(r.fd_total_derived)} (differs by ₹${fmtDec(Math.abs(r.fd_total - r.fd_total_derived))} — the per-FD figure above is the correct one).</div>`
+      : '';
     const varHtml = (r.expected_bank_balance != null) ? `
         <div>Net Capital: <b>₹${fmtDec(r.net_capital)}</b></div>
         <div>+ Collected all-time: <b>₹${fmtDec(r.total_collected_all)}</b></div>
@@ -5151,13 +7597,40 @@ async function loadSolvencyCheck() {
         <div>= Expected Bank Balance: <b>₹${fmtDec(r.expected_bank_balance)}</b></div>
         <div>Actual Bank Balance (${r.bank_balance_date||'—'}): <b>₹${fmtDec(r.bank_balance)}</b></div>
         <div style="color:${r.ok?'#1a5c3a':'#c00'};font-weight:700">Variance: ${r.variance<0?'-':''}₹${fmtDec(Math.abs(r.variance))}</div>
-        <div style="margin-top:6px;color:#555">₹${fmtDec(r.fd_total)} currently in FDs — not counted in bank balance above.</div>
+        <div style="margin-top:6px;color:#555">₹${fmtDec(r.fd_total)} currently in FDs (${fdSourceNote}) — not counted in bank balance above.</div>
+        ${fdBreakdown}
+        ${fdCompareNote}
         <div style="font-size:.78rem;color:#888">Outstanding receivables (money currently with customers, context only): ₹${fmtDec(r.total_outstanding)}</div>`
       : '<p style="color:#666">No bank reconciliation history yet.</p>';
     body.innerHTML = reasonsHtml + varHtml;
+    if (r.fd_balance_direct != null) {
+      document.getElementById('fd-balance').value = r.fd_balance_direct;
+    }
   } catch (e) {
     badge.textContent = '';
     body.innerHTML = `<p style="color:#c00">⚠️ ${e.message}</p>`;
+  }
+}
+
+async function saveFdBalance() {
+  const date = document.getElementById('fd-date').value.trim();
+  const balance = document.getElementById('fd-balance').value;
+  if (!date || balance === '') return showStatus('fd-balance-status', 'error', 'Date and balance are required.');
+  const btn = event.target; btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const r = await (await fetch('/fd-balance', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({date, balance})})).json();
+    if (r.ok) {
+      showStatus('fd-balance-status', 'success', `✅ Saved — ₹${fmtDec(r.balance)} as of ${r.date}`);
+      loadSolvencyCheck();
+      loadSummary();
+    } else {
+      showStatus('fd-balance-status', 'error', '❌ ' + (r.error || 'Failed'));
+    }
+  } catch (e) {
+    showStatus('fd-balance-status', 'error', '❌ ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '💾 Save';
   }
 }
 
@@ -5431,7 +7904,9 @@ window.onload = async () => {
   const today = new Date().toLocaleDateString('en-GB').replace(/\\//g,'-');
   document.getElementById('d-date').value = today;
   document.getElementById('r-date').value = today;
-  document.getElementById('rec-date').value = today;
+  // No reconciliation-date default any more: each uploaded statement carries
+  // its own date, read from the file.
+  document.getElementById('fd-date').value = today;
   document.getElementById('bulk-value-date').value = new Date().toLocaleDateString('en-GB');
   await loadCustomTypes();
   await loadBankAccounts();
@@ -5499,6 +7974,30 @@ def _mark_request_disbursed(request_id, disb_id):
             ws.update_cell(i, 13, disb_id)
             return
 
+REQUEST_DISB_LOG_SHEET_NAME = "Request-Disb Log"
+REQUEST_DISB_LOG_HEADERS = ["Request ID", "Disb ID", "Customer Name", "Date"]
+
+def _log_request_disb_link(request_id, disb_id, customer, date_str):
+    """Dedicated, append-only tracking tab mapping every field-request that
+    became a real disbursement to its Disb ID. The Requests tab already
+    carries this same link (its own Disb ID column, stamped by
+    _mark_request_disbursed() above), but that tab accumulates other,
+    unrelated columns over time -- this stays a flat, simple 4-column log
+    purpose-built for that one lookup. Best-effort: never blocks the
+    disbursement itself."""
+    try:
+        gc = get_gspread_client()
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(REQUEST_DISB_LOG_SHEET_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sh.add_worksheet(title=REQUEST_DISB_LOG_SHEET_NAME,
+                                   rows=1000, cols=len(REQUEST_DISB_LOG_HEADERS))
+            ws.append_row(REQUEST_DISB_LOG_HEADERS)
+        ws.append_row([request_id, disb_id, customer, date_str])
+    except Exception as e:
+        notify_ops('request_disb_log', e)
+
 def _lookup_request_bank_account(request_id):
     """The Request's 'Debit Account' column (an account NUMBER, stamped at
     /requests/export-bulk time) resolved to the matching Config bank_accounts
@@ -5525,6 +8024,23 @@ def _lookup_request_bank_account(request_id):
             return acc.get('name', '')
     return ''
 
+def _lookup_request_kyc_folder(request_id):
+    """The Request's 'KYC Folder' column (a Drive folder URL, stamped by the
+    field app's /api/upload-kyc-docs at scan-upload time) -- a straight
+    passthrough of the stamped URL, unlike _lookup_request_bank_account()
+    there's no Config cross-reference to resolve since there's no friendly
+    name involved, just a link. Mirrors that function's scan/idx pattern."""
+    _, ws = get_requests_sheet()
+    all_vals = ws.get_all_values()
+    if not all_vals:
+        return ''
+    idx = {h: i for i, h in enumerate(all_vals[0])}
+    kf_col = idx.get('KYC Folder', 16)
+    for row in all_vals[1:]:
+        if row and row[0] == request_id:
+            return row[kf_col].strip() if len(row) > kf_col else ''
+    return ''
+
 def _request_row_to_item(row, idx):
     def col(name, default_i):
         i = idx.get(name, default_i)
@@ -5544,6 +8060,8 @@ def _request_row_to_item(row, idx):
         'status':      col('Status', 11),
         'bank':        col('Bank', 14),
         'debit_account': col('Debit Account', 15),
+        'kyc_folder':  col('KYC Folder', 16),
+        'company':     col('Company', 17),
     }
 
 @app.route('/requests/pending')
@@ -5765,6 +8283,21 @@ def api_requests_export_bulk():
                     row_extra['txn_type'] = 'RTGS' if amount >= RTGS_MIN_AMOUNT else 'NEFT'
             export_rows.append({**item, **row_extra})
 
+        # Last-line defense before a real bank file gets built: a 2-digit
+        # account number once made it all the way to a real disbursement
+        # with no check anywhere. Real Indian bank account numbers run
+        # 9-18 digits — refuse the WHOLE batch (same philosophy as the
+        # double-export guard above) rather than silently dropping one bad
+        # row, since a partial file is its own source of confusion.
+        bad_accounts = [
+            (r['request_id'], r.get('account_no', '')) for r in export_rows
+            if not (9 <= len(re.sub(r'\D', '', str(r.get('account_no') or ''))) <= 18)
+        ]
+        if bad_accounts:
+            return jsonify({'ok': False,
+                             'error': 'Invalid account number(s) — must be 9-18 digits',
+                             'details': [f"{rid}: '{acc}'" for rid, acc in bad_accounts]}), 400
+
         if template['filetype'] == 'csv':
             file_bytes = _build_bulk_csv(template, export_rows)
             mimetype = 'text/csv'
@@ -5812,12 +8345,9 @@ def api_requests_export_bulk():
         return Response(file_bytes, mimetype=mimetype,
                         headers={'Content-Disposition': f'attachment; filename="{filename}"'})
     except Exception as e:
+        notify_ops('requests_export_bulk', e)
         return jsonify({'ok': False, 'error': str(e)}), 500
 
-# ── WhatsApp DISBURSEMENT REQUEST message parser ─────────────────────────────
-# Label-keyed, for the exact message format the field app generates. The
-# generic extract_disbursement() stays untouched — it serves the disb tab's
-# free-form notes; this one only trusts explicit "Label: value" lines.
 REQUEST_LABELS = [
     ('customer',    ['customer name', 'name']),
     ('phone',       ['phone no', 'phone number', 'phone', 'mobile']),
@@ -5866,6 +8396,9 @@ def parse_request_message(text):
     for required in ('customer', 'amount', 'account_no', 'ifsc'):
         if not fields.get(required):
             warnings.append(f'Missing: {required}')
+    territory_warning = _bib_territory_mismatch_warning(fields.get('cluster', ''), fields.get('branch', ''))
+    if territory_warning:
+        warnings.append(territory_warning)
     return fields, warnings
 
 def generate_request_id(ws):
@@ -6027,8 +8560,15 @@ def api_rebuild_ledger():
 @app.route('/save/disbursement', methods=['POST'])
 def api_save_disbursement():
     try:
-        return jsonify({'ok': True, 'disb_id': save_disbursement(request.json)})
+        data = request.json or {}
+        disb_id = save_disbursement(data)
+        resp = {'ok': True, 'disb_id': disb_id}
+        warning = _bib_territory_mismatch_warning(data.get('cluster', ''), data.get('branch', ''))
+        if warning:
+            resp['warning'] = warning
+        return jsonify(resp)
     except Exception as e:
+        notify_ops('save_disbursement', e)
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/save/repayment', methods=['POST'])
@@ -6036,6 +8576,7 @@ def api_save_repayment():
     try:
         return jsonify({'ok': True, **save_repayment(request.json)})
     except Exception as e:
+        notify_ops('save_repayment', e)
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/recent')
@@ -6062,6 +8603,7 @@ def api_case_update_disbursement():
         known = update_disbursement(request.json)
         return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
+        notify_ops('update_disbursement', e)
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/update-repayment', methods=['POST'])
@@ -6070,6 +8612,7 @@ def api_case_update_repayment():
         known = update_repayment(request.json)
         return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
+        notify_ops('update_repayment', e)
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/delete-repayment', methods=['POST'])
@@ -6078,6 +8621,7 @@ def api_case_delete_repayment():
         known = delete_repayment(request.json)
         return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
+        notify_ops('delete_repayment', e)
         return jsonify({'ok': False, 'error': str(e)})
 
 @app.route('/case/add-repayment', methods=['POST'])
@@ -6086,6 +8630,7 @@ def api_case_add_repayment():
         known = add_repayment(request.json)
         return jsonify({'ok': True, 'case': _case_detail(request.json['disb_id'], known=known)})
     except Exception as e:
+        notify_ops('add_repayment', e)
         return jsonify({'ok': False, 'error': str(e)})
 
 def _load_for_invoice(sh, disb_id):
@@ -6109,7 +8654,10 @@ def _load_for_invoice(sh, disb_id):
 
     rows = []
     for raw in raw_rows:
-        row = list(raw[:22]) + [None] * max(0, 22 - len(raw))
+        # Widened from 26 to 28 to also reach col AB (request_id, 0-indexed
+        # 27) for the invoice header -- col Z (charge_plan) was the previous
+        # ceiling here.
+        row = list(raw[:28]) + [None] * max(0, 28 - len(raw))
         row = [None if c == '' else c for c in row]
         for i in _MIS_NUMERIC_COLS:
             row[i] = _clean_numeric_cell(row[i])
@@ -6160,7 +8708,7 @@ def api_generate_mis():
         ensure_mis_assets_cached()
 
         sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
-        rows, db_raw, mcoll, (cluster_mgrs, branch_contacts), capital_log = load_data_from_sheet(sh)
+        rows, db_raw, mcoll, (cluster_mgrs, branch_contacts, area_mgrs, territory_to_area), capital_log = load_data_from_sheet(sh)
         open_cases, all_cases, all_cases_full = mis.parse_cases(rows, mcoll)
         metrics = mis.compute_dashboard_metrics(all_cases_full, db_raw, capital_log)
 
@@ -6171,7 +8719,8 @@ def api_generate_mis():
 
         active_clusters = sorted(set(c['cluster'] for c in open_cases))
         zip_bytes = mis.build_zip(open_cases, all_cases, all_cases_full, metrics,
-                                   cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=mcoll)
+                                   cluster_mgrs, branch_contacts, active_clusters, mcoll_raw=mcoll,
+                                   area_mgrs=area_mgrs, territory_to_area=territory_to_area)
 
         date_human = mis.TODAY.strftime('%d-%b-%Y')
         filename = f'{date_human} BridgeLine MIS Package.zip'
@@ -6209,81 +8758,179 @@ def api_save_config():
 
 @app.route('/reconcile/parse', methods=['POST'])
 def api_reconcile_parse():
-    if 'file' not in request.files:
+    """Parse one OR MANY bank statements in a single request.
+
+    Uploading every account's statement together (13-08-2026, Prem's call) is
+    what lets transfers between our own accounts be identified STRUCTURALLY —
+    same amount, opposite direction, different account, same few days — instead
+    of being inferred from narration text. See _pair_uploaded_statements().
+
+    Still accepts a lone 'file' so an older cached page keeps working; that
+    path is just the N=1 case of the same code.
+    """
+    files = [f for f in (request.files.getlist('files') or []) if f and f.filename]
+    if not files:
+        files = [f for f in (request.files.getlist('file') or []) if f and f.filename]
+    if not files:
         return jsonify({'ok': False, 'error': 'No file uploaded'})
-    f = request.files['file']
-    if not f.filename:
-        return jsonify({'ok': False, 'error': 'Empty filename'})
+
     import tempfile
-    suffix = '.' + f.filename.rsplit('.', 1)[-1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        f.save(tmp.name)
-        tmp_path = tmp.name
+    tmp_paths = []
     try:
-        result = parse_bank_statement(tmp_path, f.filename)
-        # Run classification immediately so UI can split confident vs review
+        # One read of the books for the whole batch, not one per file.
         try:
             records = read_accounts_from_gsheet()
             sh      = get_gspread_client().open_by_key(SPREADSHEET_ID)
             mc_rows = sh.worksheet('M Coll').get_all_values()[1:]
         except Exception:
-            records, mc_rows = [], []
-        classified = _match_transactions(result['transactions'], records, mc_rows)
+            records, mc_rows, sh = [], [], None
+        bank_accounts = (load_config().get('bank_accounts') or [])
+
+        typed_date  = request.form.get('date', '').strip()
+        # Manual per-file account overrides, positional and optional — used
+        # only where the statement doesn't name an account we recognise.
+        forced_accts = request.form.getlist('accounts') or []
+        legacy_acct  = request.form.get('account', '').strip()
+
+        statements = []
+        for idx, f in enumerate(files):
+            suffix = '.' + f.filename.rsplit('.', 1)[-1]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                f.save(tmp.name)
+                tmp_paths.append(tmp.name)
+            try:
+                result = parse_bank_statement(tmp_paths[-1], f.filename, bank_accounts)
+            except Exception as e:
+                # One unreadable file must not lose the others' work — report
+                # it against its own row and carry on with the rest.
+                statements.append({'filename': f.filename, 'error': str(e),
+                                   'transactions': [], 'account': '', 'recon_date': ''})
+                continue
+
+            # The statement's own declared period wins over whatever was typed
+            # — a hand-typed date is the one part of this flow with no source
+            # of truth behind it (see _extract_statement_period()).
+            stmt_to = result.get('statement_to')
+            recon_date = stmt_to or typed_date
+            forced = (forced_accts[idx].strip() if idx < len(forced_accts) else '')
+            account = (forced or result.get('statement_account')
+                       or (legacy_acct if len(files) == 1 else '') or '')
+            statements.append({
+                'filename': f.filename,
+                'transactions': _match_transactions(result['transactions'], records, mc_rows),
+                'opening_balance': result['opening_balance'],
+                'closing_balance': result['closing_balance'],
+                'account': account,
+                'account_source': ('you selected' if forced
+                                   else 'read from the statement' if result.get('statement_account')
+                                   else 'not identified'),
+                'account_number': result.get('statement_account_no'),
+                'recon_date': recon_date,
+                'statement_from': result.get('statement_from'),
+                'statement_to': stmt_to,
+                'date_corrected': bool(stmt_to and typed_date and stmt_to != typed_date),
+                'typed_date': typed_date,
+            })
+
+        # Cross-account pairing runs BEFORE the review split, so a transfer
+        # correctly identified here never reaches the review queue at all.
+        cross_pairs = _pair_uploaded_statements([s for s in statements if not s.get('error')])
 
         def _needs_review(tx):
-            if tx['match_basis'] in ('UTR', 'Manual'):         return False
-            if tx['type'] in ('FD Booking', 'Test Credit'):    return False
-            if tx['credit'] > 0 and tx['credit'] < 100:        return False
+            if tx['match_basis'] in ('UTR', 'Manual', 'Cross-account'): return False
+            if tx['type'] in ('FD Booking', 'Test Credit'):             return False
+            if tx['credit'] > 0 and tx['credit'] < 100:                 return False
             return True
 
-        confident = [tx for tx in classified if not _needs_review(tx)]
-        review    = [tx for tx in classified if _needs_review(tx)]
-
-        # Period + account, needed for the book-completeness check and the
-        # per-account tie-out — same '%d-%m-%Y' -> '%b %Y' derivation
-        # save_reconciliation() already uses, so both paths agree on what
-        # counts as "this period".
-        recon_date = request.form.get('date', '').strip()
-        account    = request.form.get('account', '').strip()
+        # Every already-saved period, read once and reused by each statement's
+        # completeness check — the whole point of the check is the WHOLE
+        # month's picture, not just the file in hand.
         try:
-            period_month = datetime.strptime(recon_date, '%d-%m-%Y').strftime('%b %Y')
+            saved_periods = _load_recon_periods(get_recon_txns_sheet(sh)) if sh else []
         except Exception:
-            period_month = ''
+            saved_periods = []
 
-        book_completeness = (_book_completeness(records, mc_rows, classified, period_month)
-                              if period_month else None)
+        for st in statements:
+            if st.get('error'):
+                continue
+            classified = st['transactions']
+            st['confident'] = [tx for tx in classified if not _needs_review(tx)]
+            st['review']    = [tx for tx in classified if _needs_review(tx)]
 
-        total_dr = sum(tx['debit'] for tx in classified)
-        total_cr = sum(tx['credit'] for tx in classified)
-        expected_closing = round(result['opening_balance'] + total_cr - total_dr, 2)
-        variance = round(result['closing_balance'] - expected_closing, 2)
-        statement_check = {
-            'total_debit': round(total_dr, 2), 'total_credit': round(total_cr, 2),
-            'expected_closing': expected_closing, 'variance': variance,
-            'ok': abs(variance) <= 1.0,
-        }
+            try:
+                period_month = datetime.strptime(st['recon_date'], '%d-%m-%Y').strftime('%b %Y')
+            except Exception:
+                period_month = ''
+            st['period_month'] = period_month
 
-        account_tieout = (_account_tieout(records, mc_rows, account, period_month,
-                                           classified, result['closing_balance'])
-                           if period_month else {'status': 'no_account_selected'})
+            st['book_completeness'] = None
+            if period_month:
+                completeness_txns = list(classified)
+                # Other accounts uploaded in this same batch count too — a
+                # collection banked into IDFC is not "missing from the books"
+                # just because we're looking at the HDFC statement.
+                for other in statements:
+                    if other is not st and not other.get('error'):
+                        completeness_txns.extend(other['transactions'])
+                for p in saved_periods:
+                    if p['period_label'] == period_month:
+                        completeness_txns.extend(p['txns'])
+                st['book_completeness'] = _book_completeness(records, mc_rows,
+                                                             completeness_txns, period_month)
 
+            total_dr = sum(tx['debit'] for tx in classified)
+            total_cr = sum(tx['credit'] for tx in classified)
+            expected_closing = round(st['opening_balance'] + total_cr - total_dr, 2)
+            variance = round(st['closing_balance'] - expected_closing, 2)
+            st['statement_check'] = {
+                'total_debit': round(total_dr, 2), 'total_credit': round(total_cr, 2),
+                'expected_closing': expected_closing, 'variance': variance,
+                'ok': abs(variance) <= 1.0,
+            }
+            st['account_tieout'] = (
+                _account_tieout(records, mc_rows, st['account'], period_month, classified,
+                                st['closing_balance'], recon_date=st['recon_date'])
+                if (period_month and st['account']) else {'status': 'no_account_selected'})
+
+        ok_stmts = [s for s in statements if not s.get('error')]
+        # Two accounts reconciled to DIFFERENT dates is the exact state in
+        # which a transfer between them vanishes from the combined bank total
+        # — it has left one account but not yet arrived in the other. Uploading
+        # together is the fix, so say so when the dates don't line up.
+        dates = {s['recon_date'] for s in ok_stmts if s['recon_date']}
+        date_mismatch = sorted(dates) if len(dates) > 1 else None
+
+        first = ok_stmts[0] if ok_stmts else {}
         return jsonify({
             'ok': True,
-            'opening_balance': result['opening_balance'],
-            'closing_balance': result['closing_balance'],
-            'transactions':    classified,   # full list for save
-            'confident':       confident,
-            'review':          review,
-            'confident_count': len(confident),
-            'review_count':    len(review),
-            'book_completeness': book_completeness,
-            'statement_check': statement_check,
-            'account_tieout': account_tieout,
+            'statements': statements,
+            'cross_account_pairs': cross_pairs,
+            'cross_account_total': round(sum(p['amount'] for p in cross_pairs), 2),
+            'date_mismatch': date_mismatch,
+            # Flat mirror of the first statement, so an older cached page that
+            # still expects the single-file shape keeps rendering.
+            'opening_balance':  first.get('opening_balance', 0),
+            'closing_balance':  first.get('closing_balance', 0),
+            'transactions':     first.get('transactions', []),
+            'confident':        first.get('confident', []),
+            'review':           first.get('review', []),
+            'confident_count':  len(first.get('confident', [])),
+            'review_count':     len(first.get('review', [])),
+            'book_completeness': first.get('book_completeness'),
+            'statement_check':  first.get('statement_check'),
+            'account_tieout':   first.get('account_tieout'),
+            'recon_date':       first.get('recon_date', ''),
+            'statement_from':   first.get('statement_from'),
+            'statement_to':     first.get('statement_to'),
+            'date_corrected':   first.get('date_corrected', False),
+            'typed_date':       typed_date,
         })
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)})
     finally:
-        os.unlink(tmp_path)
+        for p in tmp_paths:
+            try: os.unlink(p)
+            except Exception: pass
 
 @app.route('/contacts', methods=['GET'])
 def api_contacts_get():
@@ -6347,6 +8994,172 @@ def api_solvency_check():
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
+@app.route('/money-integrity', methods=['GET'])
+def api_money_integrity():
+    try:
+        return jsonify(_money_integrity_check())
+    except Exception as e:
+        import traceback
+        return jsonify({'all_clear': False, 'error': str(e),
+                         'trace': traceback.format_exc()}), 500
+
+# ── Reports ──────────────────────────────────────────────────────────────────
+# Data-driven catalogue: the frontend renders whatever this returns, so adding
+# a report later needs no frontend change at all.
+REPORT_CATALOGUE = [
+    {'id': 'pl', 'label': 'Profit & Loss Statement', 'group': 'Governance',
+     'needs_period': True, 'needs_cluster': False,
+     'desc': 'Cash-basis P&L: charges earned on collection, less expenses by category. '
+             'GST and partner drawings shown below the line.'},
+    {'id': 'integrity', 'label': 'Money Integrity & Audit Report', 'group': 'Governance',
+     'needs_period': False, 'needs_cluster': False,
+     'desc': 'Every distinct way a rupee could go missing, each proven. The report to hand '
+             'partners and investors.'},
+    {'id': 'position', 'label': 'Statement of Position', 'group': 'Governance',
+     'needs_period': False, 'needs_cluster': False,
+     'desc': 'Assets (bank + FD + receivables) against how they are funded. Deployable cash '
+             'is the headline figure.'},
+    {'id': 'gst', 'label': 'GST Register', 'group': 'Governance',
+     'needs_period': False, 'needs_cluster': False,
+     'desc': 'Month-wise from Apr-2026, collection basis. Mirrors the GST Register sheet exactly.'},
+    {'id': 'consolidated_mis', 'label': 'Consolidated MIS', 'group': 'Portfolio',
+     'needs_period': False, 'needs_cluster': False,
+     'desc': 'Full portfolio dashboard: KPIs, open cases, cluster analytics, ROI, monthly and MTD/YTD.'},
+    {'id': 'cluster_mis', 'label': 'Cluster MIS', 'group': 'Portfolio',
+     'needs_period': False, 'needs_cluster': True,
+     'desc': 'One cluster\'s own pack: KPI strip, MTD/YTD, branch leaderboard ranked by TAT, open cases.'},
+    {'id': 'escalation', 'label': 'Collection Follow-Up / Escalation', 'group': 'Collections',
+     'needs_period': False, 'needs_cluster': False,
+     'desc': 'Calling list for every open case with the full escalation chain - field officer, '
+             'territory, area and cluster manager, with phone numbers.'},
+]
+
+@app.route('/reports/catalogue', methods=['GET'])
+def api_reports_catalogue():
+    try:
+        clusters = []
+        try:
+            records = read_accounts_from_gsheet()
+            clusters = sorted({(r.get('Cluster', '') or '').strip() for r in records
+                               if (r.get('Cluster', '') or '').strip()})
+        except Exception:
+            pass
+        return jsonify({'ok': True, 'reports': REPORT_CATALOGUE, 'clusters': clusters})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/reports/generate', methods=['POST'])
+def api_reports_generate():
+    """One route, dispatching on `report`. Deliberately READ-ONLY: unlike
+    /generate-mis it never calls write_claude_dashboard_to_sheet(), so pulling
+    a report can never mutate the spreadsheet."""
+    try:
+        data = request.json or {}
+        report = (data.get('report') or '').strip()
+        ensure_mis_assets_cached()
+        today = date.today()
+
+        def _d(key, default=None):
+            v = (data.get(key) or '').strip()
+            return _parse_flex_date(v) if v else default
+
+        if report == 'pl':
+            frm = _d('from', date(today.year if today.month >= 4 else today.year - 1, 4, 1))
+            to = _d('to', today)
+            fin = _period_financials(from_date=frm, to_date=to)
+            label = f"{frm.strftime('%d-%b-%Y')} to {to.strftime('%d-%b-%Y')}"
+            pdf_bytes = mis.generate_pl_statement(fin, label)
+            fname = f"BridgeLine P&L {frm.strftime('%d%m%y')}-{to.strftime('%d%m%y')}.pdf"
+
+        elif report == 'integrity':
+            integrity = _money_integrity_check()
+            summary = get_today_summary()
+            pdf_bytes = mis.generate_money_integrity_report(integrity, summary=summary)
+            fname = f"BridgeLine Money Integrity {today.strftime('%d%m%y')}.pdf"
+
+        elif report == 'position':
+            summary = get_today_summary()
+            try:
+                capital_log = read_capital_log(get_gspread_client().open_by_key(SPREADSHEET_ID))
+            except Exception:
+                capital_log = None
+            pdf_bytes = mis.generate_position_statement(summary, capital_log=capital_log)
+            fname = f"BridgeLine Position {today.strftime('%d%m%y')}.pdf"
+
+        elif report == 'gst':
+            sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+            records = read_accounts_from_gsheet()
+            periods = _load_recon_periods(get_recon_txns_sheet(sh))
+            months, y, m = [], 2026, 4
+            while (y, m) <= (today.year, today.month):
+                frm = date(y, m, 1)
+                to = date(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1)
+                fin = _period_financials(from_date=frm, to_date=min(to, today),
+                                          periods=periods, records=records, sh=sh)
+                months.append({'label': frm.strftime('%b %Y'), 'charges': fin['charges_earned'],
+                                'gst': fin['gst_collected'], 'cases': fin['cases_closed']})
+                m += 1
+                if m > 12:
+                    m = 1; y += 1
+            pdf_bytes = mis.generate_gst_register_pdf(months)
+            fname = f"BridgeLine GST Register {today.strftime('%d%m%y')}.pdf"
+
+        elif report in ('consolidated_mis', 'cluster_mis', 'escalation'):
+            sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+            rows, db_raw, mcoll, (cluster_mgrs, branch_contacts, area_mgrs,
+                                   territory_to_area), capital_log = load_data_from_sheet(sh)
+            open_cases, all_cases, all_cases_full = mis.parse_cases(rows, mcoll)
+            metrics = mis.compute_dashboard_metrics(all_cases_full, db_raw, capital_log)
+            if report == 'consolidated_mis':
+                pdf_bytes = mis.generate_consolidated_mis(open_cases, all_cases, all_cases_full, metrics)
+                fname = f"BridgeLine Consolidated MIS {today.strftime('%d%m%y')}.pdf"
+            elif report == 'cluster_mis':
+                cluster = (data.get('cluster') or '').strip()
+                if not cluster:
+                    return jsonify({'ok': False, 'error': 'Please choose a cluster.'}), 400
+                pdf_bytes = mis.generate_cluster_mis(cluster, open_cases, all_cases, metrics)
+                fname = f"BridgeLine {cluster} MIS {today.strftime('%d%m%y')}.pdf"
+            else:
+                pdf_bytes = mis.generate_calling_followup_pdf(
+                    open_cases, cluster_mgrs, branch_contacts, area_mgrs, territory_to_area)
+                fname = f"BridgeLine Collection Follow-Up {today.strftime('%d%m%y')}.pdf"
+        else:
+            return jsonify({'ok': False, 'error': f'Unknown report: {report}'}), 400
+
+        return Response(pdf_bytes, mimetype='application/pdf',
+                        headers={'Content-Disposition': f'attachment; filename="{fname}"'})
+    except Exception as e:
+        import traceback
+        return jsonify({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}), 500
+
+@app.route('/period-financials', methods=['GET'])
+def api_period_financials():
+    try:
+        frm = _parse_flex_date(request.args.get('from', '') or '')
+        to = _parse_flex_date(request.args.get('to', '') or '')
+        return jsonify({'ok': True, **_period_financials(from_date=frm, to_date=to)})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/fd-balance', methods=['GET'])
+def api_fd_balance_get():
+    try:
+        bal, d = get_latest_fd_balance()
+        return jsonify({'ok': True, 'balance': bal, 'date': d.strftime('%d-%m-%Y') if d else None})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
+@app.route('/fd-balance', methods=['POST'])
+def api_fd_balance_post():
+    try:
+        data = request.json or {}
+        if not str(data.get('date', '')).strip() or str(data.get('balance', '')).strip() == '':
+            return jsonify({'ok': False, 'error': 'Date and balance are required.'})
+        bal, d = save_fd_balance(data['date'], data['balance'])
+        return jsonify({'ok': True, 'balance': bal, 'date': d.strftime('%d-%m-%Y')})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)})
+
 @app.route('/reconcile/save', methods=['POST'])
 def api_reconcile_save():
     """Persists the period to the 'Recon Txns' sheet tab and returns the FULL
@@ -6359,22 +9172,57 @@ def api_reconcile_save():
     """
     try:
         data = request.json
-        result = save_reconciliation(
-            recon_date=data['date'],
-            opening_balance=float(data.get('opening') or 0),
-            closing_balance=float(data.get('closing') or 0),
-            transactions=data['transactions'],
-            remarks=data.get('remarks', ''),
-            remarks_map=data.get('remarks_map', {}),
-            account=data.get('account', ''),
-        )
+        # Multi-account batch, or the single-statement shape wrapped as a
+        # one-element batch so there is only ever one code path.
+        batch = data.get('statements') or [{
+            'date':         data.get('date'),
+            'opening':      data.get('opening'),
+            'closing':      data.get('closing'),
+            'transactions': data.get('transactions'),
+            'remarks':      data.get('remarks', ''),
+            'remarks_map':  data.get('remarks_map', {}),
+            'account':      data.get('account', ''),
+        }]
+
+        # Saved one at a time — the Sheet append is not transactional, so a
+        # failure partway must report exactly which accounts made it in
+        # rather than implying all or nothing. save_reconciliation() replaces
+        # any existing (date, account) period, so re-running after a partial
+        # failure is safe and won't duplicate what already saved.
+        saved, result = [], None
+        for st in batch:
+            if not (st.get('account') or '').strip():
+                raise ValueError('Every statement needs its bank account set before saving.')
+            if not (st.get('date') or '').strip():
+                raise ValueError(f"No reconciliation date for the {st['account']} statement.")
+            try:
+                result = save_reconciliation(
+                    recon_date=st['date'],
+                    opening_balance=float(st.get('opening') or 0),
+                    closing_balance=float(st.get('closing') or 0),
+                    transactions=st['transactions'],
+                    remarks=st.get('remarks', ''),
+                    remarks_map=st.get('remarks_map', {}),
+                    account=st.get('account', ''),
+                )
+                saved.append({'account': st['account'], 'date': st['date'],
+                              'rows': result['rows_saved'], 'closing': result['closing']})
+            except Exception as e:
+                done = ', '.join(f"{s['account']} ({s['rows']} rows)" for s in saved) or 'none'
+                raise RuntimeError(
+                    f"Saved: {done}. Then FAILED on {st.get('account')}: {e}. "
+                    f"Re-run the save — already-saved accounts are replaced, not duplicated.")
+
+        # The workbook is cumulative across every period ever saved, so the
+        # last call's bytes already contain all of this batch.
         return Response(
             result['file_bytes'],
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={
                 'Content-Disposition': f'attachment; filename="{result["filename"]}"',
-                'X-Rows-Saved': str(result['rows_saved']),
+                'X-Rows-Saved': str(sum(s['rows'] for s in saved)),
                 'X-Closing-Balance': str(result['closing']),
+                'X-Accounts-Saved': json.dumps(saved),
             },
         )
     except Exception as e:
