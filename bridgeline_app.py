@@ -2120,6 +2120,14 @@ DEFAULT_CONFIG = {
     # DEFAULT_CHARGE_PLANS"; set it to override or to onboard a new company
     # without a code change. See get_charge_plans()/resolve_charge_plan().
     "charge_plans": [],
+    # Decisions taken on suspense lines once identified — [{key, resolution,
+    # note, resolved_on}]. Applied at READ time so a decision survives every
+    # future re-upload. See _suspense_register().
+    "suspense_resolutions": [],
+    # Manual re-types of individual bank lines — [{key, type, note, on}].
+    # Applied at read time by _effective_type(), so the decision outlives
+    # any re-upload of the statement it came from.
+    "type_overrides": [],
     # Defaults for the Bank File tab's bulk-upload exports (overridable per
     # export in the UI).
     "bulk_debit_account": "",
@@ -4532,7 +4540,7 @@ def _all_time_recon_totals(periods=None):
             # debit is money out) so an unrecognised type can never again
             # silently swallow cash; _money_integrity_check() reports it by
             # name so it gets a proper role.
-            _role = CASH_ROLE.get(_effective_type(tx))
+            _role = CASH_ROLE.get(_effective_type(tx, p['account']))
             if _role in ('expense', 'withdrawal'):
                 expense_total += tx['debit'] - tx['credit']
             elif _role is None and tx['debit'] > tx['credit']:
@@ -4986,6 +4994,119 @@ def _pair_uploaded_statements(statements):
                                   'description': cr['desc']}})
     return pairs
 
+SUSPENSE_REVERSAL_MAX_DAYS = 5   # a wrong credit is normally returned same-day
+
+def _suspense_key(account, tx):
+    """Stable identity for one suspense line, so a resolution recorded once
+    keeps applying without re-saving the reconciliation."""
+    return '|'.join([str(account), str(tx.get('date', '')),
+                     f"{tx.get('debit', 0):.2f}", f"{tx.get('credit', 0):.2f}",
+                     _norm_ws(tx.get('description', ''))[:60]])
+
+def _suspense_register(periods=None, sh=None):
+    """Everything sitting in Suspense, split into what has been settled and
+    what is genuinely still open.
+
+    Suspense is where money goes when we can see it moved but not why —
+    correct accounting, but useless if nothing ever comes back OUT of it.
+    Prem, 14-08-2026: "we should have someplace to put back whats in suspense
+    once its found out."
+
+    Two ways an item leaves suspense:
+
+      * RETURNED — a wrong credit that was sent straight back shows up as a
+        suspense credit and a suspense debit, same account, same amount,
+        within a few days. It cancels itself; there is nothing to chase and
+        nothing to decide. Paired automatically (Charan A Rao, 14-08-2026:
+        "was a wrong credit and it was debited the same day").
+      * RESOLVED — anything else, once identified: it belonged to a customer
+        case, it was really income, it was really an expense. Recorded
+        against the line's own key in Config and applied at read time, so a
+        decision survives every future re-upload.
+    """
+    if periods is None:
+        if sh is None:
+            sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
+        periods = _load_recon_periods(get_recon_txns_sheet(sh))
+    try:
+        resolutions = {r['key']: r for r in (load_config().get('suspense_resolutions') or [])
+                       if isinstance(r, dict) and r.get('key')}
+    except Exception:
+        resolutions = {}
+
+    overrides = _type_overrides()
+    items, seen = [], set()
+    for p in periods:
+        for tx in p['txns']:
+            if _effective_type(tx, p['account'], overrides) != 'Suspense':
+                continue
+            key = (p['account'], tx['date'], tx['description'], tx['debit'], tx['credit'], tx['balance'])
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append({'account': p['account'], 'date': tx.get('date', ''),
+                          'debit': tx.get('debit', 0), 'credit': tx.get('credit', 0),
+                          'description': _norm_ws(tx.get('description', ''))[:160],
+                          'key': _suspense_key(p['account'], tx),
+                          'd': _parse_flex_date(tx.get('date', ''))})
+
+    # Pair each suspense credit with a suspense debit that reverses it.
+    returned, used = [], set()
+    credits = [i for i in items if i['credit'] > 0]
+    debits  = [i for i in items if i['debit'] > 0]
+    for cr in sorted(credits, key=lambda x: x['d'] or date.max):
+        best = None
+        for j, dr in enumerate(debits):
+            if j in used or dr['account'] != cr['account']:
+                continue
+            if abs(dr['debit'] - cr['credit']) > 1:
+                continue
+            if cr['d'] and dr['d']:
+                gap = (dr['d'] - cr['d']).days
+                if gap < 0 or gap > SUSPENSE_REVERSAL_MAX_DAYS:
+                    continue        # the return must come AFTER the credit
+            else:
+                gap = 0
+            if best is None or gap < best[1]:
+                best = (j, gap)
+        if best is None:
+            continue
+        j, gap = best
+        used.add(j)
+        returned.append({'amount': round(cr['credit'], 2), 'account': cr['account'],
+                         'received': cr['date'], 'returned_on': debits[j]['date'],
+                         'gap_days': gap,
+                         'credit_desc': cr['description'], 'debit_desc': debits[j]['description'],
+                         'keys': [cr['key'], debits[j]['key']]})
+    paired_keys = {k for r in returned for k in r['keys']}
+
+    open_items, resolved = [], []
+    for i in items:
+        i.pop('d', None)
+        if i['key'] in paired_keys:
+            continue
+        r = resolutions.get(i['key'])
+        if r:
+            resolved.append({**i, 'resolution': r.get('resolution', ''),
+                             'note': r.get('note', ''), 'resolved_on': r.get('resolved_on', '')})
+        else:
+            open_items.append(i)
+
+    def _net(rows):
+        return round(sum(x['debit'] - x['credit'] for x in rows), 2)
+
+    return {
+        'open': sorted(open_items, key=lambda x: x['date']),
+        'open_count': len(open_items),
+        'open_net': _net(open_items),
+        'returned': returned,
+        'returned_count': len(returned),
+        'returned_total': round(sum(r['amount'] for r in returned), 2),
+        'resolved': resolved,
+        'resolved_count': len(resolved),
+        'all_clear': not open_items,
+    }
+
 def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
     """Every distinct way a rupee could go missing, each as its own number
     that should be zero. Deliberately NOT a single variance: the bank
@@ -5038,7 +5159,7 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
                 first_date = d if first_date is None or d < first_date else first_date
                 last_date = d if last_date is None or d > last_date else last_date
 
-            t = _effective_type(tx) or '(blank)'
+            t = _effective_type(tx, p['account']) or '(blank)'
             if k in contra_paired_keys:
                 t = 'Contra'          # matched to its counter-leg in another own account
             role = CASH_ROLE.get(t)
@@ -5071,6 +5192,10 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
     # so it covers exactly the window reconciliation actually proves.
     disb_by_ref, coll_by_ref = _bank_matched_refs(all_txns)
     bank_descs_upper = [(tx.get('description') or '').upper() for tx in all_txns]
+    # Built once here too — a bulk rename of the call sites on 14-08-2026
+    # switched these two lookups to the index without defining it in this
+    # scope, which took /money-integrity down with a NameError.
+    bank_idx = _build_bank_ref_index(bank_descs_upper)
     def _in_window(dstr):
         d = _parse_flex_date(str(dstr or ''))
         return bool(d and first_date and last_date and first_date <= d <= last_date)
@@ -5099,6 +5224,15 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
     fd = _fd_ledger(periods)
     contra = role_totals.get('contra', {'net_out_of_bank': 0.0})
     suspense = role_totals.get('suspense', {'net_out_of_bank': 0.0})
+    # Money that came in by mistake and went straight back, or that has since
+    # been identified, is no longer sitting in suspense — only what is still
+    # genuinely unexplained should be reported as such.
+    try:
+        susp_reg = _suspense_register(periods=periods, sh=sh)
+    except Exception:
+        susp_reg = {'open_net': suspense.get('net_out_of_bank', 0.0), 'open_count': 0,
+                    'returned_count': 0, 'returned_total': 0.0, 'resolved_count': 0,
+                    'open': [], 'returned': [], 'resolved': []}
 
     leaks = {
         'unclassified_types': {
@@ -5117,7 +5251,12 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
             'disbursements': book_unmatched_disb[:50],
             'collections': book_unmatched_coll[:50]},
         'contra_imbalance': round(contra.get('net_out_of_bank', 0.0), 2),
-        'suspense_net': round(suspense.get('net_out_of_bank', 0.0), 2),
+        'suspense_net': round(susp_reg['open_net'], 2),
+        'suspense_open_count': susp_reg['open_count'],
+        'suspense_returned_count': susp_reg['returned_count'],
+        'suspense_returned_total': susp_reg['returned_total'],
+        'suspense_resolved_count': susp_reg['resolved_count'],
+        'suspense_gross_net': round(suspense.get('net_out_of_bank', 0.0), 2),
         'fd_orphan_total': fd['orphan_sweepin_total'],
         'fd_unparsed_net': fd['unparsed_net'],
     }
@@ -5256,7 +5395,14 @@ REPORT_GST_RATE = 0.18
 # about any particular transaction.
 UNIDENTIFIED_MATERIALITY = 50000
 
-def _effective_type(tx):
+def _type_overrides():
+    try:
+        return {o['key']: o.get('type', '') for o in (load_config().get('type_overrides') or [])
+                if isinstance(o, dict) and o.get('key')}
+    except Exception:
+        return {}
+
+def _effective_type(tx, account='', overrides=None):
     """A stored row's type, corrected where its own narration contradicts it.
 
     Only ever upgrades an FD sweep leg that was mis-typed because the bank
@@ -5264,6 +5410,16 @@ def _effective_type(tx):
     already-saved rows are right without a re-save -- same approach as
     _cross_account_contra_pairs(). Without this the six August sweep-outs
     sit in the P&L as Rs 1.23 crore of operating expenses."""
+    # A manual re-type outranks everything: it is Prem saying what a line
+    # actually was, and it is stored against the line's own key so it
+    # survives every future re-upload of that statement. This is how a wrong
+    # credit sitting as a Repayment gets moved into Suspense without
+    # re-saving the reconciliation (Charan A Rao, 14-08-2026).
+    if overrides is None:
+        overrides = _type_overrides()
+    ov = overrides.get(_suspense_key(account, tx)) if overrides else None
+    if ov:
+        return ov
     stored = (tx.get('type') or '').strip()
     if stored == 'FD Booking':
         return stored
@@ -5360,7 +5516,7 @@ def _period_financials(from_date=None, to_date=None, periods=None, records=None,
                 continue
             if k in contra_paired_keys:
                 continue          # own-account transfer, not income or cost
-            role = CASH_ROLE.get(_effective_type(tx))
+            role = CASH_ROLE.get(_effective_type(tx, p['account']))
             net_out = tx['debit'] - tx['credit']
             if role == 'expense':
                 # Re-derive from the narration rather than trusting the label
@@ -6393,6 +6549,13 @@ HTML = """<!DOCTYPE html>
       <h3>🔒 Money Integrity <span id="integrity-badge" style="font-weight:400;color:#888"></span></h3>
       <p style="font-size:.8rem;color:#666;margin:0 0 10px">Every distinct way a rupee could go missing, each proven separately. A single variance figure proves nothing — a bank statement's own arithmetic always balances.</p>
       <div id="integrity-body" style="font-size:.85rem;line-height:1.6"></div>
+    </div>
+
+    <div class="section" id="suspense-section">
+      <h3>⚖️ Suspense Register <span id="suspense-badge" style="font-weight:400;color:#888"></span></h3>
+      <p style="font-size:.8rem;color:#666;margin:0 0 10px">Money that moved for a reason we couldn't identify. A wrong credit that was sent straight back clears itself. Anything else stays here until you say what it was — and that decision survives every future re-upload.</p>
+      <div id="suspense-body" style="font-size:.85rem;line-height:1.6"></div>
+      <div id="suspense-status" class="status"></div>
     </div>
 
     <div class="section" id="capital-log-section">
@@ -8031,6 +8194,7 @@ async function loadSettings() {
   document.getElementById('cl-date').value = new Date().toLocaleDateString('en-GB').replace(/\//g,'-');
   loadSolvencyCheck();
   loadMoneyIntegrity();
+  loadSuspense();
   loadCapitalLog();
 }
 
@@ -8049,6 +8213,8 @@ async function loadMoneyIntegrity() {
     }
     const L = r.leaks || {};
     const bank = L.bank_entries_not_tied_to_a_case || {};
+    window._integrityBankEntries = bank.entries || [];
+    window._bankAccountNames = (_bankAccounts || []).map(a => a.name);
     const book = L.book_entries_with_no_bank_evidence || {};
     const bookAmt = (book.disbursement_total||0) + (book.collection_total||0);
     const internal = Math.abs(L.contra_imbalance||0) + Math.abs(L.fd_unparsed_net||0);
@@ -8087,6 +8253,19 @@ async function loadMoneyIntegrity() {
             <div style="white-space:nowrap;font-weight:700;color:${ok?'#1a5c3a':'#c00'}">${ok?'✅ CLEAR':'⚠️ ₹'+fmtDec(Math.abs(amt))}</div>
           </div>`;
       }).join('') +
+      ((bank.entries && bank.entries.length) ? `<div style="margin-top:10px;padding:8px 10px;background:#fff8e1;border:1px solid #e0c060;border-radius:6px;font-size:.8rem">
+          <b>Bank lines not tied to any case</b> — if one of these was a wrong credit, move it to Suspense and it will clear against its return.
+          ${bank.entries.map((e, i) => `<div style="margin-top:8px;padding-top:8px;border-top:1px solid #ecdfae">
+             <b>${e.date}</b> &nbsp; ${e.debit>0 ? '<span style="color:#c00">Dr ₹'+fmtDec(e.debit)+'</span>' : '<span style="color:#1a5c3a">Cr ₹'+fmtDec(e.credit)+'</span>'}
+             &nbsp;<span style="color:#666">currently typed <b>${e.type||'—'}</b></span><br>
+             <span style="color:#555">${(e.description||'').replace(/</g,'&lt;')}</span><br>
+             <select id="rt-acct-${i}" style="font-size:.78rem;margin-top:4px">
+               ${(window._bankAccountNames||[]).map(a => `<option value="${a}">${a}</option>`).join('')}
+             </select>
+             <button class="btn" onclick="retypeToSuspense(${i})"
+               style="width:auto;padding:4px 10px;font-size:.78rem;margin-left:6px;background:#1a3a5c;color:#fff;border:none;border-radius:5px;cursor:pointer">Move to Suspense</button>
+           </div>`).join('')}
+        </div>` : '') +
       ((ci && ci.count) ? `<div style="margin-top:10px;padding:8px 10px;background:#fff5f5;border:1px solid #e0b0b0;border-radius:6px;font-size:.8rem">
           <b>Charge-plan mismatches</b>
           ${ci.issues.map(i => `<div style="margin-top:6px;padding-top:6px;border-top:1px solid #f0dede">
@@ -8110,6 +8289,147 @@ async function loadMoneyIntegrity() {
   } catch (e) {
     badge.textContent = '— error';
     body.innerHTML = '<span style="color:#c00">' + e.message + '</span>';
+  }
+}
+
+async function retypeToSuspense(i) {
+  const e = (window._integrityBankEntries || [])[i];
+  if (!e) return;
+  const account = document.getElementById('rt-acct-' + i).value;
+  if (!account) return alert('Pick which account this line is in.');
+  const btn = event.target; btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await (await fetch('/retype', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({account, date: e.date, debit: e.debit, credit: e.credit,
+                            description: e.description, type: 'Suspense'})})).json();
+    if (!r.ok) throw new Error(r.error || 'Failed');
+    await loadMoneyIntegrity();
+    await loadSuspense();
+  } catch (err) {
+    btn.disabled = false; btn.textContent = 'Move to Suspense';
+    alert('❌ ' + err.message);
+  }
+}
+
+// ── Suspense register ──────────────────────────────────────────
+const SUSPENSE_OPTIONS = [
+  ['case',    'Belonged to a customer case'],
+  ['income',  'Ours to keep — income'],
+  ['expense', 'A genuine expense'],
+  ['returned','Sent back / reversed'],
+  ['other',   'Other — see note'],
+];
+
+function renderSuspense(r) {
+  const badge = document.getElementById('suspense-badge');
+  const body  = document.getElementById('suspense-body');
+  badge.textContent = r.open_count
+    ? `— ${r.open_count} still to identify (${_fmtSigned(r.open_net)})`
+    : '— ✅ nothing unexplained';
+  badge.style.color = r.open_count ? '#c00' : '#1a5c3a';
+
+  let html = '';
+  if (r.open_count) {
+    html += `<div style="overflow-x:auto"><table class="recon-table"><thead><tr>
+        <th>Date</th><th>Account</th><th>Description</th>
+        <th style="text-align:right">Amount</th><th style="width:200px">What was it?</th>
+        <th style="min-width:180px">Note</th><th style="width:70px"></th>
+      </tr></thead><tbody>` +
+      r.open.map((x, i) => `<tr>
+        <td style="white-space:nowrap;font-size:.82rem">${x.date}</td>
+        <td style="font-size:.78rem;color:#12467e">${x.account}</td>
+        <td style="font-size:.79rem;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(x.description||'').replace(/"/g,'&quot;')}">${(x.description||'').replace(/</g,'&lt;')}</td>
+        <td style="text-align:right;font-weight:600;white-space:nowrap;color:${x.debit>0?'#c00':'#1a5c3a'}">${x.debit>0?'−':'+'}₹${fmtDec(x.debit>0?x.debit:x.credit)}</td>
+        <td><select id="susp-res-${i}" style="width:100%;font-size:.8rem">
+              <option value="">Select…</option>
+              ${SUSPENSE_OPTIONS.map(([v,l]) => `<option value="${v}">${l}</option>`).join('')}
+            </select></td>
+        <td><input type="text" id="susp-note-${i}" placeholder="e.g. BLP-120826-401, or why"
+              style="width:100%;font-size:.8rem;padding:4px 6px;border:1px solid #b0c4d8;border-radius:5px;box-sizing:border-box"></td>
+        <td><button class="btn" onclick="resolveSuspense(${i})"
+              style="width:auto;padding:5px 10px;font-size:.78rem;background:#1a3a5c;color:#fff;border:none;border-radius:5px;cursor:pointer">Save</button></td>
+      </tr>`).join('') + `</tbody></table></div>`;
+    window._suspenseOpen = r.open;
+  } else {
+    html += `<div style="padding:8px 10px;background:#eaf6ee;border:1px solid #9ccfae;border-radius:6px;color:#1a5c3a">Nothing is sitting unexplained in suspense.</div>`;
+    window._suspenseOpen = [];
+  }
+
+  if (r.returned_count) {
+    html += `<div style="margin-top:14px"><b>Cleared automatically — wrong credits that were sent back</b>
+      <span style="color:#888;font-weight:400">(${r.returned_count}, ₹${fmtDec(r.returned_total)})</span>
+      <div style="overflow-x:auto;margin-top:6px"><table class="recon-table"><thead><tr>
+        <th>Account</th><th style="text-align:right">Amount</th><th>Came in</th><th>Went back</th><th>Description</th>
+      </tr></thead><tbody>` + r.returned.map(x => `<tr>
+        <td style="font-size:.78rem;color:#12467e">${x.account}</td>
+        <td style="text-align:right;font-weight:600">₹${fmtDec(x.amount)}</td>
+        <td style="font-size:.8rem;white-space:nowrap">${x.received}</td>
+        <td style="font-size:.8rem;white-space:nowrap">${x.returned_on}${x.gap_days ? ` (+${x.gap_days}d)` : ' (same day)'}</td>
+        <td style="font-size:.78rem;color:#666;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${(x.credit_desc||'').replace(/</g,'&lt;')}</td>
+      </tr>`).join('') + `</tbody></table></div></div>`;
+  }
+
+  if (r.resolved_count) {
+    html += `<div style="margin-top:14px"><b>Identified by you</b> <span style="color:#888;font-weight:400">(${r.resolved_count})</span>
+      <div style="overflow-x:auto;margin-top:6px"><table class="recon-table"><thead><tr>
+        <th>Date</th><th>Account</th><th style="text-align:right">Amount</th><th>Was</th><th>Note</th><th style="width:80px"></th>
+      </tr></thead><tbody>` + r.resolved.map((x, i) => `<tr>
+        <td style="font-size:.82rem;white-space:nowrap">${x.date}</td>
+        <td style="font-size:.78rem;color:#12467e">${x.account}</td>
+        <td style="text-align:right;font-weight:600">₹${fmtDec(x.debit>0?x.debit:x.credit)}</td>
+        <td style="font-size:.8rem">${(SUSPENSE_OPTIONS.find(o=>o[0]===x.resolution)||[,x.resolution])[1]}</td>
+        <td style="font-size:.78rem;color:#666">${(x.note||'').replace(/</g,'&lt;')}</td>
+        <td><button class="btn" onclick="reopenSuspense('${x.key.replace(/'/g,"\\'")}')"
+              style="width:auto;padding:4px 8px;font-size:.75rem;background:#fff;color:#c00;border:1px solid #e0b4b4;border-radius:5px;cursor:pointer">Undo</button></td>
+      </tr>`).join('') + `</tbody></table></div></div>`;
+  }
+  body.innerHTML = html;
+}
+
+async function loadSuspense() {
+  const body = document.getElementById('suspense-body');
+  if (!body) return;
+  body.innerHTML = '<span style="color:#888">Loading…</span>';
+  try {
+    const r = await (await fetch('/suspense')).json();
+    if (!r.ok) throw new Error(r.error || 'Failed');
+    renderSuspense(r);
+  } catch (e) {
+    body.innerHTML = '<span style="color:#c00">' + e.message + '</span>';
+  }
+}
+
+async function resolveSuspense(i) {
+  const item = (window._suspenseOpen || [])[i];
+  if (!item) return;
+  const resolution = document.getElementById('susp-res-' + i).value;
+  const note = document.getElementById('susp-note-' + i).value.trim();
+  if (!resolution) return alert('Please pick what this turned out to be.');
+  const btn = event.target; btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await (await fetch('/suspense/resolve', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({key: item.key, resolution, note})})).json();
+    if (!r.ok) throw new Error(r.error || 'Failed');
+    renderSuspense(r);
+    showStatus('suspense-status','success','✅ Recorded — it will stay recorded through future uploads.');
+    loadMoneyIntegrity();
+  } catch (e) {
+    btn.disabled = false; btn.textContent = 'Save';
+    showStatus('suspense-status','error','❌ ' + e.message);
+  }
+}
+
+async function reopenSuspense(key) {
+  try {
+    const r = await (await fetch('/suspense/resolve', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({key, resolution: 'reopen'})})).json();
+    if (!r.ok) throw new Error(r.error || 'Failed');
+    renderSuspense(r);
+    loadMoneyIntegrity();
+  } catch (e) {
+    showStatus('suspense-status','error','❌ ' + e.message);
   }
 }
 
@@ -9708,6 +10028,61 @@ def api_solvency_check():
         return jsonify(_solvency_check())
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.route('/suspense')
+def api_suspense():
+    try:
+        return jsonify({'ok': True, **_suspense_register()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/retype', methods=['POST'])
+def api_retype():
+    """Re-type one bank line for good — e.g. a wrong credit sitting as a
+    Repayment moved into Suspense. Stored against the line's own key and
+    applied at read time, so it is never lost by a later upload."""
+    try:
+        d = request.json or {}
+        account = (d.get('account') or '').strip()
+        tx = {'date': d.get('date', ''), 'debit': float(d.get('debit') or 0),
+              'credit': float(d.get('credit') or 0), 'description': d.get('description', '')}
+        new_type = (d.get('type') or '').strip()
+        if not new_type:
+            raise ValueError('A type is required.')
+        key = _suspense_key(account, tx)
+        cfg = load_config_strict()
+        kept = [o for o in (cfg.get('type_overrides') or [])
+                if isinstance(o, dict) and o.get('key') != key]
+        if new_type != 'clear':
+            kept.append({'key': key, 'type': new_type, 'note': (d.get('note') or '').strip(),
+                         'on': datetime.today().strftime('%d-%m-%Y')})
+        save_config({'type_overrides': kept})
+        return jsonify({'ok': True, 'key': key, 'type': new_type})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+@app.route('/suspense/resolve', methods=['POST'])
+def api_suspense_resolve():
+    """Record what a suspense line turned out to be. Stored against the
+    line's own key and applied at read time — never a re-save of the
+    reconciliation, so the decision cannot be lost by a later upload."""
+    try:
+        d = request.json or {}
+        key = (d.get('key') or '').strip()
+        resolution = (d.get('resolution') or '').strip()
+        if not key or not resolution:
+            raise ValueError('Both the suspense line and a resolution are required.')
+        cfg = load_config_strict()
+        existing = [r for r in (cfg.get('suspense_resolutions') or [])
+                    if isinstance(r, dict) and r.get('key') != key]
+        if resolution != 'reopen':
+            existing.append({'key': key, 'resolution': resolution,
+                             'note': (d.get('note') or '').strip(),
+                             'resolved_on': datetime.today().strftime('%d-%m-%Y')})
+        save_config({'suspense_resolutions': existing})
+        return jsonify({'ok': True, **_suspense_register()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
 
 @app.route('/charge-integrity')
 def api_charge_integrity():
