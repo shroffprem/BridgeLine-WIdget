@@ -2562,14 +2562,37 @@ def get_today_summary():
     # seen — otherwise it is by definition stale (sweeps have happened since
     # a human last looked) and would freeze the dashboard at an old number,
     # which is precisely the failure this whole mechanism exists to end.
+    #
+    # And the rule that was missing until 14-08-2026: a figure DERIVED FROM
+    # INCOMPLETE DATA IS NOT A FIGURE. If any FD shows money sweeping back in
+    # that was never seen going out, the ledger cannot know what that deposit
+    # still holds — its arithmetic goes negative and gets floored at zero. It
+    # then reports ₹0 with total confidence, which is the single most
+    # damaging thing this dashboard can do: ₹0 looks like an answer. On
+    # 14-08-2026 that put Available to Disburse at ₹20.6 lakh against a real
+    # position near ₹72 lakh. An orphaned sweep-in now disqualifies the
+    # derived figure outright and hands over to the entered balance.
     fd_date = None
     fd_ledger_info = None
+    fd_incomplete = False
     try:
         fd_ledger_info = _fd_ledger()
+        orphans = fd_ledger_info.get('orphan_sweepins') or {}
+        unparsed = fd_ledger_info.get('unparsed') or []
+        fd_incomplete = bool(orphans or unparsed)
         fd_outstanding = max(0.0, fd_ledger_info['fd_total'])
         fd_source = 'fd_ledger'
         direct_bal, direct_date = get_latest_fd_balance()
-        if direct_bal is not None and direct_date is not None:
+        if fd_incomplete:
+            # Trust the entered balance regardless of date — a stale figure is
+            # far closer to the truth than a confident zero.
+            if direct_bal is not None:
+                fd_outstanding, fd_date = direct_bal, direct_date
+                fd_source = 'entered_ledger_incomplete'
+            else:
+                fd_outstanding = None
+                fd_source = 'unknown_ledger_incomplete'
+        elif direct_bal is not None and direct_date is not None:
             latest_txn = fd_ledger_info.get('latest_fd_txn_date')
             if latest_txn is None or direct_date.date() >= latest_txn:
                 fd_outstanding, fd_date = direct_bal, direct_date
@@ -2587,8 +2610,13 @@ def get_today_summary():
             fd_outstanding = 0.0
             fd_source = 'unavailable'
 
+    # Available = what's in the current accounts + what's in the FDs,
+    # adjusted only for business booked since each account's own statement.
+    # If the FD figure is unknown, Available is unknown too — a number that
+    # silently omits the FDs is worse than no number, because it looks like
+    # an answer and is short by tens of lakhs.
     available = None
-    if bank_balance is not None:
+    if bank_balance is not None and fd_outstanding is not None:
         available = bank_balance - disbursed_since_bank + collected_since_bank + fd_outstanding
     return {
         'disbursed_today':   disbursed_today,
@@ -2760,6 +2788,35 @@ def _extract_statement_account(text_lines, bank_accounts):
     """
     registered = [(a.get('name', '').strip(), re.sub(r'\D', '', str(a.get('account_number', '') or '')))
                   for a in (bank_accounts or []) if a.get('name', '').strip()]
+
+    # Simplest rule first, and the one that actually works: if a registered
+    # account's number appears ANYWHERE in the file, that is the account.
+    # No dependence on the words "Account Number", on where in the header the
+    # bank chose to print it, or on the 60-line window the pattern search
+    # used — all of which failed on Prem's real August download even though,
+    # in his words, "the statment dates and ac numbers were there".
+    # Checked longest-number-first so a short number that happens to be a
+    # substring of a longer one can never win.
+    whole = ' '.join(str(l) for l in text_lines)
+    digits_only = re.sub(r'\D', '', whole)
+    for name, acct in sorted(registered, key=lambda x: -len(x[1])):
+        if acct and len(acct) >= 9 and acct in digits_only:
+            return name, acct
+
+    # Same idea for a masked number printed without the word "account"
+    # anywhere near it (XXXXXXXX0923, ****8167). Accepted only when exactly
+    # one registered account ends in those four digits — two candidates means
+    # we genuinely cannot tell, and asking beats guessing.
+    for masked in re.findall(r'(?:[X\*x]\s*){3,}(\d[\s\d]{2,}\d)', whole):
+        tail = re.sub(r'\D', '', masked)[-4:]
+        if len(tail) < 4:
+            continue
+        hits = [n for n, a in registered if a and a[-4:] == tail]
+        if len(hits) == 1:
+            return hits[0], f'****{tail}'
+        if len(hits) > 1:
+            return None, f'****{tail}'
+
     for line in text_lines[:60]:   # header block only; txn rows can contain long refs
         s = ' '.join(str(line).split())
         if not s:
@@ -2949,11 +3006,22 @@ def parse_bank_statement(filepath, filename, bank_accounts=None):
         if closing_balance is None:
             closing_balance = last_balance
 
+    # If the header didn't declare a period, the transactions themselves are
+    # the period — first row to last. Simpler than any header pattern, always
+    # present, and impossible to get wrong: a statement cannot cover a day it
+    # has no rows for. Only the header's own declaration outranks it.
+    if not (stmt_from and stmt_to):
+        row_dates = [d for d in (_parse_flex_date(r['date']) for r in rows) if d]
+        if row_dates:
+            stmt_from = stmt_from or min(row_dates)
+            stmt_to = stmt_to or max(row_dates)
+
     return {'transactions': rows,
             'opening_balance': opening_balance or 0,
             'closing_balance': closing_balance or 0,
             'statement_from': stmt_from.strftime('%d-%m-%Y') if stmt_from else None,
             'statement_to': stmt_to.strftime('%d-%m-%Y') if stmt_to else None,
+            'statement_period_source': 'header' if _extract_statement_period(_period_lines)[1] else 'transactions',
             'statement_account': stmt_account,
             'statement_account_no': stmt_account_no}
 
@@ -4372,13 +4440,19 @@ def _load_recon_periods(ws):
         for j, (q, rq) in enumerate(ranged):
             if i == j or rq is None or q['account'] != p['account']:
                 continue
-            covers = rq[0] <= rp[0] and rq[1] >= rp[1]
-            if not covers:
+            # Day-set containment, not span containment: a wider period only
+            # supersedes a narrower one when it actually carries every day the
+            # narrower one has. A span test hides real days the wider upload
+            # was silent about (13-08-2026: three FD bookings vanished).
+            qd = {d for d in (_parse_flex_date(t.get('date', '')) for t in q['txns']) if d}
+            pd = {d for d in (_parse_flex_date(t.get('date', '')) for t in p['txns']) if d}
+            if not pd <= qd:
                 continue
+            covers = True
             # Identical ranges: only the later batch survives. Strict
             # containment: the wider one wins regardless of which is newer,
             # since it is by definition the more complete record.
-            same = rq == rp
+            same = pd == qd
             if (same and q['batch_id'] > p['batch_id']) or (not same):
                 superseded.add(id(p))
                 break
@@ -5510,10 +5584,23 @@ def _supersede_covered_periods(txns_ws, account, classified):
     _load_recon_periods(), which produces the same numbers without touching
     the sheet, so a Sheets hiccup can never cost a save.
     """
-    dates = [d for d in (_parse_flex_date(tx.get('date', '')) for tx in classified) if d]
-    if not dates or not account:
+    # Rule: replace a DAY only if the new statement actually has that day.
+    #
+    # Not "every day in the statement's span". A span rule deletes days the
+    # new file is silent about, and silence is not the same as "no activity"
+    # — it is usually a day the download simply left out. That is exactly
+    # what went wrong on 13-08-2026: an August IDFC upload spanning 01–13 Aug
+    # deleted every IDFC row in that span, but the file had no rows for the
+    # days carrying three FD sweep-out bookings. Their sweep-ins survived, so
+    # the FD ledger saw ₹74.4 lakh coming back from deposits it had never
+    # seen created and reported the FD balance as zero.
+    #
+    # Day-present is the safe version of the same intent: re-uploading August
+    # still rewrites every August day the file covers, and a day it does not
+    # cover keeps whatever was already reconciled for it.
+    days = {d for d in (_parse_flex_date(tx.get('date', '')) for tx in classified) if d}
+    if not days or not account:
         return 0
-    lo, hi = min(dates), max(dates)
     try:
         vals = txns_ws.get_all_values()
     except Exception:
@@ -5523,7 +5610,7 @@ def _supersede_covered_periods(txns_ws, account, classified):
         if len(row) < 14 or not row[0] or row[2] != account:
             continue
         d = _parse_flex_date(row[7])
-        if d and lo <= d <= hi:
+        if d and d in days:
             doomed.append(i)
     if not doomed:
         return 0
@@ -7041,7 +7128,9 @@ async function loadSummary() {
     document.getElementById('s-disb').textContent = (d.disbursed_today||0) > 0 ? '₹'+fmt(d.disbursed_today) : '—';
     document.getElementById('s-coll').textContent = (d.collected_today||0) > 0 ? '₹'+fmt(d.collected_today) : '—';
     document.getElementById('s-out').textContent  = d.total_outstanding != null ? '₹'+fmt(d.total_outstanding) : '—';
-    document.getElementById('s-avail').textContent = d.available_for_disbursement != null ? '₹'+fmt(d.available_for_disbursement) : '—';
+    document.getElementById('s-avail').textContent = d.available_for_disbursement != null
+      ? '₹'+fmt(d.available_for_disbursement)
+      : (d.bank_balance != null ? 'FD unknown' : '—');
     document.getElementById('s-date').textContent = d.date;
   } catch(e) {}
 }
@@ -7058,7 +7147,30 @@ function openSumModal(kind) {
   document.getElementById('sum-modal-title').textContent = cfg.title;
   const body = document.getElementById('sum-modal-body');
   if (kind === 'avail') {
-    if (d.available_for_disbursement == null) {
+    if (d.available_for_disbursement == null && d.bank_balance != null) {
+      // Bank is known, FD is not. Say exactly that, show what IS known, and
+      // give the two ways out — never a blank and never a confident wrong
+      // total that quietly leaves the FDs out.
+      body.innerHTML = `<div style="padding:18px">
+        <div style="padding:10px 12px;background:#fdecea;border:1px solid #e0a0a0;border-radius:6px;font-size:.85rem;color:#8a2020;margin-bottom:14px">
+          <b>FD balance can't be worked out from the statements right now,</b> so this total is deliberately not shown.
+          ₹${fmt(d.fd_orphan_total||0)} was seen sweeping back IN from deposits whose matching sweep-OUT is missing from the
+          uploaded statements — so how much those deposits still hold is unknown. Showing ₹0 for the FDs would understate
+          your position by tens of lakhs, which is worse than showing nothing.
+        </div>
+        <table style="width:100%;font-size:.88rem">
+          <tr><td style="padding:6px 0;color:#555">Bank Closing Balance (${d.bank_balance_date||''})</td><td style="padding:6px 0;text-align:right;font-weight:600">₹${fmt(d.bank_balance||0)}</td></tr>
+          <tr><td style="padding:6px 0;color:#555">Plus: Parked in FDs</td><td style="padding:6px 0;text-align:right;font-weight:700;color:#c00">unknown</td></tr>
+          <tr style="border-top:2px solid #1a3a5c"><td style="padding:8px 0;font-weight:700">Available to Disburse</td><td style="padding:8px 0;text-align:right;font-weight:700;color:#c00">unknown</td></tr>
+        </table>
+        <div style="margin-top:12px;font-size:.82rem;color:#333;line-height:1.7">
+          <b>Two ways to fix it:</b><br>
+          1. <b>Fastest</b> — enter today's FD balance under Settings → FD Balance. It is used immediately.<br>
+          2. <b>Proper</b> — re-upload the bank statement covering the days holding the missing sweep-out lines.
+             A re-upload now only rewrites the days the file actually contains, so nothing else is disturbed.
+        </div>
+      </div>`;
+    } else if (d.available_for_disbursement == null) {
       body.innerHTML = `<div class="empty">No bank reconciliation found yet — upload a bank statement under "Bank Reconciliation" to enable this.</div>`;
     } else {
       body.innerHTML = `<div style="padding:18px">
