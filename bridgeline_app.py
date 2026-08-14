@@ -3687,11 +3687,40 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
     matching bank transaction in classified_txns — the reverse-direction
     check the interactive preview never ran before (it only ever asked
     "does this bank line match a book record", never "does every book
-    record this period have a matching bank line")."""
+    record this period have a matching bank line").
+
+    Splits the result by WHY there's no bank evidence, because the two
+    reasons could not be more different and only one is alarming:
+
+      * pending  -- the entry is dated AFTER the last day any bank statement
+                    covers. Today's business, banked and booked, simply not
+                    reconciled yet. Completely normal, expected every day.
+      * missing  -- the entry falls INSIDE the reconciled window and still
+                    has no bank line. That is the real red flag.
+
+    Reported as one undifferentiated "not found in bank" list until
+    13-08-2026, when six collections and a disbursement all dated the same
+    day the books were written showed up as a Rs 15.3 lakh alarm purely
+    because that day's statement hadn't been uploaded yet. The check was
+    right every time; the wording made correct output look like a crisis,
+    which costs more trust than a missed entry would.
+    """
     disb_by_ref, coll_by_ref = _bank_matched_refs(classified_txns)
     bank_descs_upper = [tx.get('description', '').upper() for tx in classified_txns]
 
-    unmatched_disb = []
+    # The last day ANY bank statement in play actually reaches. Derived from
+    # transaction dates, not the period label — a statement saved under one
+    # date routinely carries several days of rows.
+    bank_dates = {d for d in (_parse_flex_date(tx.get('date', '')) for tx in classified_txns) if d}
+    last_bank_date = max(bank_dates) if bank_dates else None
+
+    def _bucket(date_str):
+        d = _parse_flex_date(date_str)
+        if last_bank_date is None or d is None:
+            return 'missing'
+        return 'pending' if d > last_bank_date else 'missing'
+
+    unmatched_disb, pending_disb = [], []
     for r in records:
         did   = r.get('Disbursement ID', '')
         ddate = str(r.get('Disbursement Date', '') or '')
@@ -3700,14 +3729,13 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
         debit_note = str(r.get('Debit Note', '') or '').strip()
         if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(debit_note)):
             continue
-        unmatched_disb.append({
-            'disb_id': did, 'date': ddate,
-            'customer': r.get('Customer Name', ''),
-            'amount': _to_num(r.get('Amount', 0)),
-            'utr': debit_note,
-        })
+        entry = {'disb_id': did, 'date': ddate,
+                 'customer': r.get('Customer Name', ''),
+                 'amount': _to_num(r.get('Amount', 0)),
+                 'utr': debit_note}
+        (pending_disb if _bucket(ddate) == 'pending' else unmatched_disb).append(entry)
 
-    unmatched_coll = []
+    unmatched_coll, pending_coll = [], []
     for mc in mc_rows:
         did   = (mc[0] if len(mc) > 0 else '').strip()
         pdate = mc[1] if len(mc) > 1 else ''
@@ -3716,21 +3744,61 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
         credit_note = mc[3] if len(mc) > 3 else ''
         if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(credit_note)):
             continue
-        unmatched_coll.append({
-            'disb_id': did, 'date': pdate,
-            'customer': mc[4] if len(mc) > 4 else '',
-            'amount': _clean_amount(mc[2]) if len(mc) > 2 else 0,
-            'utr_or_note': credit_note,
-        })
+        entry = {'disb_id': did, 'date': pdate,
+                 'customer': mc[4] if len(mc) > 4 else '',
+                 'amount': _clean_amount(mc[2]) if len(mc) > 2 else 0,
+                 'utr_or_note': credit_note}
+        (pending_coll if _bucket(str(pdate)) == 'pending' else unmatched_coll).append(entry)
 
     return {
+        'reconciled_through': last_bank_date.strftime('%d-%m-%Y') if last_bank_date else None,
         'unmatched_disbursements': unmatched_disb,
         'unmatched_disbursements_count': len(unmatched_disb),
         'unmatched_disbursements_total': round(sum(d['amount'] for d in unmatched_disb), 2),
         'unmatched_collections': unmatched_coll,
         'unmatched_collections_count': len(unmatched_coll),
         'unmatched_collections_total': round(sum(c['amount'] for c in unmatched_coll), 2),
+        # Dated past the reconciled window — awaiting a statement, not missing.
+        'pending_disbursements': pending_disb,
+        'pending_disbursements_count': len(pending_disb),
+        'pending_disbursements_total': round(sum(d['amount'] for d in pending_disb), 2),
+        'pending_collections': pending_coll,
+        'pending_collections_count': len(pending_coll),
+        'pending_collections_total': round(sum(c['amount'] for c in pending_coll), 2),
     }
+
+def _account_day_gaps(periods, upto=None):
+    """Days each account has NO bank transaction while another account does.
+
+    A day genuinely without activity looks identical to a day never
+    uploaded — unless a different account moved money that day, which makes
+    it a business day and the silence suspicious. That comparison is what
+    isolates a real hole: on 13-08-2026 it showed IDFC had no rows for
+    02-Aug or 11-Aug while HDFC had both, and the 11-Aug one was exactly
+    why a real disbursement (BLP-110826-398, an IDFC UTR) had no bank
+    evidence. Reported per account so the fix is obvious: re-upload that
+    account's statement for those days.
+    """
+    by_acct = {}
+    for p in periods:
+        for tx in p['txns']:
+            d = _parse_flex_date(tx.get('date', ''))
+            if d and (upto is None or d <= upto):
+                by_acct.setdefault(p['account'], set()).add(d)
+    if len(by_acct) < 2:
+        return {}
+    all_days = set().union(*by_acct.values())
+    gaps = {}
+    for acct, days in by_acct.items():
+        if not days:
+            continue
+        # Only inside the window this account actually covers — before its
+        # first day or after its last is coverage, not a gap.
+        lo, hi = min(days), max(days)
+        missing = sorted(d for d in all_days if lo <= d <= hi and d not in days)
+        if missing:
+            gaps[acct] = [d.strftime('%d-%m-%Y') for d in missing]
+    return gaps
 
 # ── Sheet 1: Statement ────────────────────────────────────────────────────────
 
@@ -5841,6 +5909,7 @@ HTML = """<!DOCTYPE html>
       </div>
 
       <!-- Statements are reconciled to different dates -->
+      <div id="account-gap-note" style="display:none;margin-bottom:14px;padding:10px 12px;border:1px solid #e0a0a0;background:#fdecea;color:#8a2020;border-radius:6px;font-size:.82rem"></div>
       <div id="date-mismatch-note" style="display:none;margin-bottom:14px;padding:10px 12px;border:1px solid #e0c060;background:#fff3cd;color:#7a5c00;border-radius:6px;font-size:.82rem"></div>
 
       <!-- One block per uploaded statement, built by renderReconResult() -->
@@ -7169,18 +7238,39 @@ function _statementBlock(st, si) {
     + (v.dr ? ` &nbsp;Dr \u20b9${fmtDec(v.dr)}` : "")
     + (v.cr ? ` &nbsp;Cr \u20b9${fmtDec(v.cr)}` : "") + `</span>`).join("");
 
+  // Two very different findings, deliberately styled apart: entries dated
+  // PAST the reconciled window are simply awaiting a statement (blue,
+  // informational), while entries INSIDE the window with no bank line are
+  // the real red flag (red). Merging them made a normal day's business look
+  // like a 15.3 lakh hole on 13-08-2026 and cost an hour chasing it.
   const bc = st.book_completeness;
-  const bcHtml = (bc && (bc.unmatched_disbursements_count || bc.unmatched_collections_count))
-    ? `<div class="section" style="background:#fff5f5;border-color:#e0b0b0;margin-top:12px">
-         <h3 style="color:#a00">📋 Book vs Bank Completeness <span style="font-weight:400;color:#888">\u2014 ${bc.unmatched_disbursements_count} disb. + ${bc.unmatched_collections_count} coll. not found in bank</span></h3>
-         <div style="font-size:.83rem">` +
-         (bc.unmatched_disbursements_count
-           ? `<p><b>Disbursements not found in bank (\u20b9${fmtDec(bc.unmatched_disbursements_total)}):</b></p>`
-             + buildUnmatchedTable(bc.unmatched_disbursements, 'Debit Note') : '') +
-         (bc.unmatched_collections_count
-           ? `<p style="margin-top:12px"><b>Collections not found in bank (\u20b9${fmtDec(bc.unmatched_collections_total)}):</b></p>`
-             + buildUnmatchedTable(bc.unmatched_collections, 'UTR / Note') : '') +
-       `</div></div>` : '';
+  const realMissing = bc && (bc.unmatched_disbursements_count || bc.unmatched_collections_count);
+  const pending     = bc && (bc.pending_disbursements_count || bc.pending_collections_count);
+  const bcHtml =
+    (realMissing
+      ? `<div class="section" style="background:#fff5f5;border-color:#e0b0b0;margin-top:12px">
+           <h3 style="color:#a00">\u26a0\ufe0f In the reconciled window but no bank line <span style="font-weight:400;color:#888">\u2014 ${bc.unmatched_disbursements_count} disb. + ${bc.unmatched_collections_count} coll.</span></h3>
+           <p style="font-size:.8rem;color:#666;margin:0 0 10px">Dated <b>on or before ${bc.reconciled_through||'\u2014'}</b>, which the uploaded statements cover \u2014 so a matching bank entry should exist and doesn't. Worth investigating.</p>
+           <div style="font-size:.83rem">`
+        + (bc.unmatched_disbursements_count
+            ? `<p><b>Disbursements (\u20b9${fmtDec(bc.unmatched_disbursements_total)}):</b></p>`
+              + buildUnmatchedTable(bc.unmatched_disbursements, 'Debit Note') : '')
+        + (bc.unmatched_collections_count
+            ? `<p style="margin-top:12px"><b>Collections (\u20b9${fmtDec(bc.unmatched_collections_total)}):</b></p>`
+              + buildUnmatchedTable(bc.unmatched_collections, 'UTR / Note') : '')
+        + `</div></div>` : '')
+    + (pending
+      ? `<div class="section" style="background:#f2f7fd;border-color:#b8d0ea;margin-top:12px">
+           <h3 style="color:#12467e">🕓 Awaiting a bank statement <span style="font-weight:400;color:#555">\u2014 ${bc.pending_disbursements_count} disb. + ${bc.pending_collections_count} coll.</span></h3>
+           <p style="font-size:.8rem;color:#555;margin:0 0 10px">Booked <b>after ${bc.reconciled_through||'\u2014'}</b>, the last day any uploaded statement reaches. Nothing is wrong \u2014 these reconcile the moment that day's statement goes up. <b>This is not missing money.</b></p>
+           <div style="font-size:.83rem">`
+        + (bc.pending_disbursements_count
+            ? `<p><b>Disbursements (\u20b9${fmtDec(bc.pending_disbursements_total)}):</b></p>`
+              + buildUnmatchedTable(bc.pending_disbursements, 'Debit Note') : '')
+        + (bc.pending_collections_count
+            ? `<p style="margin-top:12px"><b>Collections (\u20b9${fmtDec(bc.pending_collections_total)}):</b></p>`
+              + buildUnmatchedTable(bc.pending_collections, 'UTR / Note') : '')
+        + `</div></div>` : '');
 
   const to = st.account_tieout || {};
   let toHtml = '';
@@ -7294,6 +7384,23 @@ function renderReconResult(r) {
 
   // Accounts reconciled to different dates is the one state in which a
   // transfer between them is missing from the combined bank total.
+  // A day with no rows for one account, while another account moved money
+  // that same day, is the signature of a statement never uploaded — and it
+  // is exactly why a real IDFC disbursement on 11-Aug had no bank evidence.
+  const gaps = r.account_day_gaps || {};
+  const gapNames = Object.keys(gaps);
+  const gapEl = document.getElementById("account-gap-note");
+  if (gapEl) {
+    if (gapNames.length) {
+      gapEl.style.display = "block";
+      gapEl.innerHTML = `⚠️ <b>Days missing from an account's history.</b> These days have transactions in another account but none in this one — usually a statement that was never uploaded, which leaves real entries with no bank evidence:<br>`
+        + gapNames.map(a => `&nbsp;&nbsp;<b>${a}</b>: ${gaps[a].join(', ')}`).join('<br>')
+        + `<br><span style="font-size:.78rem">Re-upload those days for that account to close the gap.</span>`;
+    } else {
+      gapEl.style.display = "none";
+    }
+  }
+
   const dm = document.getElementById("date-mismatch-note");
   if (r.date_mismatch) {
     dm.style.display = "block";
@@ -9152,6 +9259,15 @@ def api_reconcile_parse():
                 if (period_month and st['account']) else {'status': 'no_account_selected'})
 
         ok_stmts = [s for s in statements if not s.get('error')]
+        # Days one account is silent while another moved money — the only
+        # reliable way to tell "no activity" from "never uploaded".
+        try:
+            gap_periods = list(saved_periods) + [
+                {'account': s['account'] or s['filename'], 'txns': s['transactions']}
+                for s in ok_stmts]
+            account_day_gaps = _account_day_gaps(gap_periods)
+        except Exception:
+            account_day_gaps = {}
         # Two accounts reconciled to DIFFERENT dates is the exact state in
         # which a transfer between them vanishes from the combined bank total
         # — it has left one account but not yet arrived in the other. Uploading
@@ -9166,6 +9282,7 @@ def api_reconcile_parse():
             'cross_account_pairs': cross_pairs,
             'cross_account_total': round(sum(p['amount'] for p in cross_pairs), 2),
             'date_mismatch': date_mismatch,
+            'account_day_gaps': account_day_gaps,
             # Flat mirror of the first statement, so an older cached page that
             # still expects the single-file shape keeps rendering.
             'opening_balance':  first.get('opening_balance', 0),
