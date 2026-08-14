@@ -2577,7 +2577,7 @@ def get_today_summary():
     fd_incomplete = False
     try:
         fd_ledger_info = _fd_ledger()
-        orphans = fd_ledger_info.get('orphan_sweepins') or {}
+        orphans = fd_ledger_info.get('orphans_unexplained') or {}
         unparsed = fd_ledger_info.get('unparsed') or []
         fd_incomplete = bool(orphans or unparsed)
         fd_outstanding = max(0.0, fd_ledger_info['fd_total'])
@@ -2991,6 +2991,14 @@ def parse_bank_statement(filepath, filename, bank_accounts=None):
         # genuine transaction and its balance cell should always be trusted.
         last_balance = balance
 
+        # Collapse the bank's own line wrapping. IDFC wraps long narrations
+        # mid-phrase, so the stored text is literally "Sweepout FD\n<acct>
+        # booked" -- and `\bfd\b.*\bbooked\b` cannot match across a newline
+        # because `.` excludes it. Six August sweep-outs worth Rs 1.23 crore
+        # were therefore typed Expense instead of FD Booking, which zeroed the
+        # FD balance and would have charged the lot to the P&L. Normalising
+        # once here means no downstream pattern ever has to think about it.
+        desc = ' '.join(desc.split())
         rows.append({'date': date_val, 'description': desc, 'utr': utr,
                      'debit': debit, 'credit': credit, 'balance': balance})
 
@@ -3141,8 +3149,13 @@ def _looks_like_own_transfer(desc):
         or re.search(r'chq\s*dep\b[^/]*(?:/[^/]*){0,2}/\s*bridgeline', desc, re.IGNORECASE)
     )
 
+def _norm_ws(text):
+    """Bank narration with its line wrapping collapsed. Any matcher that
+    looks for two words in sequence must run on this, never on raw text."""
+    return ' '.join(str(text or '').split())
+
 def _is_fd_booking(desc):
-    return bool(re.search(r'\bfd\b.*\bbooked\b', desc, re.IGNORECASE))
+    return bool(re.search(r'\bfd\b.*\bbooked\b', _norm_ws(desc), re.IGNORECASE))
 
 def _is_expense_debit(desc, amt):
     """Return True if this debit is an operating expense (not a loan disbursement)."""
@@ -4519,7 +4532,7 @@ def _all_time_recon_totals(periods=None):
             # debit is money out) so an unrecognised type can never again
             # silently swallow cash; _money_integrity_check() reports it by
             # name so it gets a proper role.
-            _role = CASH_ROLE.get((tx['type'] or '').strip())
+            _role = CASH_ROLE.get(_effective_type(tx))
             if _role in ('expense', 'withdrawal'):
                 expense_total += tx['debit'] - tx['credit']
             elif _role is None and tx['debit'] > tx['credit']:
@@ -4610,9 +4623,20 @@ def _fd_ledger(periods=None):
     for p in sorted(periods, key=_rdk, reverse=True):
         acct = p['account']
         for tx in p['txns']:
-            if (tx.get('type') or '').strip() != 'FD Booking':
+            # The NARRATION decides, not the stored type. A row is an FD leg
+            # because it says "Sweepout FD <acct> booked" or "Auto sweep in
+            # from <acct>" -- reading a type that some earlier classification
+            # pass happened to write is one indirection too many, and it is
+            # what hid Rs 1.23 crore of August sweep-outs stored as Expense.
+            # Keying off the evidence means already-saved rows heal
+            # themselves with no re-upload.
+            desc_ws = _norm_ws(tx.get('description', ''))
+            is_fd_leg = (any(pat.search(desc_ws) for pat in FD_OUT_PATTERNS)
+                         or any(pat.search(desc_ws) for pat in FD_IN_PATTERNS)
+                         or (tx.get('type') or '').strip() == 'FD Booking')
+            if not is_fd_leg:
                 continue
-            desc = tx.get('description', '') or ''
+            desc = desc_ws
             dr, cr = tx['debit'], tx['credit']
             key = (acct, tx['date'], desc, dr, cr, tx['balance'])
             if key in seen_txn_keys:
@@ -4650,6 +4674,17 @@ def _fd_ledger(periods=None):
                 e['swept_in'] += cr
                 e['sweepin_dates'].append(tx.get('date'))
 
+    # Earliest day we hold for each account. An FD that swept back shortly
+    # after that day was booked before our records begin -- we could never
+    # have seen it, so it is explained, not a gap. Anything sweeping back
+    # later than that means a booking we SHOULD have and don't.
+    first_seen = {}
+    for p in periods:
+        for tx in p['txns']:
+            d = _parse_flex_date(tx.get('date', ''))
+            if d and (p['account'] not in first_seen or d < first_seen[p['account']]):
+                first_seen[p['account']] = d
+
     open_fds, orphans = {}, {}
     total = 0.0
     for fd_no, e in fds.items():
@@ -4657,6 +4692,14 @@ def _fd_ledger(periods=None):
         e['swept_in'] = round(e['swept_in'], 2)
         e['remaining'] = round(e['booked'] - e['swept_in'], 2)
         if e['booked'] <= 0 and e['swept_in'] > 0:
+            start = first_seen.get(e['account'])
+            first_in = min((d for d in (_parse_flex_date(x) for x in e['sweepin_dates']) if d),
+                           default=None)
+            # 30 days: these are short-term sweep deposits, so a booking more
+            # than a month before its sweep-in is not plausible. The real
+            # case this covers is HDFC FD 50301355033761 -- Rs 2,13,765 that
+            # swept back 20-Jul-2026 against history starting 01-Jul.
+            e['pre_history'] = bool(start and first_in and (first_in - start).days <= 30)
             orphans[fd_no] = e
             continue
         # Clamp at zero: a fully-swept FD holds nothing, and any excess that
@@ -4671,6 +4714,12 @@ def _fd_ledger(periods=None):
         'open_fd_count': len(open_fds),
         'orphan_sweepins': orphans,
         'orphan_sweepin_total': round(sum(o['swept_in'] for o in orphans.values()), 2),
+        # Orphans that predate our records are permanent and understood;
+        # only the rest mean data actually went missing, so only the rest
+        # may disqualify the derived FD figure.
+        'orphans_unexplained': {k: v for k, v in orphans.items() if not v.get('pre_history')},
+        'orphans_unexplained_total': round(
+            sum(o['swept_in'] for o in orphans.values() if not o.get('pre_history')), 2),
         'unparsed': unparsed,
         'unparsed_net': round(sum(u['debit'] - u['credit'] for u in unparsed), 2),
         'latest_fd_txn_date': latest_fd_txn_date,
@@ -4989,7 +5038,7 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
                 first_date = d if first_date is None or d < first_date else first_date
                 last_date = d if last_date is None or d > last_date else last_date
 
-            t = (tx.get('type') or '').strip() or '(blank)'
+            t = _effective_type(tx) or '(blank)'
             if k in contra_paired_keys:
                 t = 'Contra'          # matched to its counter-leg in another own account
             role = CASH_ROLE.get(t)
@@ -5207,6 +5256,22 @@ REPORT_GST_RATE = 0.18
 # about any particular transaction.
 UNIDENTIFIED_MATERIALITY = 50000
 
+def _effective_type(tx):
+    """A stored row's type, corrected where its own narration contradicts it.
+
+    Only ever upgrades an FD sweep leg that was mis-typed because the bank
+    wrapped the narration across lines (see _norm_ws). Read-time repair, so
+    already-saved rows are right without a re-save -- same approach as
+    _cross_account_contra_pairs(). Without this the six August sweep-outs
+    sit in the P&L as Rs 1.23 crore of operating expenses."""
+    stored = (tx.get('type') or '').strip()
+    if stored == 'FD Booking':
+        return stored
+    d = _norm_ws(tx.get('description', ''))
+    if any(pat.search(d) for pat in FD_OUT_PATTERNS) or any(pat.search(d) for pat in FD_IN_PATTERNS):
+        return 'FD Booking'
+    return stored
+
 def _gst_of(record):
     """The Accounts sheet's GST header carries a narrow no-break space, so a
     plain 'GST (18%)' string literal never matches it. Find it by prefix."""
@@ -5295,7 +5360,7 @@ def _period_financials(from_date=None, to_date=None, periods=None, records=None,
                 continue
             if k in contra_paired_keys:
                 continue          # own-account transfer, not income or cost
-            role = CASH_ROLE.get((tx.get('type') or '').strip())
+            role = CASH_ROLE.get(_effective_type(tx))
             net_out = tx['debit'] - tx['credit']
             if role == 'expense':
                 # Re-derive from the narration rather than trusting the label
