@@ -3670,6 +3670,25 @@ def _ref_present_in_bank_text(ref_text, bank_descs_upper):
     ref_norm = ref_text.strip().upper()
     if not ref_norm:
         return False
+    # An index prepared by _build_bank_ref_index() when the caller has many
+    # refs to test. Same answers, but the per-description digit-stripping and
+    # word-splitting happen once for the whole batch instead of once per ref.
+    # A full month of two accounts is ~500 bank rows against ~400 book
+    # entries; redoing that work per ref is 200,000 regex passes and can push
+    # the request past its 60s limit.
+    if isinstance(bank_descs_upper, dict):
+        idx = bank_descs_upper
+        if ref_norm in idx['blob']:
+            return True
+        sig = _narrative_signature(ref_text)
+        if not sig:
+            return False
+        tail, names = sig
+        for digits, words in idx['rows']:
+            if tail in digits and (names & words):
+                return True
+        return False
+
     if any(ref_norm in d for d in bank_descs_upper):
         return True
     sig = _narrative_signature(ref_text)
@@ -3680,6 +3699,20 @@ def _ref_present_in_bank_text(ref_text, bank_descs_upper):
         if tail in re.sub(r'\D', '', d) and (names & {w for w in re.split(r'[^A-Za-z]+', d) if len(w) >= 4}):
             return True
     return False
+
+def _build_bank_ref_index(bank_descs_upper):
+    """Precomputed form of the description list for _ref_present_in_bank_text.
+
+    'blob' is every narration joined by a separator no reference can span, so
+    one substring scan replaces a per-description loop. 'rows' caches the
+    digits-only and long-word forms each narrative-signature comparison would
+    otherwise recompute for every ref tested."""
+    return {
+        'blob': '\x00'.join(bank_descs_upper),
+        'rows': [(re.sub(r'\D', '', d),
+                  {w for w in re.split(r'[^A-Za-z]+', d) if len(w) >= 4})
+                 for d in bank_descs_upper],
+    }
 
 
 def _book_completeness(records, mc_rows, classified_txns, period_month):
@@ -3707,6 +3740,8 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
     """
     disb_by_ref, coll_by_ref = _bank_matched_refs(classified_txns)
     bank_descs_upper = [tx.get('description', '').upper() for tx in classified_txns]
+    # Built once for the whole book scan below — see _build_bank_ref_index().
+    bank_idx = _build_bank_ref_index(bank_descs_upper)
 
     # The last day ANY bank statement in play actually reaches. Derived from
     # transaction dates, not the period label — a statement saved under one
@@ -3727,7 +3762,7 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
         if not did or not _date_in_period(ddate, period_month) or did in disb_by_ref:
             continue
         debit_note = str(r.get('Debit Note', '') or '').strip()
-        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(debit_note)):
+        if any(_ref_present_in_bank_text(tok, bank_idx) for tok in _split_ref_tokens(debit_note)):
             continue
         entry = {'disb_id': did, 'date': ddate,
                  'customer': r.get('Customer Name', ''),
@@ -3742,7 +3777,7 @@ def _book_completeness(records, mc_rows, classified_txns, period_month):
         if not did or not _date_in_period(str(pdate), period_month) or did in coll_by_ref:
             continue
         credit_note = mc[3] if len(mc) > 3 else ''
-        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(credit_note)):
+        if any(_ref_present_in_bank_text(tok, bank_idx) for tok in _split_ref_tokens(credit_note)):
             continue
         entry = {'disb_id': did, 'date': pdate,
                  'customer': mc[4] if len(mc) > 4 else '',
@@ -4309,12 +4344,53 @@ def _load_recon_periods(ws):
                 'match_notes': row[16] if len(row) > 16 else '',
             })
 
+    # A period whose transaction dates fall entirely inside a LATER-SAVED
+    # period for the same account is superseded by it, and must not be read
+    # alongside it.
+    #
+    # "Latest Batch ID wins" above only replaces a period saved under the
+    # exact same (recon_date, account). Uploading a whole month's statement
+    # creates a NEW key — so every day already reconciled inside that month
+    # would be counted twice: twice in the downloaded workbook, twice in the
+    # per-account tie-out, twice everywhere that doesn't happen to carry its
+    # own content-key dedup. Four aggregate functions do carry that dedup and
+    # would have survived; the workbook and the tie-out would not.
+    #
+    # Fixed at the read layer on purpose: nothing is deleted, a wider upload
+    # simply outranks the narrower ones it contains, and re-uploading a
+    # single day afterwards (a later batch, narrower range) is still honoured
+    # for the days it covers because containment is checked both ways.
+    def _range(p):
+        ds = [d for d in (_parse_flex_date(t.get('date', '')) for t in p['txns']) if d]
+        return (min(ds), max(ds)) if ds else None
+
+    ranged = [(p, _range(p)) for p in batches.values()]
+    superseded = set()
+    for i, (p, rp) in enumerate(ranged):
+        if rp is None:
+            continue
+        for j, (q, rq) in enumerate(ranged):
+            if i == j or rq is None or q['account'] != p['account']:
+                continue
+            covers = rq[0] <= rp[0] and rq[1] >= rp[1]
+            if not covers:
+                continue
+            # Identical ranges: only the later batch survives. Strict
+            # containment: the wider one wins regardless of which is newer,
+            # since it is by definition the more complete record.
+            same = rq == rp
+            if (same and q['batch_id'] > p['batch_id']) or (not same):
+                superseded.add(id(p))
+                break
+
+    kept = [p for p in batches.values() if id(p) not in superseded]
+
     def _period_sort_key(p):
         try:
             return datetime.strptime(p['recon_date'], '%d-%m-%Y')
         except Exception:
             return datetime.min
-    return sorted(batches.values(), key=_period_sort_key)
+    return sorted(kept, key=_period_sort_key)
 
 def _all_time_recon_totals(periods=None):
     """All-time Expense/FD totals across every saved reconciliation period
@@ -4714,6 +4790,7 @@ def _pair_uploaded_statements(statements):
             legs.append({'si': si, 'ti': ti, 'date': d, 'already': already,
                          'acct': st['account'] or f'File {si + 1}',
                          'desc': (tx.get('description') or '')[:110],
+                         'utr': tx.get('utr', '') or '',
                          'debit': tx.get('debit', 0) or 0, 'credit': tx.get('credit', 0) or 0})
 
     debits  = [l for l in legs if l['debit']  >= CONTRA_PAIR_MIN_AMOUNT]
@@ -4737,8 +4814,35 @@ def _pair_uploaded_statements(statements):
         if best is None:
             continue
         i, gap = best
-        used.add(i)
         cr = credits[i]
+        # Amount + direction + date alone is not enough evidence at month
+        # scale. Across one day's statements a same-amount debit and credit
+        # in different accounts is almost certainly a transfer; across a
+        # whole month of ~500 rows per account, a disbursement and an
+        # unrelated collection of the same size a day apart is ordinary.
+        # So require one leg to positively say "this is our own money":
+        # narration naming us, a leg already typed Contra, or a reference
+        # shared by both legs. All three real cases fixed this week satisfy
+        # this — the Rs 18,00,000 RTGS (narration names BRIDGELINE PARTNERS),
+        # the Rs 75,000 cheque (Saraswat leg already Contra), and the IDFC
+        # opening deposit. A transfer with no corroboration at all is left
+        # for the review queue and for _cross_account_contra_pairs() at read
+        # time, where a wrong guess costs nothing.
+        def _shared_ref(a, b):
+            ta = {t for t in _split_ref_tokens(a.get('utr', '') or '') if len(t) >= 6}
+            tb = {t for t in _split_ref_tokens(b.get('utr', '') or '') if len(t) >= 6}
+            if ta & tb:
+                return True
+            da, db = (a.get('desc') or '').upper(), (b.get('desc') or '').upper()
+            return any(t in db for t in ta) or any(t in da for t in tb)
+
+        corroborated = (dr['already'] or cr['already']
+                        or _looks_like_own_transfer(dr.get('desc', '') or '')
+                        or _looks_like_own_transfer(cr.get('desc', '') or '')
+                        or _shared_ref(dr, cr))
+        if not corroborated:
+            continue
+        used.add(i)
         retyped = []
         for leg, side in ((dr, 'outgoing leg'), (cr, 'incoming leg')):
             if leg['already']:
@@ -4854,7 +4958,7 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
         if not did or not _in_window(r.get('Disbursement Date', '')) or did in disb_by_ref:
             continue
         note = str(r.get('Debit Note', '') or '').strip()
-        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(note)):
+        if any(_ref_present_in_bank_text(tok, bank_idx) for tok in _split_ref_tokens(note)):
             continue
         book_unmatched_disb.append({'disb_id': did, 'customer': r.get('Customer Name', ''),
                                      'date': r.get('Disbursement Date', ''),
@@ -4864,7 +4968,7 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
         if not did or not _in_window(mc[1] if len(mc) > 1 else '') or did in coll_by_ref:
             continue
         note = mc[3] if len(mc) > 3 else ''
-        if any(_ref_present_in_bank_text(tok, bank_descs_upper) for tok in _split_ref_tokens(note)):
+        if any(_ref_present_in_bank_text(tok, bank_idx) for tok in _split_ref_tokens(note)):
             continue
         book_unmatched_coll.append({'disb_id': did, 'date': mc[1] if len(mc) > 1 else '',
                                      'amount': _clean_amount(mc[2]) if len(mc) > 2 else 0})
@@ -5391,6 +5495,53 @@ def _solvency_check():
         'day_level_gaps': day_gaps,
     }
 
+def _supersede_covered_periods(txns_ws, account, classified):
+    """Delete Recon Txns rows for `account` that the statement being saved
+    now covers, so a wider upload REWRITES the days inside it.
+
+    Only rows whose own transaction date falls inside the new statement's
+    date span are removed, and only for this account — a day outside the
+    span, or another account's row, is never touched. Deletes bottom-up in
+    contiguous blocks (rows are appended per batch, so a superseded period is
+    almost always one block) to keep this to a couple of API calls.
+
+    Returns the number of rows removed, for reporting. A failure here is
+    swallowed: it degrades to the read-time containment rule in
+    _load_recon_periods(), which produces the same numbers without touching
+    the sheet, so a Sheets hiccup can never cost a save.
+    """
+    dates = [d for d in (_parse_flex_date(tx.get('date', '')) for tx in classified) if d]
+    if not dates or not account:
+        return 0
+    lo, hi = min(dates), max(dates)
+    try:
+        vals = txns_ws.get_all_values()
+    except Exception:
+        return 0
+    doomed = []
+    for i, row in enumerate(vals[1:], start=2):     # 1-based, skipping header
+        if len(row) < 14 or not row[0] or row[2] != account:
+            continue
+        d = _parse_flex_date(row[7])
+        if d and lo <= d <= hi:
+            doomed.append(i)
+    if not doomed:
+        return 0
+    blocks, start, prev = [], doomed[0], doomed[0]
+    for r in doomed[1:]:
+        if r == prev + 1:
+            prev = r; continue
+        blocks.append((start, prev)); start = prev = r
+    blocks.append((start, prev))
+    removed = 0
+    for a, b in sorted(blocks, reverse=True):       # bottom-up: indices above stay valid
+        try:
+            txns_ws.delete_rows(a, b)
+            removed += b - a + 1
+        except Exception:
+            pass
+    return removed
+
 def save_reconciliation(recon_date, opening_balance, closing_balance, transactions,
                          remarks='', remarks_map=None, account=''):
     """Persists this period's classified transactions to the 'Recon Txns'
@@ -5434,6 +5585,14 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
     # through one rebuild path.
     txns_ws = get_recon_txns_sheet(sh)
     batch_id = datetime.now().strftime('%Y%m%d%H%M%S')
+    # A wider statement REWRITES the days it covers (Prem, 13-08-2026: "u
+    # just rewrite the entire month"). Uploading August in one file must
+    # replace the daily August periods already saved for that account, not
+    # sit alongside them — otherwise every day already reconciled is counted
+    # twice in the workbook and the tie-out. Physically removed rather than
+    # only outranked at read time so the Recon Txns tab stays true to what
+    # the books actually use.
+    superseded_rows = _supersede_covered_periods(txns_ws, account, classified)
     txns_ws.append_rows([[
         batch_id, recon_date, account, period_label,
         opening_balance, closing_balance, remarks,
@@ -5503,6 +5662,9 @@ def save_reconciliation(recon_date, opening_balance, closing_balance, transactio
         'total_credit': total_cr,
         'closing':      closing_balance,
         'rows_saved':   len(transactions),
+        # Rows this upload rewrote, so a wider statement replacing narrower
+        # ones is reported rather than happening silently.
+        'rows_superseded': superseded_rows,
         'filename':     filename,
         'file_bytes':   buf.getvalue(),
     }
@@ -7523,7 +7685,7 @@ async function saveRecon() {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(url);
     const detail = perAccount.length
-      ? perAccount.map(s => `${s.account} ${s.date}: ${s.rows} txns, closing ₹${fmtDec(s.closing)}`).join(' · ')
+      ? perAccount.map(s => `${s.account} ${s.date}: ${s.rows} txns${s.replaced ? ', rewrote ' + s.replaced + ' earlier row(s)' : ''}, closing ₹${fmtDec(s.closing)}`).join(' · ')
       : `${rowsSaved} transactions`;
     showStatus('recon-status','success',
       `✅ Downloaded ${filename} (full history) — ${detail}`);
@@ -9589,7 +9751,8 @@ def api_reconcile_save():
                     account=st.get('account', ''),
                 )
                 saved.append({'account': st['account'], 'date': st['date'],
-                              'rows': result['rows_saved'], 'closing': result['closing']})
+                              'rows': result['rows_saved'], 'closing': result['closing'],
+                              'replaced': result.get('rows_superseded', 0)})
             except Exception as e:
                 done = ', '.join(f"{s['account']} ({s['rows']} rows)" for s in saved) or 'none'
                 raise RuntimeError(
