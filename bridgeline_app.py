@@ -2460,7 +2460,7 @@ def _account_tieout(records, mc_rows, account, period_month, classified_txns, st
     # read as an unexplained discrepancy.
     expense_total = sum(t['debit'] for t in classified_txns if t['type'] == 'Expense')
     capital_net = (sum(t['credit'] for t in classified_txns if t['type'] in ('Capital In', 'Contra'))
-                   - sum(t['debit'] for t in classified_txns if t['type'] in ('Capital Out', 'FD Booking', 'Contra')))
+                   - sum(t['debit'] for t in classified_txns if t['type'] in ('Capital Out', 'FD Booking', 'FD Sweep-In', 'Contra')))
 
     return {
         'status': 'ok',
@@ -3162,8 +3162,18 @@ def _norm_ws(text):
     looks for two words in sequence must run on this, never on raw text."""
     return ' '.join(str(text or '').split())
 
+FD_OUT_TYPE = 'FD Booking'    # money leaving the account INTO a deposit
+FD_IN_TYPE  = 'FD Sweep-In'   # deposit maturing/sweeping BACK into the account
+FD_TYPES    = (FD_OUT_TYPE, FD_IN_TYPE)
+
 def _is_fd_booking(desc):
     return bool(re.search(r'\bfd\b.*\bbooked\b', _norm_ws(desc), re.IGNORECASE))
+
+def _is_fd_sweep_in(desc):
+    return bool(re.search(r'\bfd\b.*(?:clos|matur|premat|redeem|sweep|liquidat)'
+                          r'|(?:sweep|swp).*(?:trf|transfer|cr)'
+                          r'|prin\s*\+\s*int|sweep\s*in\s*from',
+                          _norm_ws(desc), re.IGNORECASE))
 
 def _is_expense_debit(desc, amt):
     """Return True if this debit is an operating expense (not a loan disbursement)."""
@@ -3636,13 +3646,15 @@ def _match_transactions(txns, records, mc_rows):
             elif re.search(r'credit\s*int(?:erest)?|int(?:erest)?\s*(?:pd|paid|credit)|\bint\.?\s*pd\b|\bsb\s*int\b|fd\s*int', desc, re.IGNORECASE):
                 tx_type = 'Interest Income'; tx_notes = 'Bank interest credit'
 
-            # FD principal sweeping/maturing back into the account — typed
-            # 'FD Booking' same as the outgoing booking so the net FD figure
-            # (_all_time_recon_totals) self-corrects: these are sweep-in FDs
-            # counted as available-to-disburse while parked, and must stop
-            # being counted the moment the money is back in the account.
-            elif re.search(r'\bfd\b.*(?:clos|matur|premat|redeem|sweep|liquidat)|(?:sweep|swp).*(?:trf|transfer|cr)|prin\s*\+\s*int|sweep\s*in\s*from', desc, re.IGNORECASE):
-                tx_type = 'FD Booking'; tx_notes = 'FD maturity / sweep-in credit'
+            # FD principal sweeping/maturing back into the account. This is
+            # the OPPOSITE of a booking -- money coming OUT of a deposit --
+            # and used to carry the same 'FD Booking' label, so the
+            # reconciliation showed credits labelled as bookings (Prem,
+            # 14-08-2026: "why is auto sweep in recorded as fd booked while
+            # it should be otherwise"). Same 'fd' cash role, so every net
+            # figure is unchanged; only the label is now honest.
+            elif _is_fd_sweep_in(desc):
+                tx_type = FD_IN_TYPE; tx_notes = 'FD maturity / sweep-in credit'
 
             # Pradaan routing = repayment routed via Pradaan account
             elif re.search(r'pradaan|pradan', desc, re.IGNORECASE):
@@ -3969,6 +3981,7 @@ def _sheet_statement(wb, period_label, remarks, opening, closing, classified_txn
         'Expense':                s['red_fill'],
         'Contra':                 s['blu_fill'],
         'FD Booking':             s['blu_fill'],
+        'FD Sweep-In':            s['blu_fill'],
         # Legacy labels — older stored periods still carry these type
         # strings and get rebuilt into every downloaded workbook.
         'Collection':             s['grn_fill'],
@@ -4550,7 +4563,7 @@ def _all_time_recon_totals(periods=None):
             # — so fd_total is always the amount CURRENTLY sitting in FDs,
             # and a matured FD can't be double-counted (once in the bank
             # balance and again as a parked FD).
-            elif tx['type'] == 'FD Booking':
+            elif tx['type'] in FD_TYPES:
                 fd_total += tx['debit'] - tx['credit']
             # Non-lending income arriving in the bank (interest credits,
             # misc receipts) — cash the lending books never see, so it must
@@ -4641,7 +4654,7 @@ def _fd_ledger(periods=None):
             desc_ws = _norm_ws(tx.get('description', ''))
             is_fd_leg = (any(pat.search(desc_ws) for pat in FD_OUT_PATTERNS)
                          or any(pat.search(desc_ws) for pat in FD_IN_PATTERNS)
-                         or (tx.get('type') or '').strip() == 'FD Booking')
+                         or (tx.get('type') or '').strip() in FD_TYPES)
             if not is_fd_leg:
                 continue
             desc = desc_ws
@@ -4764,6 +4777,7 @@ CASH_ROLE = {
     'Interest Income':          'income',
     'Other Income':             'income',
     'FD Booking':               'fd',
+    'FD Sweep-In':              'fd',   # same role: the other leg of one FD cycle
     'Contra':                   'contra',
     'Capital In':               'contra',       # legacy label
     'Capital Out':              'contra',       # legacy label
@@ -5421,11 +5435,13 @@ def _effective_type(tx, account='', overrides=None):
     if ov:
         return ov
     stored = (tx.get('type') or '').strip()
-    if stored == 'FD Booking':
-        return stored
     d = _norm_ws(tx.get('description', ''))
-    if any(pat.search(d) for pat in FD_OUT_PATTERNS) or any(pat.search(d) for pat in FD_IN_PATTERNS):
-        return 'FD Booking'
+    # Direction comes from the narration, so a row already saved as
+    # 'FD Booking' on the way IN corrects itself with no re-upload.
+    if any(pat.search(d) for pat in FD_IN_PATTERNS) or _is_fd_sweep_in(d):
+        return FD_IN_TYPE
+    if any(pat.search(d) for pat in FD_OUT_PATTERNS) or _is_fd_booking(d):
+        return FD_OUT_TYPE
     return stored
 
 def _gst_of(record):
@@ -7563,7 +7579,7 @@ async function parseStatement() {
   }
 }
 
-const BASE_TYPES = ['Disbursement','Repayment','Other Income','Expense','Contra','Interest Income','Skip'];
+const BASE_TYPES = ['Disbursement','Repayment','Other Income','Expense','Contra','Interest Income','FD Booking','FD Sweep-In','Skip'];
 const TYPE_COLOR = {
   'Disbursement':'#fff8e1','Repayment':'#e8f5e9','Other Income':'#e8f5e9','Interest Income':'#e8f5e9',
   'Expense':'#fce4ec','Contra':'#e3f2fd','Skip':'#eeeeee',
@@ -7934,7 +7950,7 @@ function renderReconResult(r) {
                             : `<span style="color:#1a5c3a;font-weight:600">Cr</span>`;
       const autoColor = ({Disbursement:"#b8860b",Repayment:"#1a5c3a",Collection:"#1a5c3a",
         "Other Income":"#1a5c3a","Interest Income":"#1a5c3a",Expense:"#c00",
-        "FD Booking":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
+        "FD Booking":"#1565c0","FD Sweep-In":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
       return `<tr style="background:${i%2?"#f8fbff":"white"}">
         <td style="font-size:.75rem;color:#12467e;font-weight:600">${statements[row.si].account || statements[row.si].filename}</td>
         <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
@@ -9863,7 +9879,7 @@ def api_reconcile_parse():
 
         def _needs_review(tx):
             if tx['match_basis'] in ('UTR', 'Manual', 'Cross-account'): return False
-            if tx['type'] in ('FD Booking', 'Test Credit'):             return False
+            if tx['type'] in ('FD Booking', 'FD Sweep-In', 'Test Credit'): return False
             if tx['credit'] > 0 and tx['credit'] < 100:                 return False
             return True
 
