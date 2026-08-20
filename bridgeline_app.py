@@ -2466,17 +2466,39 @@ def _account_tieout(records, mc_rows, account, period_month, classified_txns, st
                         f"Account tag — cannot reliably attribute book activity to \"{account}\" yet."),
         }
 
-    expected_closing = round(last_closing + activity['coll_total'] - activity['disb_total'], 2)
-    variance = round(statement_closing - expected_closing, 2)
-
-    # Context, not part of the formula: this statement's own Expense/Capital
-    # totals (already computed by _match_transactions on this same upload)
-    # are surfaced alongside the variance so a legitimate non-book cash
-    # movement (bank charges, FD booking, inter-account transfer) doesn't
-    # read as an unexplained discrepancy.
+    # Contra (internal transfers between our own accounts) and net FD
+    # movement (sweep-in credit minus booking debit) are REAL bank cash
+    # flows this specific account had this period -- they used to be
+    # computed and shown only as unreliable "context" alongside the
+    # variance, never actually added into expected_closing. On a normal
+    # day that made the variance line lie: IDFC's daily activity is now
+    # dominated by FD auto-sweeps (Prem, 12-08-2026: "its always there in
+    # the statement as sweep out or sweep in"), and Contra transfers
+    # between HDFC and IDFC are routine, so excluding both from the actual
+    # math produced a large, scary-looking variance on an ordinary day with
+    # nothing wrong -- confirmed live 20-08-2026: IDFC's ₹15,48,438
+    # "variance" reconciled to the exact paisa once FD net (₹11,48,438) and
+    # Contra (₹4,00,000) were folded into the formula instead of left as a
+    # footnote. This is what a human doing the same check by hand naturally
+    # includes, which is exactly why Prem's own manual check came up clean
+    # while the on-screen number didn't -- his was more complete, not
+    # wrong. Fixed by making expected_closing arithmetic close, not by
+    # asking anyone to read a side-note and do the addition themselves.
+    #
+    # Also note: the previous version's debit-only capital_net formula
+    # never added FD Sweep-In CREDITS anywhere (only ever subtracted their
+    # debit side, which is always 0 for a sweep-IN row) -- silently
+    # invisible to the old "context" figure even before FD Sweep-In existed
+    # as its own type. Fixed here as part of the same change.
+    contra_net = (sum(t['credit'] for t in classified_txns if t['type'] in ('Capital In', 'Contra'))
+                 - sum(t['debit'] for t in classified_txns if t['type'] in ('Capital Out', 'Contra')))
+    fd_net = (sum(t['credit'] for t in classified_txns if t['type'] == 'FD Sweep-In')
+             - sum(t['debit'] for t in classified_txns if t['type'] == 'FD Booking'))
     expense_total = sum(t['debit'] for t in classified_txns if t['type'] == 'Expense')
-    capital_net = (sum(t['credit'] for t in classified_txns if t['type'] in ('Capital In', 'Contra'))
-                   - sum(t['debit'] for t in classified_txns if t['type'] in ('Capital Out', 'FD Booking', 'FD Sweep-In', 'Contra')))
+
+    expected_closing = round(last_closing + activity['coll_total'] - activity['disb_total']
+                             + contra_net + fd_net, 2)
+    variance = round(statement_closing - expected_closing, 2)
 
     return {
         'status': 'ok',
@@ -2489,10 +2511,15 @@ def _account_tieout(records, mc_rows, account, period_month, classified_txns, st
         'variance': variance,
         'ok': abs(variance) <= 1.0,
         'this_statement_expense_total': round(expense_total, 2),
-        'this_statement_capital_net': round(capital_net, 2),
-        'note': ('Book-tagged view only — does not include expenses or internal transfers on this '
-                 'account this period; cross-check against the Expense/Capital figures above if the '
-                 'variance looks large.'),
+        'this_statement_capital_net': round(contra_net, 2),
+        'this_statement_fd_net': round(fd_net, 2),
+        'note': ('Includes tagged book Disbursements/Collections plus this statement\'s own Contra '
+                 'transfers and net FD sweep movement — every real cash flow this account had this '
+                 'period. A variance now means the books and bank genuinely disagree, not that a '
+                 'legitimate transfer or FD sweep was left out of the math. Expense is still shown '
+                 'separately, not netted in — a real expense should make the tagged view LOOK short '
+                 'by that amount, which is the correct signal that it needs a book entry, not '
+                 'something to silently absorb.'),
     }
 
 def get_today_summary():
@@ -7818,16 +7845,24 @@ function _statementBlock(st, si) {
       body = `<p style="color:#666">${to.message}</p>`;
     } else if (to.status === 'ok') {
       badge = `<span style="color:${to.ok?'#1a5c3a':'#c00'}">${to.ok ? '\u2014 \u2713 Matches' : '\u2014 \u2717 Mismatch'}</span>`;
+      // Every term shown here must actually sum to Expected closing below --
+      // Contra and net FD sweep used to be computed and shown only as an
+      // unreliable footnote while the real math silently left them out,
+      // which is why a routine Contra transfer or FD sweep day used to
+      // read as a scary, false variance (confirmed live 20-08-2026: IDFC's
+      // \u20b915,48,438 "mismatch" reconciled to the exact paisa once these
+      // were added to the actual formula, not just mentioned beside it).
       body = `
         <div>Last reconciled closing (${to.last_closing_date||'\u2014'}): <b>\u20b9${fmtDec(to.last_closing)}</b></div>
         <div>+ Tagged collections this period (${to.tagged_collected_count}): <b>\u20b9${fmtDec(to.tagged_collected)}</b></div>
         <div>\u2212 Tagged disbursements this period (${to.tagged_disbursed_count}): <b>\u20b9${fmtDec(to.tagged_disbursed)}</b></div>
+        <div>${to.this_statement_capital_net<0?'\u2212':'+'} Contra / internal transfers this period: <b>${_fmtSigned(to.this_statement_capital_net)}</b></div>
+        <div>${(to.this_statement_fd_net||0)<0?'\u2212':'+'} Net FD sweep this period: <b>${_fmtSigned(to.this_statement_fd_net||0)}</b></div>
         <div>= Expected closing: <b>\u20b9${fmtDec(to.expected_closing)}</b></div>
         <div>Statement's own closing: <b>\u20b9${fmtDec(to.statement_closing)}</b></div>
         <div style="color:${to.ok?'#1a5c3a':'#c00'};font-weight:700">Variance: ${_fmtSigned(to.variance)}</div>
         <div style="margin-top:8px;font-size:.78rem;color:#888">
-          This statement's own Expense total: \u20b9${fmtDec(to.this_statement_expense_total)} &nbsp;|&nbsp;
-          Capital In/Out net: ${_fmtSigned(to.this_statement_capital_net)}<br>${to.note||''}
+          This statement's own Expense total (shown separately, not netted \u2014 a real expense should widen this view, that's the correct signal it needs a book entry): \u20b9${fmtDec(to.this_statement_expense_total)}<br>${to.note||''}
         </div>`;
     }
     toHtml = `<div class="section" style="margin-top:12px">
