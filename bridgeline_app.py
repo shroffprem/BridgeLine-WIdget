@@ -1261,6 +1261,33 @@ def get_next_seq(records=None):
             max_seq = max(max_seq, int(m.group(1)))
     return max_seq + 1
 
+def _existing_disbursement_for_utr(utr, records=None, exclude_disb_id=None):
+    """The case (if any) that already cites this exact UTR as its own Debit
+    Note, across the full Accounts history (live + archive tabs).
+
+    A UTR names ONE real bank transaction; it cannot fund two disbursements.
+    Nothing enforced this before, so the same transfer was recorded as two
+    separate cases — BLP-130826-404 and -407, both citing
+    IDFBR62026081304024231 for Manjunath M, one collected against, one left
+    open — doubling his book liability by ₹5,02,950 with nothing anywhere
+    to notice. Prem, 20-08-2026: 'the app allowed the same to be recorded
+    twice.' Exact-match only (no fuzzy/substring matching) — a UTR is an
+    exact identifier, and a partial match here would block legitimate
+    transfers over a coincidental shared prefix/suffix."""
+    utr_norm = (utr or '').strip().upper()
+    if not utr_norm:
+        return None
+    if records is None:
+        records = read_accounts_from_gsheet()
+    for r in records:
+        did = (r.get('Disbursement ID', '') or '').strip()
+        if exclude_disb_id and did.upper() == exclude_disb_id.strip().upper():
+            continue
+        if (r.get('Debit Note', '') or '').strip().upper() == utr_norm:
+            return {'disb_id': did, 'customer': r.get('Customer Name', ''),
+                    'amount': _to_num(r.get('Amount', 0)), 'date': r.get('Disbursement Date', '')}
+    return None
+
 def save_disbursement(data):
     # Server-side backstop — the widget's own form already requires this,
     # but a request hitting this route directly (API call, retry script)
@@ -1268,6 +1295,13 @@ def save_disbursement(data):
     # still land in the books.
     if not (data.get('utr') or '').strip():
         raise ValueError('UTR / Reference number is required — a disbursement cannot be recorded without proof of transfer.')
+    dupe = _existing_disbursement_for_utr(data.get('utr'))
+    if dupe:
+        raise ValueError(
+            f"This UTR is already recorded against {dupe['disb_id']} ({dupe['customer']}, "
+            f"₹{dupe['amount']:,.0f}, {dupe['date']}) — one bank transfer can only fund one "
+            f"disbursement. If this is genuinely a different transfer, double-check the UTR; "
+            f"if it's the same transfer, don't re-enter it.")
     ws  = get_sheet()
     _ensure_accounts_bank_account_column(ws)
     _ensure_accounts_charge_plan_column(ws)
@@ -1842,6 +1876,16 @@ def update_disbursement(data):
     info = lookup_case(disb_id)
     if not info['found']:
         raise ValueError(f"Disbursement ID '{disb_id}' not found.")
+    # Same guard as save_disbursement() -- editing the UTR into collision
+    # with another case's proof of transfer is exactly as wrong as entering
+    # it that way from the start.
+    if 'debit_note' in data and (data['debit_note'] or '').strip():
+        dupe = _existing_disbursement_for_utr(data['debit_note'], exclude_disb_id=disb_id)
+        if dupe:
+            raise ValueError(
+                f"This UTR is already recorded against {dupe['disb_id']} ({dupe['customer']}, "
+                f"₹{dupe['amount']:,.0f}, {dupe['date']}) — one bank transfer can only fund one "
+                f"disbursement.")
     sh  = get_gspread_client().open_by_key(SPREADSHEET_ID)
     ws  = sh.worksheet(info.get('sheet', SHEET_NAME))
     row = info['row']
@@ -5164,6 +5208,34 @@ def _suspense_register(periods=None, sh=None):
         'all_clear': not open_items,
     }
 
+def _duplicate_debit_note_check(records=None):
+    """Every group of 2+ disb_ids citing the identical UTR as their own Debit
+    Note. A UTR is an exact identifier for ONE real bank transaction, so
+    this can only mean one real transfer got booked as more than one
+    disbursement -- confirmed live 20-08-2026 (BLP-130826-404 / -407,
+    Manjunath M, IDFBR62026081304024231), which doubled his book liability
+    with nothing anywhere flagging it until found by eye. Exact match only,
+    same reasoning as _existing_disbursement_for_utr()."""
+    from collections import defaultdict
+    if records is None:
+        records = read_accounts_from_gsheet()
+    by_utr = defaultdict(list)
+    for r in records:
+        utr = (r.get('Debit Note', '') or '').strip()
+        did = (r.get('Disbursement ID', '') or '').strip()
+        if not utr or not did:
+            continue
+        by_utr[utr.upper()].append({
+            'disb_id': did, 'customer': r.get('Customer Name', ''),
+            'amount': _to_num(r.get('Amount', 0)), 'total': _to_num(r.get('Total', 0)),
+            'collected': _to_num(r.get('Collected Amount', 0)),
+            'date': r.get('Disbursement Date', ''), 'status': (r.get('Overdue Status', '') or '').strip(),
+        })
+    groups = [{'utr': utr, 'cases': rows} for utr, rows in by_utr.items() if len(rows) > 1]
+    return {'count': len(groups),
+            'total_at_risk': round(sum(c['total'] for g in groups for c in g['cases']), 2),
+            'groups': groups}
+
 def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
     """Every distinct way a rupee could go missing, each as its own number
     that should be zero. Deliberately NOT a single variance: the bank
@@ -5177,6 +5249,13 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
       3. book_unmatched -- a book disbursement/collection with no bank evidence
       4. contra_imbalance -- own-account transfers must net to zero
       5. fd_orphans / fd_unparsed -- sweeps that can't be attributed
+      6. duplicate_debit_notes -- two disb_ids citing the SAME UTR as proof of
+         transfer. A UTR names one real bank transaction; it cannot fund two
+         disbursements. Confirmed live 20-08-2026 -- BLP-130826-404 and -407
+         both cited IDFBR62026081304024231 for Manjunath M, doubling his
+         book liability with nothing anywhere to notice until Prem found it
+         by eye. save_disbursement()/update_disbursement() now block this
+         going forward; this is what catches it for data already saved.
     """
     if sh is None:
         sh = get_gspread_client().open_by_key(SPREADSHEET_ID)
@@ -5279,6 +5358,7 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
                                      'amount': _clean_amount(mc[2]) if len(mc) > 2 else 0})
 
     fd = _fd_ledger(periods)
+    dup_utrs = _duplicate_debit_note_check(records)
     contra = role_totals.get('contra', {'net_out_of_bank': 0.0})
     suspense = role_totals.get('suspense', {'net_out_of_bank': 0.0})
     # Money that came in by mistake and went straight back, or that has since
@@ -5308,6 +5388,7 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
             'disbursements': book_unmatched_disb[:50],
             'collections': book_unmatched_coll[:50]},
         'contra_imbalance': round(contra.get('net_out_of_bank', 0.0), 2),
+        'duplicate_debit_notes': dup_utrs,
         'suspense_net': round(susp_reg['open_net'], 2),
         'suspense_open_count': susp_reg['open_count'],
         'suspense_returned_count': susp_reg['returned_count'],
@@ -5323,7 +5404,8 @@ def _money_integrity_check(periods=None, records=None, mc_rows=None, sh=None):
              and leaks['book_entries_with_no_bank_evidence']['collection_count'] == 0
              and abs(leaks['contra_imbalance']) < 1
              and abs(leaks['fd_orphan_total']) < 1
-             and abs(leaks['fd_unparsed_net']) < 1)
+             and abs(leaks['fd_unparsed_net']) < 1
+             and leaks['duplicate_debit_notes']['count'] == 0)
 
     return {
         'reconciled_window': {
@@ -8296,6 +8378,8 @@ async function loadMoneyIntegrity() {
        'Own-account transfers and FD sweeps must cancel out.'],
       ['FD swept in from an untracked deposit', L.fd_orphan_total||0,
        'Deposit booked before bank records begin.'],
+      ['Same bank transfer recorded as two disbursements', (L.duplicate_debit_notes||{}).total_at_risk||0,
+       (L.duplicate_debit_notes||{}).count ? (L.duplicate_debit_notes.count + ' UTR(s) shared across cases — one bank transfer cannot fund two loans.') : 'Every UTR is used by exactly one disbursement.'],
     ];
     // Charges are the sixth way money can quietly go wrong: a case billed on
     // the wrong counterparty's rate. Fetched separately so a failure here
@@ -8320,6 +8404,16 @@ async function loadMoneyIntegrity() {
             <div style="white-space:nowrap;font-weight:700;color:${ok?'#1a5c3a':'#c00'}">${ok?'✅ CLEAR':'⚠️ ₹'+fmtDec(Math.abs(amt))}</div>
           </div>`;
       }).join('') +
+      ((L.duplicate_debit_notes && L.duplicate_debit_notes.count) ? `<div style="margin-top:10px;padding:8px 10px;background:#fdecea;border:1px solid #e0a0a0;border-radius:6px;font-size:.8rem">
+          <b>⚠️ Same bank transfer recorded as two disbursements</b> — one of each pair is a duplicate and needs voiding; check with Prem before deleting either.
+          ${L.duplicate_debit_notes.groups.map(g => `<div style="margin-top:8px;padding-top:8px;border-top:1px solid #f0d0d0">
+             <span style="font-size:.75rem;color:#666">UTR ${g.utr}</span>
+             ${g.cases.map(c => `<div style="margin-top:3px">
+                <b>${c.disb_id}</b> ${c.customer} — amount ₹${fmtDec(c.amount)}, total ₹${fmtDec(c.total)},
+                collected ₹${fmtDec(c.collected)}, ${c.date}, <span style="color:${c.status==='Closed'?'#1a5c3a':'#b8860b'}">${c.status||'—'}</span>
+              </div>`).join('')}
+           </div>`).join('')}
+        </div>` : '') +
       ((bank.entries && bank.entries.length) ? `<div style="margin-top:10px;padding:8px 10px;background:#fff8e1;border:1px solid #e0c060;border-radius:6px;font-size:.8rem">
           <b>Bank lines not tied to any case</b> — if one of these was a wrong credit, move it to Suspense and it will clear against its return.
           ${bank.entries.map((e, i) => `<div style="margin-top:8px;padding-top:8px;border-top:1px solid #ecdfae">
