@@ -2314,25 +2314,41 @@ def _last_recon_closing_for_account(account):
     accounts figure — the starting point for that ONE account's book-balance
     tie-out. Reads the same Recon Log rows independently rather than
     refactoring get_latest_bank_balance() itself, so the existing dashboard
-    balance figure can't regress from this change."""
+    balance figure can't regress from this change.
+
+    Picks by the row's own RECON DATE, not by append order. It used to pick
+    "last row in the sheet for this account", which is only correct if every
+    save for an account happens in strictly increasing date order — an
+    assumption a correction or re-upload of an earlier day breaks the moment
+    it's saved after a later day already logged. Confirmed this actually
+    happens in real data (14-08-2026's multi-account batch save appended
+    IDFC's 11-Aug row after its own already-saved 13-Aug row) — it hadn't
+    yet bitten the CURRENT baseline when checked (20-08-2026), but the
+    tie-out's whole job is catching exactly this kind of silent staleness,
+    so it can't rely on an assumption it would itself flag as unsafe
+    anywhere else. Prem, 20-08-2026: 'this really needs to be sorted out.'"""
     try:
         ws = get_gspread_client().open_by_key(SPREADSHEET_ID).worksheet(RECON_LOG_SHEET_NAME)
         rows = ws.get_all_values()[1:]
-        last_row = None
+        best_row, best_date = None, None
         for row in rows:
             acct = row[4].strip() if len(row) > 4 else ''
-            if acct == account:
-                last_row = row  # last write wins -> most recent append for this account
-        if not last_row:
+            if acct != account:
+                continue
+            d = _parse_recon_date(row[0] if row else None)
+            if d is None:
+                continue
+            if best_date is None or d >= best_date:
+                best_row, best_date = row, d
+        if not best_row:
             return None, None
         closing = None
-        if len(last_row) > 2 and last_row[2]:
+        if len(best_row) > 2 and best_row[2]:
             try:
-                closing = float(str(last_row[2]).replace(',', '').replace('₹', '').strip())
+                closing = float(str(best_row[2]).replace(',', '').replace('₹', '').strip())
             except ValueError:
                 closing = None
-        d = _parse_recon_date(last_row[0] if last_row else None)
-        return closing, d
+        return closing, best_date
     except Exception:
         return None, None
 
