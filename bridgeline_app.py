@@ -6523,28 +6523,15 @@ HTML = """<!DOCTYPE html>
       <div id="account-gap-note" style="display:none;margin-bottom:14px;padding:10px 12px;border:1px solid #e0a0a0;background:#fdecea;color:#8a2020;border-radius:6px;font-size:.82rem"></div>
       <div id="date-mismatch-note" style="display:none;margin-bottom:14px;padding:10px 12px;border:1px solid #e0c060;background:#fff3cd;color:#7a5c00;border-radius:6px;font-size:.82rem"></div>
 
-      <!-- One block per uploaded statement, built by renderReconResult() -->
+      <!-- One block per uploaded statement, built by renderReconResult() —
+           each block now includes its OWN full, editable transaction table
+           (see _statementBlock), not just a flagged subset. Prem, 20-08-2026:
+           "after recon u need to allow me to check if everything is proper,
+           i would change anything if i would and then u save." Every row,
+           confident or not, is visible and editable before Save; there is no
+           separate hidden review queue any more, and nothing gets saved that
+           wasn't visible on this screen first. -->
       <div id="recon-statements"></div>
-
-      <!-- Review queue — uncertain entries across every statement -->
-      <div class="section" id="review-section" style="display:none">
-        <h3>⚠️ Needs Your Input <span id="review-badge" style="font-weight:400;color:#888"></span></h3>
-        <p style="font-size:.8rem;color:#666;margin:0 0 10px">These couldn't be confidently matched. Set the correct <b>Type</b> and optionally add <b>Remarks</b> — then save.</p>
-        <div style="overflow-x:auto">
-          <table class="recon-table">
-            <thead><tr>
-              <th style="width:110px">Account</th>
-              <th>Date</th><th>Description</th><th>UTR</th>
-              <th style="text-align:right">Amount</th>
-              <th style="width:60px">Dr/Cr</th>
-              <th style="width:80px">Auto Type</th>
-              <th style="width:190px">Correct Type</th>
-              <th style="min-width:260px">Remarks</th>
-            </tr></thead>
-            <tbody id="review-tbody"></tbody>
-          </table>
-        </div>
-      </div>
 
       <p style="font-size:.8rem;color:#666;margin:8px 0 4px">History is stored automatically — every download contains <b>all periods saved so far</b>. No need to re-upload previous files.</p>
       <button class="btn btn-save" onclick="saveRecon()" style="margin-top:4px">💾 Complete Reconciliation &amp; Save Excel</button>
@@ -7758,7 +7745,12 @@ async function registerAccountIfNew(name) {
 function allTypeOpts() {
   return ['', ...BASE_TYPES, ..._customTypes];
 }
-function buildTypeSelect(i, val='') {
+// rowKey is "<statement index>-<transaction index>" — globally unique across
+// every statement's table, so one select/lookup scheme covers the whole
+// page instead of assuming a single tbody the way this used to (back when
+// there was one flat cross-statement review queue rather than a table per
+// statement covering every row).
+function buildTypeSelect(rowKey, val='') {
   // The stored value may be a legacy/auto-only label (Collection, Capital
   // In, FD Booking, ...) no longer offered in the list — keep it selectable
   // for THIS row so re-saving doesn't silently change it.
@@ -7767,29 +7759,29 @@ function buildTypeSelect(i, val='') {
   const optHtml = opts.map(t =>
     `<option value="${t}" ${t===val?'selected':''}>${t||'— auto —'}</option>`).join('')
     + `<option value="__add__">＋ Add new type…</option>`;
-  return `<select data-row="${i}" onchange="onTypeChange(this)"
+  return `<select data-rowkey="${rowKey}" onchange="onTypeChange(this)"
     style="width:100%;font-size:.82rem;padding:4px 6px;border:1px solid #b0c4d8;border-radius:5px;background:white">${optHtml}</select>`;
 }
 function rowBg(type) { return TYPE_COLOR[type] || 'white'; }
 
 async function onTypeChange(sel) {
-  const i = sel.dataset.row;
+  const rowKey = sel.dataset.rowkey;
   if (sel.value === '__add__') {
     const t = (prompt('New transaction type name:') || '').trim();
     if (t && !BASE_TYPES.includes(t) && !_customTypes.includes(t)) {
       await saveCustomType(t);
     }
-    // Rebuild every type select so the new type shows up everywhere,
-    // preserving each row's current selection.
-    document.querySelectorAll('#review-tbody select[data-row]').forEach(s => {
+    // Rebuild every type select on the page so the new type shows up
+    // everywhere, preserving each row's current selection.
+    document.querySelectorAll('select[data-rowkey]').forEach(s => {
       const cur = (s === sel) ? (t || '') : s.value;
-      s.outerHTML = buildTypeSelect(s.dataset.row, cur === '__add__' ? '' : cur);
+      s.outerHTML = buildTypeSelect(s.dataset.rowkey, cur === '__add__' ? '' : cur);
     });
-    const mine = document.querySelector(`#review-tbody select[data-row="${i}"]`);
+    const mine = document.querySelector(`select[data-rowkey="${rowKey}"]`);
     if (mine) mine.value = t || '';
   }
-  const val = (document.querySelector(`#review-tbody select[data-row="${i}"]`) || sel).value;
-  const rowEl = document.getElementById('txrow-'+i);
+  const val = (document.querySelector(`select[data-rowkey="${rowKey}"]`) || sel).value;
+  const rowEl = document.getElementById('txrow-'+rowKey);
   if (rowEl) rowEl.style.background = rowBg(val);
 }
 
@@ -7991,7 +7983,85 @@ function _statementBlock(st, si) {
       <div style="font-size:.83rem;color:#333;line-height:1.8">${confHtml || '<span style="color:#888">Nothing matched automatically.</span>'}</div>
     </div>
     ${bcHtml}${toHtml}
+    ${_allTransactionsTable(st, si)}
   </div>`;
+}
+
+// The full, editable ledger for one statement \u2014 every transaction, not just
+// the uncertain ones, so nothing is saved that Prem hasn't actually seen.
+// Rows that were flagged low-confidence at classification time carry a
+// visible marker so his eye is drawn there first, but every row's Type and
+// Remarks are editable the same way \u2014 there is no separate, easier-to-miss
+// review queue any more.
+function _allTransactionsTable(st, si) {
+  const reviewSet = new Set(st.review || []);
+  // Pair each transaction with its TRUE index in st.transactions before
+  // sorting for display \u2014 that original index is what save time keys back
+  // into, so it must survive the reorder.
+  const rows = st.transactions.map((tx, ti) => ({tx, ti}));
+  rows.sort((a, b) => (_parseDMY(a.tx.date) || 0) - (_parseDMY(b.tx.date) || 0));
+
+  const body = rows.map(({tx, ti}) => {
+    const rowKey = `${si}-${ti}`;
+    const needsLook = reviewSet.has(tx);
+    const desc = (tx.description || '').replace(/</g, '&lt;');
+    const amt  = tx.debit ? '\u20b9' + fmtDec(tx.debit) : '\u20b9' + fmtDec(tx.credit);
+    const drCr = tx.debit ? `<span style="color:#c00;font-weight:600">Dr</span>`
+                          : `<span style="color:#1a5c3a;font-weight:600">Cr</span>`;
+    const autoColor = ({Disbursement:"#b8860b",Repayment:"#1a5c3a",Collection:"#1a5c3a",
+      "Other Income":"#1a5c3a","Interest Income":"#1a5c3a",Expense:"#c00",
+      "FD Booking":"#1565c0","FD Sweep-In":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
+    return `<tr id="txrow-${rowKey}" style="background:${needsLook ? '#fffaf0' : 'white'}">
+        <td style="text-align:center">${needsLook ? '<span title="Low confidence \u2014 please check" style="color:#b8860b">\u26a0\ufe0f</span>' : ''}</td>
+        <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
+        <td style="font-size:.8rem;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${desc}">${desc}</td>
+        <td style="font-size:.78rem;color:#666;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${tx.utr||"\u2014"}</td>
+        <td style="text-align:right;font-size:.82rem;font-weight:600">${amt}</td>
+        <td style="text-align:center">${drCr}</td>
+        <td style="font-size:.75rem;color:${autoColor};font-weight:600;white-space:nowrap">${tx.type||"\u2014"}</td>
+        <td>${buildTypeSelect(rowKey, tx.type)}</td>
+        <td><input type="text" data-remarks="${rowKey}" placeholder="remarks\u2026"
+            style="width:100%;font-size:.82rem;padding:4px 6px;border:1px solid #b0c4d8;border-radius:5px;box-sizing:border-box"></td>
+      </tr>`;
+  }).join('');
+
+  const flaggedCount = (st.review || []).length;
+  return `<div class="section" style="margin-top:12px">
+      <h3>📄 All Transactions <span style="font-weight:400;color:#888">\u2014 ${st.transactions.length} total${flaggedCount ? `, <span style="color:#b8860b">\u26a0\ufe0f ${flaggedCount} worth a closer look</span>` : ''}</span></h3>
+      <p style="font-size:.8rem;color:#666;margin:0 0 10px">Every row is editable. Check it over, change anything that's wrong, then Save below.</p>
+      <div style="overflow-x:auto;max-height:520px;overflow-y:auto">
+        <table class="recon-table">
+          <thead style="position:sticky;top:0;background:white;z-index:1"><tr>
+            <th style="width:26px"></th>
+            <th>Date</th><th>Description</th><th>UTR</th>
+            <th style="text-align:right">Amount</th>
+            <th style="width:60px">Dr/Cr</th>
+            <th style="width:80px">Auto Type</th>
+            <th style="width:190px">Correct Type</th>
+            <th style="min-width:200px">Remarks</th>
+          </tr></thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
+// DD-MM-YYYY (or DD/MM/YY, or DD-Mon-YYYY) -> a comparable number for
+// sorting the transaction table by date. Returns 0 (sorts first) rather
+// than throwing on a shape it doesn't recognise -- a display-order glitch
+// is fine; the row itself is never dropped.
+function _parseDMY(s) {
+  if (!s) return 0;
+  const m = String(s).trim().match(/^(\d{1,2})[-\/](\w+)[-\/](\d{2,4})/);
+  if (!m) return 0;
+  const day = parseInt(m[1], 10);
+  const monRaw = m[2];
+  const mon = /^\d+$/.test(monRaw) ? parseInt(monRaw, 10) - 1
+    : ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'].indexOf(monRaw.slice(0,3).toLowerCase());
+  let year = parseInt(m[3], 10);
+  if (year < 100) year += 2000;
+  const d = new Date(year, mon, day);
+  return isNaN(d.getTime()) ? 0 : d.getTime();
 }
 
 function renderReconResult(r) {
@@ -8060,46 +8130,6 @@ function renderReconResult(r) {
     dm.style.display = "none";
   }
 
-  // One review queue across every statement. Each row remembers WHICH
-  // statement and WHICH row it came from, so a correction can never land on
-  // the same-looking transaction in the other account.
-  const rev = [];
-  statements.forEach((st, si) => {
-    if (st.error) return;
-    (st.review || []).forEach(tx => {
-      const ti = st.transactions.indexOf(tx);
-      if (ti >= 0) rev.push({si, ti, tx});
-    });
-  });
-  window._reviewTxns = rev;
-  if (rev.length) {
-    document.getElementById("review-section").style.display = "block";
-    document.getElementById("review-badge").textContent = `\u2014 ${rev.length} entries need review`;
-    document.getElementById("review-tbody").innerHTML = rev.map((row, i) => {
-      const tx = row.tx;
-      const desc = (tx.description||"").replace(/</g,"&lt;");
-      const amt  = tx.debit ? "\u20b9"+fmtDec(tx.debit) : "\u20b9"+fmtDec(tx.credit);
-      const drCr = tx.debit ? `<span style="color:#c00;font-weight:600">Dr</span>`
-                            : `<span style="color:#1a5c3a;font-weight:600">Cr</span>`;
-      const autoColor = ({Disbursement:"#b8860b",Repayment:"#1a5c3a",Collection:"#1a5c3a",
-        "Other Income":"#1a5c3a","Interest Income":"#1a5c3a",Expense:"#c00",
-        "FD Booking":"#1565c0","FD Sweep-In":"#1565c0","Capital In":"#1565c0","Capital Out":"#1565c0","Contra":"#1565c0"})[tx.type] || "#555";
-      return `<tr style="background:${i%2?"#f8fbff":"white"}">
-        <td style="font-size:.75rem;color:#12467e;font-weight:600">${statements[row.si].account || statements[row.si].filename}</td>
-        <td style="white-space:nowrap;font-size:.82rem">${tx.date}</td>
-        <td style="font-size:.8rem;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${desc}">${desc}</td>
-        <td style="font-size:.78rem;color:#666;max-width:130px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${tx.utr||"\u2014"}</td>
-        <td style="text-align:right;font-size:.82rem;font-weight:600">${amt}</td>
-        <td style="text-align:center">${drCr}</td>
-        <td style="font-size:.75rem;color:${autoColor};font-weight:600;white-space:nowrap">${tx.type||"\u2014"}</td>
-        <td>${buildTypeSelect(i, tx.type)}</td>
-        <td><input type="text" data-review-row="${i}" placeholder="remarks\u2026"
-            style="width:100%;font-size:.82rem;padding:4px 6px;border:1px solid #b0c4d8;border-radius:5px;box-sizing:border-box"></td>
-      </tr>`;
-    }).join("");
-  } else {
-    document.getElementById("review-section").style.display = "none";
-  }
   document.getElementById("recon-preview-section").style.display = "block";
   document.getElementById("recon-status").style.display = "none";
 }
@@ -8118,23 +8148,14 @@ async function saveRecon() {
   }
   for (const st of statements) await registerAccountIfNew(st.account);
 
-  // Corrections from the review queue, applied back by (statement, row)
-  // index. The old code matched on date+description+amount, which two
-  // accounts can share — with several statements in one upload that key
-  // could put a correction on the wrong account's transaction.
+  // Every row is now visible and editable in its own statement's table
+  // (built by _allTransactionsTable), keyed "<statement index>-<row index>"
+  // — read corrections straight from there rather than from a separate
+  // review-only list, so what Prem sees on screen IS what gets saved, for
+  // every row, not just the ones the auto-classifier flagged as uncertain.
   // Remarks are remarks ONLY — they used to also get saved as new dropdown
   // "types", which is how the type list filled up with raw SMS text and
   // case IDs. New types come exclusively from "+ Add new type…" now.
-  const fixes = {};
-  (window._reviewTxns || []).forEach((row, i) => {
-    const sel = document.querySelector(`#review-tbody select[data-row="${i}"]`);
-    const inp = document.querySelector(`input[data-review-row="${i}"]`);
-    fixes[`${row.si}|${row.ti}`] = {
-      type_override: sel && sel.value !== '__add__' ? sel.value.trim() : '',
-      row_remarks:   inp ? inp.value.trim() : '',
-    };
-  });
-
   const remarks = document.getElementById('rec-remarks').value.trim();
   const data = {
     statements: statements.map(st => {
@@ -8147,8 +8168,18 @@ async function saveRecon() {
         account:     st.account,
         remarks_map: {},
         transactions: st.transactions.map((tx, ti) => {
-          const fix = fixes[`${si}|${ti}`] || {};
-          return {...tx, type_override: fix.type_override||'', row_remarks: fix.row_remarks||''};
+          const rowKey = `${si}-${ti}`;
+          const sel = document.querySelector(`select[data-rowkey="${rowKey}"]`);
+          const inp = document.querySelector(`input[data-remarks="${rowKey}"]`);
+          const chosen = sel && sel.value !== '__add__' ? sel.value.trim() : '';
+          // Only an ACTUAL correction (chosen differs from what was already
+          // auto-assigned) is sent as type_override — the select always
+          // shows a value, so sending it unconditionally would "override"
+          // every single row with its own existing type, which is harmless
+          // arithmetically but pointless and makes every save look like a
+          // mass correction in the sheet's own audit trail.
+          const type_override = (chosen && chosen !== (tx.type || '')) ? chosen : '';
+          return {...tx, type_override, row_remarks: (inp ? inp.value.trim() : '')};
         }),
       };
     }),
@@ -8183,7 +8214,6 @@ async function saveRecon() {
     // otherwise a leftover account/date/balance could silently carry into the
     // next statement. Only on SUCCESS — a failed save should leave everything
     // intact so the user can just retry.
-    window._reviewTxns = [];
     window._reconStatements = [];
     _selectedReconFiles = [];
     document.getElementById('rec-file').value = '';
